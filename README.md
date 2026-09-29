@@ -158,6 +158,12 @@
 - 完整文本：LGPL-3.0 <https://www.gnu.org/licenses/lgpl-3.0.html>、Apache-2.0 <https://www.apache.org/licenses/LICENSE-2.0>；
 - 若后续版本修改了 DexKit 源码，修改部分将按 LGPL-3.0 单独提供。
 
+### 参考项目（未分发其代码，致谢与出处）
+
+| 项目 | 许可 | 参考内容 |
+|---|---|---|
+| [MiuiBackGestureHook](https://github.com/wxxsfxyzm/MiuiBackGestureHook) | Apache-2.0 | HyperOS 4（Rust 桌面）native hook 路线的可行性论证与技术思路：LSPosed native entry 打包方式、`RTLD_NOLOAD` 回放已加载库、`madvise(MADV_DONTNEED)` 守卫模型、per-version launcher profile 机制。截至 native 探针（adapt/hyperos4 5af37b2）未复制其源码行；`NativeAPIEntries` 等 ABI 定义取自 LSPosed 官方 wiki《Native Hook》 |
+
 ## 开源协议
 
 [Apache License 2.0](LICENSE)
