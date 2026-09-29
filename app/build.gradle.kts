@@ -106,6 +106,19 @@ android {
             excludes += "**"
         }
     }
+
+    // OS4 native 探针（adapt/hyperos4）：LSPosed native entry 骨架——验证本机构建是否
+    // 真的解析 META-INF/xposed/native_init.list 并调用 native_init（U1 前提，见
+    // docs/adaptation/marble-os4-decompile-verification.md §6 与
+    // F:\hyperos\work\docs\lsposed-native-entry-verification.md §4.2）。
+    // 纯 C 探针，只导出 native_init，OS2/OS3 上必须安静跳过（无 libapp_launcher.so）。
+    ndkVersion = "27.2.12479018"
+    externalNativeBuild {
+        cmake {
+            path = file("src/main/cpp/CMakeLists.txt")
+            version = "4.1.2"
+        }
+    }
 }
 
 // 编译后将本次 versionCode 写回 version.properties，供下次编译递增
