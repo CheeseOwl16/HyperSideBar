@@ -42,6 +42,27 @@ static void on_module_loaded(const char *name, void *handle) {
     LOGI("module loaded: %s handle=%p", name ? name : "(null)", handle);
 }
 
+/*
+ * 构造期探针（2026-09-30 复盘新增，见 docs/adaptation/os4-native-entry-postmortem.md §2.1）。
+ *
+ * **为什么必须有它**：探针原来只在 native_init 内部打日志。若框架压根没 dlopen 本 so，
+ * 日志一条都没有 —— 无法区分下面两种截然不同的情况：
+ *   (a) 框架加载了 so，但没调用 native_init  ⇒ 问题在清单解析 / API 版本 / 入口约定；
+ *   (b) 框架根本没加载 so                     ⇒ modern native_init.list 未被处理。
+ * 有了构造期日志就能一刀切开：有 ctor 无 native_init = (a)；连 ctor 都没有 = (b)。
+ *
+ * 注意用 constructor 而非 JNI_OnLoad：我们不以 JNI 方式被加载，框架是 dlopen + dlsym。
+ */
+__attribute__((constructor))
+static void probe_ctor(void) {
+    LOGI("probe so LOADED (ctor) — framework did dlopen us, native_init should follow");
+}
+
+__attribute__((destructor))
+static void probe_dtor(void) {
+    LOGI("probe so UNLOADING (dtor)");
+}
+
 static void log_self(void) {
     FILE *f = fopen("/proc/self/cmdline", "r");
     char buf[160] = {0};

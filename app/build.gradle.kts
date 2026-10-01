@@ -105,6 +105,17 @@ android {
             merges += "META-INF/xposed/*"
             excludes += "**"
         }
+        // 16KB 页内核硬要求（marble OS3/A16 起；OS4 也是）：
+        // `useLegacyPackaging = false` 才会把 .so **以 STORED + 页对齐**打进 APK，
+        // 使 linker 能直接 mmap APK 内条目。
+        //
+        // ⚠️ 这里有两个**互相独立**的要求，缺一不可（2026-09-30 复盘`os4-native-entry-postmortem`）：
+        //   ① .so 内部 PT_LOAD 的 p_align >= 16384   ← 链接器（CMakeLists 的 max-page-size）
+        //   ② APK 内 ZIP 条目的 offset 按 16384 对齐   ← 打包器（本块）
+        // 之前只做了 ①，实测 APK 条目 offset 仍是 0x21d5484 等**非 16KB 倍数** ——
+        // 在 16KB 页设备上 dlopen 会失败，而 LSPosed 对 native entry 失败的处理是
+        // **整个模块中止**（与 assets/native_init 变体同一故障模式）。
+        jniLibs.useLegacyPackaging = false
     }
 
     // OS4 native 探针（adapt/hyperos4）：LSPosed native entry 骨架——验证本机构建是否
