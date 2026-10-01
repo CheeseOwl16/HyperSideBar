@@ -27,6 +27,13 @@ class XposedInit : XposedModule() {
         // NativeLibLoader 抽 libdexkit.so 需要模块 APK 路径；必须在任何宿主 init 之前就位。
         runCatching { EzXposed.initModuleResources() }
             .onFailure { Log.w(TAG, "initModuleResources failed: ${it.message}") }
+        // TEMP bisect-E（不提交）：wiki legacy 语义=assets/native_init 声明 + 模块自行
+        // System.loadLibrary，框架在 dlopen 时拦截并回调 native_init。上一轮 bisect D
+        // 只放了声明没有自加载=失败（全模块静默死）。本行验证缺的那一环。
+        runCatching {
+            System.loadLibrary("hypersidebar_native")
+            Log.i(TAG, "legacy native probe library loaded")
+        }.onFailure { Log.w(TAG, "probe loadLibrary failed: ${it.message}") }
     }
 
     override fun onPackageLoaded(param: PackageLoadedParam) {

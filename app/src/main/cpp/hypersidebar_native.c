@@ -39,7 +39,11 @@ static const char *const kReplayLibs[] = {
 };
 
 static void on_module_loaded(const char *name, void *handle) {
-    LOGI("module loaded: %s handle=%p", name ? name : "(null)", handle);
+    /* 验证期曾在此打每库一行日志——但回调对进程内每次 dlopen 都开火
+     * （libbinder/libEGL/各模块 dex 全命中），常驻会刷爆 logcat，正式接线后静音。
+     * 保留回调本身：后续真 hook（OS4 libapp_launcher）就挂在这里。 */
+    (void)name;
+    (void)handle;
 }
 
 /*
