@@ -9,6 +9,7 @@ import com.lsp.hypersidebar.util.HLog
 import com.lsp.hypersidebar.hook.BaseHook
 import com.lsp.hypersidebar.hook.EdgeGestureHook
 import com.lsp.hypersidebar.hook.FreeformRelayHook
+import com.lsp.hypersidebar.hook.SidebarOverlayProbe
 import com.lsp.hypersidebar.hook.SystemUiHook
 import com.lsp.hypersidebar.hook.TurboLayout
 import com.lsp.hypersidebar.prefs.HostPackages
@@ -21,6 +22,7 @@ class XposedInit : XposedModule() {
     private var freeformRelayHook: FreeformRelayHook? = null
     private var edgeGestureHook: EdgeGestureHook? = null
     private var systemUiHook: SystemUiHook? = null
+    private var sidebarOverlayProbe: SidebarOverlayProbe? = null
 
     override fun onModuleLoaded(param: ModuleLoadedParam) {
         EzXposed.initOnModuleLoaded(this, param)
@@ -57,7 +59,10 @@ class XposedInit : XposedModule() {
                     // prefs 同时供 FreeformRelay 做跨进程广播令牌校验（批次 0 安全修复）
                     freeformRelayHook = FreeformRelayHook(prefs)
                 }
-                initHooks(turboLayoutHook!!, freeformRelayHook!!)
+                // E0/R1-J 前置探针（OS4 适配）：ISidebarOverlay 呼出链路观测，只打日志。
+                // OS2/OS3 无该类=init 内自门控静默退出，三 ROM 通用。
+                if (sidebarOverlayProbe == null) sidebarOverlayProbe = SidebarOverlayProbe()
+                initHooks(turboLayoutHook!!, freeformRelayHook!!, sidebarOverlayProbe!!)
             }
             param.packageName == HostPackages.HOME && procName == HostPackages.HOME -> {
                 // 竖屏边缘手势通道（内滑+停顿零干扰透传；横屏触发已移交 :ui B 路线）
