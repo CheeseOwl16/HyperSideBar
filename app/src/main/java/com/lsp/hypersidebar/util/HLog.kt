@@ -83,13 +83,17 @@ object HLog {
     private val buf = ArrayDeque<Entry>(CAPACITY)
     @Volatile private var procName: String? = null
 
-    /** 进程短名（首次解析后缓存）：launcher / ui / sys / app */
+    /** 进程短名（首次解析后缓存）：launcher / ui / sys / app。
+     *  Application.getProcessName 直读 /proc/self/cmdline，onModuleLoaded 这类
+     *  Application 未就位的极早期调用点也能正确归类（ActivityThread 链是兜底）。 */
     fun proc(): String {
         procName?.let { return it }
-        val raw = runCatching {
-            val clz = Class.forName("android.app.ActivityThread")
-            clz.getMethod("currentProcessName").invoke(null) as? String
-        }.getOrNull() ?: "?"
+        val raw = runCatching { android.app.Application.getProcessName() }
+            .getOrNull()
+            ?: runCatching {
+                val clz = Class.forName("android.app.ActivityThread")
+                clz.getMethod("currentProcessName").invoke(null) as? String
+            }.getOrNull() ?: "?"
         val short = when {
             raw == HostPackages.HOME -> PROC_LAUNCHER
             raw.endsWith(HostPackages.UI_PROCESS_SUFFIX) -> PROC_UI

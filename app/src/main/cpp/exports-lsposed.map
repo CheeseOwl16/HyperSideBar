@@ -1,6 +1,7 @@
 {
   global:
     native_init;
+    Java_com_lsp_hypersidebar_util_NativeProbe_report;
   local:
     *;
 };

@@ -22,7 +22,21 @@ import com.lsp.hypersidebar.prefs.PrefKeys
  */
 object LogDumpBridge {
 
+    /** 幂等守卫：XposedInit 提前武装（不等宿主 hook）与各 hook 的 attach 注册可共存 */
+    @Volatile
+    private var registered = false
+
+    /** provider 存字段不存闭包：后续 register 调用升级替换（取快照在应答时求值） */
+    @Volatile
+    private var statusProvider: () -> String? = { null }
+
+    @Volatile
+    private var statsProvider: () -> String? = { null }
+
     /**
+     * 接收器只注册一次；provider 后到者覆盖（EdgeGestureHook 带 CircuitBreaker/StatsRecorder
+     * 的富注册到达时自动顶掉 XposedInit 早期注册的空 provider）。
+     *
      * @param statusProvider 进程状态快照（JSON 字符串，可 null）——launcher/:ui 传
      *   CircuitBreaker.snapshot()，模块 App 不注册本接收器（直读本地缓冲）
      * @param statsProvider 使用数据聚合 JSON（§11.3，可 null）——launcher/:ui 传
@@ -33,6 +47,10 @@ object LogDumpBridge {
         statusProvider: () -> String? = { null },
         statsProvider: () -> String? = { null }
     ) {
+        this.statusProvider = statusProvider
+        this.statsProvider = statsProvider
+        if (registered) return
+        registered = true
         runCatching {
             context.registerReceiver(
                 object : BroadcastReceiver() {
@@ -41,10 +59,10 @@ object LogDumpBridge {
                             .setPackage(FreeformLauncher.MODULE_PACKAGE)
                             .putExtra(PrefKeys.LOG_DUMP_EXTRA_PROC, HLog.proc())
                             .putExtra(PrefKeys.LOG_DUMP_EXTRA_LOGS, HLog.dumpJson())
-                        statusProvider()?.let {
+                        this@LogDumpBridge.statusProvider()?.let {
                             reply.putExtra(PrefKeys.LOG_DUMP_EXTRA_STATUS, it)
                         }
-                        statsProvider()?.let {
+                        this@LogDumpBridge.statsProvider()?.let {
                             reply.putExtra(PrefKeys.LOG_DUMP_EXTRA_STATS, it)
                         }
                         runCatching { c.sendBroadcast(reply) }

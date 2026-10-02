@@ -1,11 +1,14 @@
 package com.lsp.hypersidebar
 
+import android.content.Context
 import android.content.SharedPreferences
-import android.util.Log
 import io.github.libxposed.api.XposedModule
 import io.github.libxposed.api.XposedModuleInterface.*
+import io.github.kyuubiran.ezxhelper.core.finder.MethodFinder
 import io.github.kyuubiran.ezxhelper.xposed.EzXposed
+import io.github.kyuubiran.ezxhelper.xposed.dsl.HookFactory.`-Static`.createAfterHook
 import com.lsp.hypersidebar.util.HLog
+import com.lsp.hypersidebar.util.LogDumpBridge
 import com.lsp.hypersidebar.hook.BaseHook
 import com.lsp.hypersidebar.hook.EdgeGestureHook
 import com.lsp.hypersidebar.hook.FreeformRelayHook
@@ -28,14 +31,27 @@ class XposedInit : XposedModule() {
         EzXposed.initOnModuleLoaded(this, param)
         // NativeLibLoader 抽 libdexkit.so 需要模块 APK 路径；必须在任何宿主 init 之前就位。
         runCatching { EzXposed.initModuleResources() }
-            .onFailure { Log.w(TAG, "initModuleResources failed: ${it.message}") }
-        // TEMP bisect-E（不提交）：wiki legacy 语义=assets/native_init 声明 + 模块自行
-        // System.loadLibrary，框架在 dlopen 时拦截并回调 native_init。上一轮 bisect D
-        // 只放了声明没有自加载=失败（全模块静默死）。本行验证缺的那一环。
+            .onFailure { HLog.w(TAG, "initModuleResources failed: ${it.message}") }
+        // wiki legacy 语义（b69f706 定稿）：assets/native_init 声明 + 模块自行
+        // System.loadLibrary，框架在 dlopen 时拦截并回调 native_init。
+        // 报告走双通道：native 内部照旧打 logcat（tag=HSBNative），同时经
+        // NativeProbe.report() 回灌 HLog——logcat 整体失灵（OS4.0.0.14 实机）时
+        // 自检导出仍是完整取证链，三段式：loadLibrary 结果 / 报告逐行 / 取报告失败。
         runCatching {
             System.loadLibrary("hypersidebar_native")
-            Log.i(TAG, "legacy native probe library loaded")
-        }.onFailure { Log.w(TAG, "probe loadLibrary failed: ${it.message}") }
+            HLog.i("HSBNative", "legacy loadLibrary ok")
+            runCatching { com.lsp.hypersidebar.util.NativeProbe.report() }
+                .onSuccess { rep ->
+                    if (rep.isNullOrEmpty()) {
+                        HLog.w("HSBNative", "report null/empty（JNI 符号未导出?）")
+                    } else {
+                        rep.split('\n').forEach { HLog.i("HSBNative", it) }
+                    }
+                }
+                .onFailure { HLog.w("HSBNative", "report fetch failed: ${it.message}") }
+        }.onFailure {
+            HLog.e("HSBNative", "legacy loadLibrary FAILED: ${it.message}")
+        }
     }
 
     override fun onPackageLoaded(param: PackageLoadedParam) {
@@ -46,6 +62,15 @@ class XposedInit : XposedModule() {
         EzXposed.initOnPackageReady(param)
 
         val procName = currentProcessName()
+        HLog.i(TAG, "onPackageReady: pkg=${param.packageName} proc=$procName")
+
+        // 桌面日志通道提前武装（2026-10-02 实机教训：自检导出 [launcher] 段整体缺失=
+        // EdgeGestureHook 没走到注册，桌面环形缓冲成了读不出的黑洞）。在分支匹配之前
+        // 挂上，宿主分支匹配失败/hook init 崩溃也能把 HLog 拉回；LogDumpBridge 幂等，
+        // EdgeGestureHook 稍后的富 provider 注册会自动升级。
+        if (param.packageName == HostPackages.HOME) {
+            armEarlyLogDumpBridge()
+        }
         when {
             param.packageName == HostPackages.UI_HOST && procName.endsWith(HostPackages.UI_PROCESS_SUFFIX) -> {
                 // 横屏 B 路线触发端 + 竖屏小白条隐藏穿透宿主 + 执行端（fan 选中动作本进程直执行）
@@ -87,8 +112,27 @@ class XposedInit : XposedModule() {
                 }
                 initHooks(systemUiHook!!)
             }
-            else -> Log.d(TAG, "Skip package/process: ${param.packageName} / $procName")
+            else -> HLog.w(TAG, "Skip package/process: pkg=${param.packageName} proc=$procName")
         }
+    }
+
+    /**
+     * 桌面进程日志桥提前武装：hook Application.attach 后只注册 LogDumpBridge
+     * （不依赖 EdgeGestureHook 的任何状态）。方法找不到 = 记 W 级（本身就是证据）。
+     */
+    private fun armEarlyLogDumpBridge() {
+        runCatching {
+            val hooked = MethodFinder.fromClass("android.app.Application")
+                .filterByName("attach")
+                .filterByParamTypes(Context::class.java)
+                .firstOrNull()
+                ?.createAfterHook {
+                    val ctx = it.args[0] as? Context ?: return@createAfterHook
+                    LogDumpBridge.register(ctx)
+                    HLog.i(TAG, "early log dump bridge armed (via Application.attach)")
+                }
+            if (hooked == null) HLog.w(TAG, "Application.attach hook 未找到方法，日志桥未武装")
+        }.onFailure { HLog.w(TAG, "armEarlyLogDumpBridge failed: ${it.message}") }
     }
 
     /**
@@ -127,9 +171,9 @@ class XposedInit : XposedModule() {
             try {
                 h.init()
                 h.isInit = true
-                Log.i(TAG, "Hook [${h.name}] registered OK")
+                HLog.i(TAG, "Hook [${h.name}] registered OK")
             } catch (e: Exception) {
-                Log.e(TAG, "Hook [${h.name}] FAILED: ${e.message}", e)
+                HLog.e(TAG, "Hook [${h.name}] FAILED: ${e.message}", e)
             }
         }
     }
