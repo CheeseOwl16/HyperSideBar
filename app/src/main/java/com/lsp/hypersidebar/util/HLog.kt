@@ -82,18 +82,29 @@ object HLog {
 
     private val buf = ArrayDeque<Entry>(CAPACITY)
     @Volatile private var procName: String? = null
+    /** 权威进程名（XposedInit.onModuleLoaded 用 ModuleLoadedParam.getProcessName 播种，
+     *  早于一切反射链可用时刻；1002 实机教训：极早期全链 null 时 "?" 被缓存到进程死） */
+    @Volatile private var procRawOverride: String? = null
+
+    fun setProcOverride(raw: String) {
+        if (raw.isEmpty()) return
+        procRawOverride = raw
+        procName = null
+    }
 
     /** 进程短名（首次解析后缓存）：launcher / ui / sys / app。
-     *  Application.getProcessName 直读 /proc/self/cmdline，onModuleLoaded 这类
-     *  Application 未就位的极早期调用点也能正确归类（ActivityThread 链是兜底）。 */
+     *  解析顺序：override → Application.getProcessName（直读 cmdline）→
+     *  ActivityThread 反射兜底；全链失败返回 "?" 且**不缓存**（下条日志重试）。 */
     fun proc(): String {
         procName?.let { return it }
-        val raw = runCatching { android.app.Application.getProcessName() }
-            .getOrNull()
+        val raw = procRawOverride
+            ?: runCatching { android.app.Application.getProcessName() }
+                .getOrNull()?.takeIf { it.isNotEmpty() }
             ?: runCatching {
                 val clz = Class.forName("android.app.ActivityThread")
                 clz.getMethod("currentProcessName").invoke(null) as? String
-            }.getOrNull() ?: "?"
+            }.getOrNull()?.takeIf { it.isNotEmpty() }
+            ?: return "?"
         val short = when {
             raw == HostPackages.HOME -> PROC_LAUNCHER
             raw.endsWith(HostPackages.UI_PROCESS_SUFFIX) -> PROC_UI

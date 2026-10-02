@@ -29,6 +29,9 @@ class XposedInit : XposedModule() {
 
     override fun onModuleLoaded(param: ModuleLoadedParam) {
         EzXposed.initOnModuleLoaded(this, param)
+        // 权威进程名播种（API @NonNull）：极早期 HLog 归类不再依赖任何反射链，
+        // 1002 实机 [?] 段教训——全链 null 时 "?" 被缓存，整环标签报废
+        HLog.setProcOverride(param.processName)
         // NativeLibLoader 抽 libdexkit.so 需要模块 APK 路径；必须在任何宿主 init 之前就位。
         runCatching { EzXposed.initModuleResources() }
             .onFailure { HLog.w(TAG, "initModuleResources failed: ${it.message}") }

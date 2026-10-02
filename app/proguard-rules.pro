@@ -11,6 +11,11 @@
 #   - 宿主/框架类（com.miui.dock.*、MiuiMultiWindowUtils、ActivityThread）均为
 #     字符串反射目标，不在本 APK 内，不受 R8 影响
 
+# 字符串式 Class.forName 找**自己人**（FanUiWarmup 预热清单等）依赖原始类名——
+# R8 重命名后全量 miss（1002 OS4 实机 8 条 preload miss 实锤）。模块反射面多，
+# 统一保名（只防混淆不防裁剪，体积代价=名字符串）。
+-keepnames class com.lsp.hypersidebar.**
+
 # 崩溃栈可读性（映射文件在 outputs/mapping/release/）
 -keepattributes SourceFile,LineNumberTable
 -renamesourcefileattribute SourceFile
