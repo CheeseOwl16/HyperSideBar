@@ -55,6 +55,13 @@ class XposedInit : XposedModule() {
         }.onFailure {
             HLog.e("HSBNative", "legacy loadLibrary FAILED: ${it.message}")
         }
+        // 日志桥无条件武装（2026-10-02 晚升级：原 pkg==HOME 门控失效——home 进程
+        // 的 onPackageReady 可能不触发或报异名包，条件匹配永远走不到，[launcher]
+        // 段在 onModuleLoaded 已跑的情况下依旧拉不出来）。onModuleLoaded=模块在
+        // 进程内的最早时刻，挂 Application.attach 全进程通吃；LogDumpBridge 幂等，
+        // 各 hook 的富 provider 注册照常升级。HyperOS runtime（Rust 桌面）进程若
+        // 有标准 Application 生命周期即被覆盖。
+        armEarlyLogDumpBridge()
     }
 
     override fun onPackageLoaded(param: PackageLoadedParam) {
@@ -66,14 +73,6 @@ class XposedInit : XposedModule() {
 
         val procName = currentProcessName()
         HLog.i(TAG, "onPackageReady: pkg=${param.packageName} proc=$procName")
-
-        // 桌面日志通道提前武装（2026-10-02 实机教训：自检导出 [launcher] 段整体缺失=
-        // EdgeGestureHook 没走到注册，桌面环形缓冲成了读不出的黑洞）。在分支匹配之前
-        // 挂上，宿主分支匹配失败/hook init 崩溃也能把 HLog 拉回；LogDumpBridge 幂等，
-        // EdgeGestureHook 稍后的富 provider 注册会自动升级。
-        if (param.packageName == HostPackages.HOME) {
-            armEarlyLogDumpBridge()
-        }
         when {
             param.packageName == HostPackages.UI_HOST && procName.endsWith(HostPackages.UI_PROCESS_SUFFIX) -> {
                 // 横屏 B 路线触发端 + 竖屏小白条隐藏穿透宿主 + 执行端（fan 选中动作本进程直执行）
@@ -119,13 +118,21 @@ class XposedInit : XposedModule() {
         }
     }
 
+    /** 单次守卫：attach hook 每进程只装一份（各 hook 自己的 attach hook 独立共存） */
+    @Volatile
+    private var earlyBridgeHooked = false
+
     /**
-     * 桌面进程日志桥提前武装：hook Application.attach 后只注册 LogDumpBridge
-     * （不依赖 EdgeGestureHook 的任何状态）。方法找不到 = 记 W 级（本身就是证据）。
+     * 日志桥无条件武装（onModuleLoaded 调用，全进程最早时刻）：hook
+     * Application.attach 后只注册 LogDumpBridge，不依赖任何包事件分发/hook init。
+     * HyperOS runtime（Rust 桌面）进程若有标准 Application 生命周期即被覆盖。
+     * 方法找不到 = 记 W 级（本身就是证据）。
      */
     private fun armEarlyLogDumpBridge() {
+        if (earlyBridgeHooked) return
+        earlyBridgeHooked = true
         runCatching {
-            val hooked = MethodFinder.fromClass("android.app.Application")
+            val hooked = MethodFinder.fromClass(android.app.Application::class.java)
                 .filterByName("attach")
                 .filterByParamTypes(Context::class.java)
                 .firstOrNull()
