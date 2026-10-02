@@ -104,13 +104,31 @@ class EdgeGestureHook(
     private var swipeConfirmed = false
     private var anchorX = 0f
     private var anchorY = 0f
-    private var anchorT = -1L
     private var stallFired = false
 
     /** 速度窗口基准时刻（见 GestureThresholds.STALL_SPEED_WINDOW_MS；基准位置复用 anchorX/Y） */
     private var speedWinT = 0L
     private var gestureSeq = 0   // 手势取证 id：贯穿 DOWN/确认/停顿/拦截/UP 日志（S 门数据源）
     private var gestureInZone = false  // DOWN 判定的触发区归属；区外手势整条透传
+
+    // ===== 停顿定时器（13.1，对齐 OS4 gesture_pause_detector 的"逐帧判静止"思路） =====
+    // 旧判定把 `eventTime - anchorT >= dwell` 放在 MOVE 事件里评估——手指一停宿主就停止
+    // 上报 MOVE，条件满足也没人来评估，只能等下一次抖动或 UP 结算：设定 250ms 实测
+    // 902/1787/1011ms（0915 三轮），dwell 滑条调参不可信。定时器在确认/每次速度重计时
+    // 时（重新）挂上，到点主动开火，不再依赖事件到达。
+    private var stallTimer: Runnable? = null
+    private var stallTimerSeq = -1
+    /** 定时器 Handler：必须挂触摸线程的 looper——fire 里的 cancelNativeGesture 合成 UP
+     *  只允许在输入线程执行（0915 定案+外部审计）。触摸线程无 looper 的兜底形态退回
+     *  主线程并跳过合成 UP（onSwipeStop 拦截层仍会翻转 shouldBack 兜底收尾）。 */
+    private var stallTimerHandler: android.os.Handler? = null
+    private var stallTimerOnTouchThread = false
+
+    /** fire 快照：定时器开火时手指已静止、无实时事件可抄（合成 UP 用）；合格 MOVE 持续刷新 */
+    private var lastDownTime = 0L
+    private var lastEventTime = 0L
+    private var lastRawX = 0f
+    private var lastRawY = 0f
 
     // 滑动确认/重置阈值（px）：滑动距离设置项换算缓存，DOWN 时刷新。
     // 重置=确认×滞回系数（0913 取证 g#44/45：零滞回下近阈值悬停 1~2px 外漂即整条清零）
@@ -134,6 +152,19 @@ class EdgeGestureHook(
     private val cornerTrigger = CornerTrigger()
     private var hotMethod: java.lang.reflect.Method? = null
     private var cornerSeq = 0
+
+    /** 底角事件快照：锥外早退时按原时序合成重放给原生（DOWN+MOVE，原生从未见过它们
+     *  ——hook 消费发生在 onTouchEvent 之前，重放=给处理器一个干净的新手势起点）。 */
+    private data class CornerEventSnapshot(
+        val downTime: Long,
+        val eventTime: Long,
+        val action: Int,
+        val x: Float,
+        val y: Float,
+    )
+
+    private val cornerReplayBuffer = ArrayList<CornerEventSnapshot>()
+    private var cornerReplaying = false
 
     override fun init() {
         HLog.i(TAG, "=== EdgeGestureHook init, pid=${android.os.Process.myPid()} ===")
@@ -428,6 +459,8 @@ class EdgeGestureHook(
             return false
         }
         method.createBeforeHook {
+            // 重放进行中：缓冲事件经 dispatchTouchEvent 回流，本次 hook 直接放行（防递归）
+            if (cornerReplaying) return@createBeforeHook
             val ev = it.args[0] as? MotionEvent ?: return@createBeforeHook
             val view = it.thisObject as? View
             if (handleCornerTouch(ev, view)) it.result = true
@@ -470,7 +503,12 @@ class EdgeGestureHook(
             }
             fanController.dispatchTouchEvent(ev)
             if (ev.actionMasked == MotionEvent.ACTION_UP || ev.actionMasked == MotionEvent.ACTION_CANCEL) {
-                fanController.dismiss()
+                // 常驻模式：松手未提交选中 → 转点选态（窗口保留）；现状=立即收起。
+                // UP 已提交选中时 LAUNCHED 收起在先、isShowing=false，两分支都自然跳过
+                if (fanController.isShowing) {
+                    if (fanPersistentOnRelease()) fanController.onGestureEnded()
+                    else fanController.dismiss()
+                }
                 resetGesture()
             }
             return true
@@ -512,16 +550,38 @@ class EdgeGestureHook(
                     resetPx = confirmPx * GestureThresholds.SWIPE_RESET_RATIO
                 }
                 val hot = view?.let { v -> hotSpacePx(v).toFloat() } ?: 0f
+                // 底角参数（防误触收紧 2026-10-01）：角窗宽度/角度锥全部设置项化（底角 sheet）
+                val density = dm?.density ?: 1f
+                val widthRatio = runCatching {
+                    remotePrefs.getFloat(PrefKeys.CORNER_WIDTH_RATIO, LayoutDefaults.CORNER_WIDTH_RATIO)
+                }.getOrDefault(LayoutDefaults.CORNER_WIDTH_RATIO)
+                val minDeg = runCatching {
+                    remotePrefs.getInt(PrefKeys.CORNER_MIN_ANGLE_DEG, LayoutDefaults.CORNER_MIN_ANGLE_DEG)
+                }.getOrDefault(LayoutDefaults.CORNER_MIN_ANGLE_DEG).toFloat()
+                val maxDeg = runCatching {
+                    remotePrefs.getInt(PrefKeys.CORNER_MAX_ANGLE_DEG, LayoutDefaults.CORNER_MAX_ANGLE_DEG)
+                }.getOrDefault(LayoutDefaults.CORNER_MAX_ANGLE_DEG).toFloat()
+                val inwardMinPx = GestureThresholds.CORNER_INWARD_MIN_DP * density
                 val claimed = cornerTrigger.onDown(
                     ev.rawX, ev.rawY, w, h, hot,
-                    w * GestureThresholds.CORNER_WIDTH_RATIO,
+                    w * widthRatio,
                     confirmPx,
-                    GestureThresholds.CORNER_MIN_ANGLE_DEG,
-                    GestureThresholds.CORNER_MAX_ANGLE_DEG
+                    inwardMinPx,
+                    minDeg,
+                    maxDeg,
+                    GestureThresholds.CORNER_ABANDON_EXTRA_DEG,
+                    GestureThresholds.CORNER_CONFIRM_FRAMES
                 )
+                if (claimed) {
+                    cornerReplayBuffer.clear()
+                    cornerReplayBuffer += CornerEventSnapshot(
+                        ev.downTime, ev.eventTime, ev.actionMasked, ev.rawX, ev.rawY
+                    )
+                }
                 vlog(
                     "c#$cornerSeq DOWN raw=(${ev.rawX.toInt()},${ev.rawY.toInt()}) " +
-                        "screen=(${w.toInt()},${h.toInt()}) hot=${hot.toInt()} claimed=$claimed"
+                        "screen=(${w.toInt()},${h.toInt()}) hot=${hot.toInt()} claimed=$claimed " +
+                        "width=${(w * widthRatio).toInt()} cone=[$minDeg,$maxDeg] inwardMin=${inwardMinPx.toInt()}"
                 )
                 return claimed
             }
@@ -534,13 +594,27 @@ class EdgeGestureHook(
                             "c#$cornerSeq corner swipe SHOW raw=(${ev.rawX.toInt()},${ev.rawY.toInt()})"
                         )
                         StatsRecorder.onStall()
+                        cornerReplayBuffer.clear()
                         fanSeenThisGesture = false
                         // 底角专用几何：锚点=精确底角、半径固定取竖屏设置、弧占向上象限、
                         // 快捷栏在上缘之上（N1 option B，用户定案）
                         postShowFanCorner(view)
                         return true
                     }
-                    CornerTrigger.Action.CONSUME -> return true
+                    CornerTrigger.Action.ABANDON_REPLAY -> {
+                        // 明确竖直（非斜滑意图）：把缓冲的 DOWN+MOVE 按原时序重放给原生
+                        // （合成事件经 dispatchTouchEvent 回流，hook 侧 cornerReplaying 放行；
+                        // 重放失败安全回退=保持消费）。之后实时事件经 abandoned→PASS 透传。
+                        replayCornerGesture(view)
+                        return false
+                    }
+                    CornerTrigger.Action.CONSUME -> {
+                        // 判定中：缓冲快照（重放用）；触发成功时清空（扇形已接管后续）
+                        cornerReplayBuffer += CornerEventSnapshot(
+                            ev.downTime, ev.eventTime, ev.actionMasked, ev.rawX, ev.rawY
+                        )
+                        return true
+                    }
                     CornerTrigger.Action.PASS -> return false
                 }
             }
@@ -549,18 +623,52 @@ class EdgeGestureHook(
                 return cornerTrigger.onPointerDown() == CornerTrigger.Action.CONSUME
 
             MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                val consume = cornerTrigger.onEnd() == CornerTrigger.Action.CONSUME
-                // 未展示前松手（触发后主线程装配尚未落地）：撤销排队的 show（"未预选松手即收起"）
-                if (consume && !fanController.isShowing) cancelPendingShow()
-                vlog("c#$cornerSeq UP/CANCEL consume=$consume shown=${fanController.isShowing}")
+                // 已重放（竖直尾巴）：native 正在处理重放手势，UP 自然透传完成它
+                val replayed = cornerTrigger.abandoned && !cornerTrigger.consumedToEnd
+                val consume = !replayed && cornerTrigger.onEnd() == CornerTrigger.Action.CONSUME
+                // 未展示前松手（触发后主线程装配尚未落地）：撤销排队的 show（"未预选松手即收起"）；
+                // 常驻模式改为照常落地并进点选态（同边缘通道 stallFired 分支）
+                if (consume && !fanController.isShowing) {
+                    if (fanPersistentOnRelease() && pendingShow != null) fanController.markReleasedOnArrival()
+                    else cancelPendingShow()
+                }
+                vlog("c#$cornerSeq UP/CANCEL consume=$consume replayed=$replayed shown=${fanController.isShowing}")
                 cornerTrigger.reset()
+                cornerReplayBuffer.clear()
                 return consume
             }
 
             // 已接管手势的其余事件（POINTER_UP 等）一律消费，绝不中途放行
-            else -> return cornerTrigger.claimed
+            else -> return cornerTrigger.claimed && !cornerTrigger.abandoned
         }
-        return cornerTrigger.claimed
+        return cornerTrigger.claimed && !cornerTrigger.abandoned
+    }
+
+    /**
+     * 锥外早退重放（2026-10-01）：把缓冲的 DOWN+MOVE 按原时序合成后喂回 NavStubView。
+     * 原生处理器从未见过这些事件（hook 消费发生在 onTouchEvent 之前），收到的是干净的
+     * 新手势起点——修复"底角起手的竖直上滑被吞、回桌面/后台白做"。重放事件经
+     * dispatchTouchEvent 回流时由 [cornerReplaying] 标志放行（防 BeforeHook 递归）；
+     * 失败安全回退=保持消费（现状行为，手势仍会丢但不至于撕裂）。
+     */
+    private fun replayCornerGesture(view: View?) {
+        val v = view ?: run {
+            cornerReplayBuffer.clear()
+            return
+        }
+        cornerReplaying = true
+        try {
+            for (s in cornerReplayBuffer) {
+                val e = MotionEvent.obtain(s.downTime, s.eventTime, s.action, s.x, s.y, 0)
+                try { v.dispatchTouchEvent(e) } finally { e.recycle() }
+            }
+            HLog.i(TAG, "c#$cornerSeq replay ${cornerReplayBuffer.size} buffered events to native (vertical tail)")
+        } catch (e: Throwable) {
+            HLog.w(TAG, "corner replay failed: ${e.message} — falling back to consume-to-end")
+        } finally {
+            cornerReplayBuffer.clear()
+            cornerReplaying = false
+        }
     }
 
     /**
@@ -642,7 +750,12 @@ class EdgeGestureHook(
             }
             fanController.dispatchTouchEvent(ev)
             if (ev.actionMasked == MotionEvent.ACTION_UP || ev.actionMasked == MotionEvent.ACTION_CANCEL) {
-                fanController.dismiss()
+                // 常驻模式：松手未提交选中 → 转点选态（窗口保留）；现状=立即收起。
+                // UP 已提交选中时 LAUNCHED 收起在先、isShowing=false，两分支都自然跳过
+                if (fanController.isShowing) {
+                    if (fanPersistentOnRelease()) fanController.onGestureEnded()
+                    else fanController.dismiss()
+                }
                 resetGesture()
             }
             return true
@@ -671,7 +784,6 @@ class EdgeGestureHook(
                 gestureSeq++
                 swipeConfirmed = false
                 stallFired = false
-                anchorT = -1L
                 // 滑动距离换算（dp→px，DOWN 一次缓存整条手势；设置项即时经 ConfigSync 生效）
                 (stub?.context ?: safeAppContext())?.resources?.displayMetrics?.let { dm ->
                     val distanceDp = try {
@@ -716,15 +828,22 @@ class EdgeGestureHook(
                         swipeConfirmed = true
                         anchorX = ev.rawX
                         anchorY = ev.rawY
-                        anchorT = ev.eventTime
                         speedWinT = ev.eventTime
                         vlog("g#$gestureSeq swipe confirmed: inward=${inward.toInt()}px (>= ${confirmPx.toInt()}) angle=${angle.toInt()}")
+                        // 13.1：确认即挂停顿定时器（取代旧 anchorT 基准+事件内评估）
+                        armStallTimer(stub)
                     }
                 }
 
                 if (swipeConfirmed && !stallFired) {
+                    // fire 快照：定时器开火时手指已静止、无实时事件可抄（合成 UP 用）。
+                    // 确认后的每个 MOVE 都刷新——开火用的是最后一次真实触碰的位置/时刻。
+                    lastDownTime = ev.downTime
+                    lastEventTime = ev.eventTime
+                    lastRawX = ev.rawX
+                    lastRawY = ev.rawY
                     // 速度判据（0915 三轮实测定案，见 GestureThresholds.STALL_MAX_SPEED_PX_S）：
-                    // 只有"窗内平均速度仍高于阈值"才重新计时。位移式判据会被缓慢持续漂移
+                    // 只有"窗内平均速度仍高于阈值"才重启定时器。位移式判据会被缓慢持续漂移
                     // 周期性触发，把 dwell 整轮重置（横屏实测均值 661ms，且数值是 250 的整数倍）。
                     // 速度窗口同时把锚点刷成"settle 时刻的位置"，日志里的 anchor 更有意义。
                     val dt = ev.eventTime - speedWinT
@@ -733,27 +852,31 @@ class EdgeGestureHook(
                         anchorX = ev.rawX
                         anchorY = ev.rawY
                         speedWinT = ev.eventTime
-                        if (speed > GestureThresholds.STALL_MAX_SPEED_PX_S) anchorT = ev.eventTime
+                        if (speed > GestureThresholds.STALL_MAX_SPEED_PX_S) restartStallTimer(stub)
                     }
-                    // 达标判定独立于速度：本帧刚重新计时时 anchorT==eventTime，差值 0 天然不误触发
-                    if (ev.eventTime - anchorT >= dwellMs()) {
-                        stallFired = true
-                        StatsRecorder.onStall()
-                        vlog("g#$gestureSeq STALL ${dwellMs()}ms 达标 anchor=(${anchorX.toInt()},${anchorY.toInt()})")
-                        cancelNativeGesture(stub, ev)
-                        postShowFan(ev, stub)
-                        return true
-                    }
+                    // 达标判定在定时器 fire（fireStall）：手指静止后无 MOVE 也照常触发
                 }
             }
 
             MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
                 vlog("g#$gestureSeq UP stallFired=$stallFired shown=${fanController.isShowing}")
+                cancelStallTimer()
                 if (stallFired) {
-                    cancelPendingShow()
-                    // 实测轮七：fan 已落地而手指未预选即松手 → 立即收起。
-                    // 此前只重置手势状态——fan 失去唯一驱动源后常驻（PRD"未预选松手→立即收起"）
-                    if (fanController.isShowing) fanController.dismiss()
+                    if (fanController.isShowing) {
+                        // 常驻模式：松手未提交选中 → 转点选态（窗口保留）；现状=立即收起。
+                        // 实测轮七的旧语义：fan 失去手势驱动源后会常驻——常驻模式下这正是
+                        // 期望行为，看门狗（10s）兜底收起
+                        if (fanPersistentOnRelease()) fanController.onGestureEnded()
+                        else {
+                            cancelPendingShow()
+                            fanController.dismiss()
+                        }
+                    } else if (fanPersistentOnRelease() && pendingShow != null) {
+                        // fan 装配中就松手：照常落地并直接进点选态（呼出后常驻的边界场景）
+                        fanController.markReleasedOnArrival()
+                    } else {
+                        cancelPendingShow()
+                    }
                     resetGesture()
                     return true
                 }
@@ -763,8 +886,9 @@ class EdgeGestureHook(
         return false
     }
 
-    /** 停顿触发 → 主线程弹 fan（launcher 触摸回调在 MiuiMirror 输入线程，Compose 需主线程装配）。 */
-    private fun postShowFan(ev: MotionEvent, stub: View?) {
+    /** 停顿触发 → 主线程弹 fan（launcher 触摸回调在 MiuiMirror 输入线程，Compose 需主线程装配）。
+     *  13.1 起由停顿定时器 fire 调用，事件参数不再需要（锚点取 downY 字段）。 */
+    private fun postShowFan(stub: View?) {
         val ctx = safeAppContext() ?: stub?.context ?: run {
             HLog.w(TAG, "postShowFan: no context available")
             return
@@ -853,7 +977,7 @@ class EdgeGestureHook(
      * 只有字段名与类名被重命名 ⇒ 按候选名优先、再按"字段类型声明了 onPointerEvent"结构化
      * 兜底，即可同时覆盖两代，且未来再改名也能自愈。
      */
-    private fun cancelNativeGesture(stub: View?, ev: MotionEvent) {
+    private fun cancelNativeGestureSnapshot(stub: View?) {
         if (stub == null) return
         runCatching {
             val processor = resolveGestureProcessor(stub) ?: run {
@@ -869,7 +993,7 @@ class EdgeGestureHook(
             }
             method.isAccessible = true
             val up = MotionEvent.obtain(
-                ev.downTime, ev.eventTime, MotionEvent.ACTION_UP, ev.rawX, ev.rawY, 0
+                lastDownTime, lastEventTime, MotionEvent.ACTION_UP, lastRawX, lastRawY, 0
             )
             try { method.invoke(processor, up, stub) } finally { up.recycle() }
             HLog.i(TAG, "native gesture teardown via synthetic UP (${processor.javaClass.simpleName})")
@@ -935,6 +1059,52 @@ class EdgeGestureHook(
         pendingShow = null
     }
 
+    // ===== 停顿定时器（13.1）：确认挂上 → 速度超阈值重启 → UP/滑回/重置取消 → 到点开火 =====
+
+    private fun ensureStallHandler(): android.os.Handler {
+        stallTimerHandler?.let { return it }
+        val looper = android.os.Looper.myLooper()
+        stallTimerOnTouchThread = looper != null
+        if (!stallTimerOnTouchThread) {
+            HLog.w(TAG, "stall timer: touch thread has no looper, falling back to main " +
+                "(synthetic UP will be skipped; onSwipeStop layer covers teardown)")
+        }
+        return android.os.Handler(looper ?: android.os.Looper.getMainLooper()).also { stallTimerHandler = it }
+    }
+
+    private fun armStallTimer(stub: View?) {
+        cancelStallTimer()
+        stallTimerSeq = gestureSeq
+        val dwell = dwellMs()
+        val r = Runnable { fireStall(stub) }
+        stallTimer = r
+        ensureStallHandler().postDelayed(r, dwell)
+    }
+
+    /** 速度窗内超速=手指仍在主动移动：dwell 全额重启（语义同旧 anchorT=eventTime 重置）。 */
+    private fun restartStallTimer(stub: View?) {
+        armStallTimer(stub)
+        vlog("g#$gestureSeq STALL-TIMER restart ${dwellMs()}ms (speed > ${GestureThresholds.STALL_MAX_SPEED_PX_S.toInt()}px/s)")
+    }
+
+    private fun cancelStallTimer() {
+        stallTimer?.let { (stallTimerHandler ?: mainHandler).removeCallbacks(it) }
+        stallTimer = null
+    }
+
+    /** 定时器开火（触摸线程）：序号守卫防跨手势误触，fire 前重验手势仍有效。 */
+    private fun fireStall(stub: View?) {
+        if (stallTimer == null) return  // removeCallbacks 与在途任务竞态：已取消则静默退出
+        stallTimer = null
+        if (stallTimerSeq != gestureSeq || !swipeConfirmed || stallFired) return
+        if (DataDeadState.dead || !moduleEnabled()) return
+        stallFired = true
+        StatsRecorder.onStall()
+        vlog("g#$gestureSeq STALL-TIMER fire ${dwellMs()}ms anchor=(${anchorX.toInt()},${anchorY.toInt()})")
+        if (stallTimerOnTouchThread) cancelNativeGestureSnapshot(stub)
+        postShowFan(stub)
+    }
+
     /** PRD 触发区（§9.5 行为规则 3 / §7.3.1）：竖屏 [H/3, 2H/3]；横屏=原小白条位置带。 */
     private fun isInTriggerZone(x: Float, y: Float, stub: View?): Boolean {
         val dm = (stub?.context ?: safeAppContext())?.resources?.displayMetrics ?: return false
@@ -962,9 +1132,9 @@ class EdgeGestureHook(
     private fun resetGesture() {
         swipeConfirmed = false
         stallFired = false
-        anchorT = -1L
         speedWinT = 0L
         fanSeenThisGesture = false
+        cancelStallTimer()
     }
 
     private fun dwellMs(): Long = try {
@@ -976,6 +1146,13 @@ class EdgeGestureHook(
     /** 总开关（设置页"启用超级侧边栏"，PrefKeys.ENABLED）：关闭=本 hook 停止一切侵入。 */
     private fun moduleEnabled(): Boolean =
         runCatching { remotePrefs.getBoolean(PrefKeys.ENABLED, true) }.getOrDefault(true)
+
+    /** 常驻扇形（设置页"呼出后常驻"，PrefKeys.FAN_PERSISTENT_ON_RELEASE）：
+     *  开=松手未提交选中时扇形转点选态常驻；关=现状（未预选松手立即收起）。 */
+    private fun fanPersistentOnRelease(): Boolean =
+        runCatching {
+            remotePrefs.getBoolean(PrefKeys.FAN_PERSISTENT_ON_RELEASE, LayoutDefaults.FAN_PERSISTENT_ON_RELEASE)
+        }.getOrDefault(false)
 
     /** 底角斜滑开关（N1，默认关）：关闭=底角手势完全透传原生。 */
     private fun cornerSwipeEnabled(): Boolean = runCatching {

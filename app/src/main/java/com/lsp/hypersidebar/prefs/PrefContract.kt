@@ -30,12 +30,23 @@ object PrefKeys {
     /** 底角斜滑触发开关（N1，仅竖屏）：默认关（opt-in）。开=底部两角斜向内上滑呼出扇形。 */
     const val CORNER_SWIPE_ENABLED = "cornerSwipeEnabled"
 
+    /** 常驻扇形（呼出后松手不收起，13.1 同批新增）：开=松手后扇形停留，点图标启动、
+     *  点空白收起（吞点击）、10s 无操作看门狗自动收起；关=现状（未预选松手立即收起）。
+     *  同时是 OS4 R1-J（securitycenter 侧改道点选模式）的交互地基。 */
+    const val FAN_PERSISTENT_ON_RELEASE = "fanPersistentOnRelease"
+
     /** 底角斜滑扇形独立样式（N1，仅竖屏）：默认值=竖屏布局值，故开箱与竖屏效果一致、可独立微调。 */
     const val CORNER_ICON_SIZE = "cornerIconSize"
     const val CORNER_INNER_RADIUS = "cornerInnerRadius"
     const val CORNER_OUTER_RADIUS = "cornerOuterRadius"
     const val CORNER_MAX_APPS_OUTER = "cornerMaxAppsOuter"
     const val CORNER_MAX_APPS_INNER = "cornerMaxAppsInner"
+
+    /** 底角触发参数（防误触收紧 2026-10-01，底角 sheet 滑条）：角窗宽度占比、角度锥上下沿。
+     *  默认 12% / 25°~65°（原 20% / 20°~82°：靠边起手的日常上滑被 82° 上沿大量误呼出）。 */
+    const val CORNER_WIDTH_RATIO = "cornerWidthRatio"
+    const val CORNER_MIN_ANGLE_DEG = "cornerMinAngleDeg"
+    const val CORNER_MAX_ANGLE_DEG = "cornerMaxAngleDeg"
 
     /** 板材质浓度（0~0.70）：统一驱动 miuix 板材质的「主题混色 + Screen 提亮 + 噪点抖动」，
      *  0=只剩弧线与图标。键名沿用旧雾化键，保用户已调数值 */
@@ -257,14 +268,31 @@ object LayoutDefaults {
     /** 底角斜滑触发默认开关（N1）：默认关，用户显式开启后才接管底角手势。 */
     const val CORNER_SWIPE_ENABLED = false
 
+    /** 常驻扇形默认开关：默认关=现状交互（未预选松手立即收起）。 */
+    const val FAN_PERSISTENT_ON_RELEASE = false
+
     /** 底角斜滑扇形样式默认值：图标沿用竖屏（32dp），半径与数量独立定档（仿 Flyme 大半径
      *  四分之一弧，双环 13 图标不挤在小弧上）。0922 起数量不再跟竖屏联动。
      *  可在底角布局 sheet 独立微调。 */
     const val CORNER_ICON_SIZE = ICON_SIZE
+
     const val CORNER_INNER_RADIUS = 216f   // 0922：270→216（恰为外圈 80% 上限）
     const val CORNER_OUTER_RADIUS = 270f   // 0922：380→270
     const val CORNER_MAX_APPS_OUTER = 8
     const val CORNER_MAX_APPS_INNER = 5
+
+    /** 底角触发参数默认值（LayoutDefaults 契约，2026-10-01 防误触收紧）：见 PrefKeys 同名键 */
+    const val CORNER_WIDTH_RATIO = 0.12f
+    const val CORNER_WIDTH_RATIO_MIN = 0.10f
+    const val CORNER_WIDTH_RATIO_MAX = 0.25f
+    const val CORNER_WIDTH_RATIO_STEP = 0.01f
+    const val CORNER_MIN_ANGLE_DEG = 25
+    const val CORNER_MIN_ANGLE_MIN = 15
+    const val CORNER_MIN_ANGLE_MAX = 45
+    const val CORNER_MAX_ANGLE_DEG = 65
+    const val CORNER_MAX_ANGLE_MIN = 45
+    const val CORNER_MAX_ANGLE_MAX = 80
+    const val CORNER_ANGLE_STEP = 5
 
     // ===== 滑条量程契约（0913 用户拍板：量程/步进与默认值同源定义，UI 禁止内联数字）=====
     /** 滑动距离滑条（dp）：min / max / 步进。默认值=上方 TRIGGER_MIN_DISTANCE_DP，须落在格点上 */
