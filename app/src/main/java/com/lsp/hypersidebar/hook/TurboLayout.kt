@@ -191,12 +191,13 @@ class TurboLayout(private val remotePrefs: SharedPreferences) : BaseHook() {
     // 前两参=呼出点屏幕坐标（竖屏右缘 x≈968/1080、横屏左缘 x≈110/2400），后三参恒
     // 66/145/22（尺寸/类型常量，暂不需要）。呼出编排=客户端 J(canShow) 轮询→
     // J0(hide)→p7(show)；实测 p7 在松手后才到（OS4 原生时机）。
-    // 本 hook=**时机备选**（开关 EVOKE_BORROW_SYSTEM 默认关）：开=吃掉 p7（原生面板
-    // 不出现）改呼扇形——覆盖全边缘但松手后才出现、恒点选态；关=放行原生（条外边缘
-    // 停顿保持系统行为）。主触发=条上状态机（hookOnTouch OS4 分支，无需松手/OS3 时机），
-    // 不受本开关影响。接口名 com.miui.sidebar.ISidebarOverlay 未混淆（AIDL 稳定），
-    // 方法按签名形状解析（(IIIII)V 在接口 abstract 里唯一）；OS2/OS3 无此类=惰性退出。
-    // 实测消费后客户端无 p7 重试风暴（B1 轮询照常），编排接管不需要。
+    // 本 hook=**p7 常拦**（两态原生面板都不出现，模块独占触发=OS3 化）：开
+    // （EVOKE_BORROW_SYSTEM，默认关）=条外边缘停顿（松手后 p7）改呼扇形——全边缘
+    // 补充触发、恒点选态；关=p7 静默消费（条外停顿无动作）。主触发=条上状态机
+    // （hookOnTouch OS4 分支，无需松手/OS3 时机），不受本开关影响。前置：借用模式
+    // 需系统开启「侧边停顿呼出」。接口名 com.miui.sidebar.ISidebarOverlay 未混淆
+    // （AIDL 稳定），方法按签名形状解析（(IIIII)V 在接口 abstract 里唯一）；
+    // OS2/OS3 无此类=惰性退出。实测消费后客户端无 p7 重试风暴（B1 轮询照常）。
     private fun hookSidebarEvoke() {
         val cl = io.github.kyuubiran.ezxhelper.core.ClassLoaderProvider.safeClassLoader
         val itf = runCatching { Class.forName(EVOKE_ITF, false, cl) }.getOrNull() ?: run {
@@ -218,19 +219,21 @@ class TurboLayout(private val remotePrefs: SharedPreferences) : BaseHook() {
             val m = impl.getDeclaredMethod(entry.name, *entry.parameterTypes)
             m.isAccessible = true
             m.createBeforeHook { param ->
-                // 借用系统判定开关（默认关=条上停顿即呼出无需松手/OS3 时机；用户
-                // 1003 深夜定案：开关=时机选择非面板选择）。关=放行 p7（条外边缘
-                // 停顿保持系统原生行为）；开=拦 p7，松手后呼出扇形（恒点选态）。
-                if (!remotePrefs.getBoolean(
-                        PrefKeys.EVOKE_BORROW_SYSTEM, LayoutDefaults.EVOKE_BORROW_SYSTEM
-                    )
-                ) return@createBeforeHook
+                // 借用系统判定开关（默认关；1003 深夜定案：开关=是否借用系统判定，
+                // 非"面板选择"——两态下原生面板都不出现，模块独占触发=OS3 化）：
+                //   开=条外边缘停顿（松手后 p7）改呼扇形（全边缘补充触发，恒点选态）
+                //   关=p7 静默消费（条外边缘停顿无动作；原生面板不出现）
+                // 条上状态机触发（hookOnTouch OS4 分支）不受本开关影响。
+                // 退路：总开关关/熔断/数据源死亡 → p7 放行 → 原生面板回归。
                 val x = param.args[0] as Int
                 val y = param.args[1] as Int
-                // 让位面（同 hookOnTouch 横屏分支）：原生面板接管，本 hook 全放行
                 if (!moduleEnabled() || breaker.open || DataDeadState.dead) return@createBeforeHook
-                if (fanController.isShowing) {
-                    // 已在显示：吃掉重复呼出，不重弹（等原生 hide 或用户操作）
+                val borrow = remotePrefs.getBoolean(
+                    PrefKeys.EVOKE_BORROW_SYSTEM, LayoutDefaults.EVOKE_BORROW_SYSTEM
+                )
+                if (!borrow || fanController.isShowing) {
+                    // 关（静默消费，防原生面板突现）/开但已在显示（不重弹）
+                    HLog.i(TAG, "evoke consumed: ($x,$y) borrow=$borrow showing=${fanController.isShowing}")
                     param.result = null
                     return@createBeforeHook
                 }
@@ -240,7 +243,7 @@ class TurboLayout(private val remotePrefs: SharedPreferences) : BaseHook() {
                 val anchorX = if (x < dm.widthPixels / 2f) 0f else dm.widthPixels.toFloat()
                 val anchorY = y.coerceIn(0, dm.heightPixels).toFloat()
                 HLog.i(TAG, "evoke→fan: ($x,$y) anchor=($anchorX,$anchorY)")
-                // OS4 恒点选态（markReleasedOnArrival→showInternal 落地转 released）：
+                // 借用模式恒点选态（markReleasedOnArrival→showInternal 落地转 released）：
                 // 手势流在桌面 Rust 手里，拖选物理不可得；released 下点图标直启
                 // （跳过 150ms 预选门——否则停顿呼出后快速点图标会被门误拦）、
                 // 点空白收起、10s 看门狗兜底。官方呼出范围无系数可套（侦察定案），
@@ -252,7 +255,7 @@ class TurboLayout(private val remotePrefs: SharedPreferences) : BaseHook() {
                 }
                 param.result = null
             }
-            HLog.i(TAG, "hookSidebarEvoke: ${impl.simpleName}.${entry.name}(IIIII)V armed（借用系统判定：松手后呼出，开关默认关）")
+            HLog.i(TAG, "hookSidebarEvoke: ${impl.simpleName}.${entry.name}(IIIII)V armed（p7 常拦：开=借用判定全边缘，关=静默消费）")
         }.onFailure { HLog.w(TAG, "hookSidebarEvoke failed: ${it.message}") }
     }
 
