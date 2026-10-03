@@ -67,6 +67,16 @@ internal object AnchorResolver {
     @Volatile
     private var hostRescoped = false
 
+    /**
+     * 晚解析回调：L2（DexKit）upgrade 出新 role 时触发一次（upgraded>0）。
+     * OS4 上 L1 解析不出（混淆漂移），依赖锚点的 hook/探针在 init 时刻是
+     * "未解析→跳过"，必须借本回调 re-arm——否则锚点解出来也永远没人挂
+     * （1003 实机：hookOnTouch skipped 后 L2 5/6 resolved，触摸 hook 始终未装）。
+     * 回调在 DexKit 完成线程上触发，实现方自行处理线程/幂等。
+     */
+    @Volatile
+    var onAnchorsLateResolved: (() -> Unit)? = null
+
     /** 便捷重载：直接吃宿主侧 prefs（总闸读 [PrefKeys.ANCHOR_STRUCTURAL_SCAN]，默认开） */
     fun resolveAll(prefs: android.content.SharedPreferences?): Map<String, RoleResolution> =
         resolveAll(
@@ -250,6 +260,10 @@ internal object AnchorResolver {
             TAG,
             "L2 complete: upgraded=$upgraded ${summary(out)} | native=${NativeLibLoader.statusLine} index=$indexState"
         )
+        if (upgraded > 0) {
+            runCatching { onAnchorsLateResolved?.invoke() }
+                .onFailure { HLog.w(TAG, "late-resolve callback failed: ${it.message}") }
+        }
     }
 
     /** 不走 EzXposed.appContext：它在 Application 未创建时会抛 NPE，message 还是 null。 */

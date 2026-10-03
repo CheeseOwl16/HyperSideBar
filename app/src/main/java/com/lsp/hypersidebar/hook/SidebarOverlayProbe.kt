@@ -105,6 +105,45 @@ class SidebarOverlayProbe : BaseHook() {
             }
             HLog.i(TAG, "probe: mgr ${MGR}.${y2?.name}(IIIII)V ${if (y2 != null) "hooked" else "not-found (renamed?)"}")
         }.onFailure { HLog.w(TAG, "probe: mgr hook failed: ${it.message}") }
+
+        // 把手触摸流观测（R1-J' 核心测绘）：sidebar_touch（k 类）的 onTouch——
+        // 全局侧边栏把手窗口（88x308 DISPLAY_OVERLAY）的触摸处理就在这里，
+        // 呼出=内部路径不过 binder（1003 实测定案）。observe-only：绝不消费事件。
+        // 锚点是 L2 晚解析 → 立即试一次 + 晚解析回调再试，幂等。
+        runCatching {
+            com.lsp.hypersidebar.anchor.AnchorResolver.onAnchorsLateResolved = {
+                runCatching { hookHandleTouchStream(cl) }
+                    .onFailure { HLog.w(TAG, "touch stream hook failed: ${it.message}") }
+            }
+            hookHandleTouchStream(cl)
+        }.onFailure { HLog.w(TAG, "probe: touch stream arm failed: ${it.message}") }
+    }
+
+    private var touchStreamHooked = false
+
+    /** 把手 onTouch 观测挂载（幂等）；呼出时逐事件打 action/x/y，不消费 */
+    private fun hookHandleTouchStream(cl: ClassLoader) {
+        if (touchStreamHooked) return
+        val role = com.lsp.hypersidebar.anchor.AnchorRoles.SIDEBAR_TOUCH.role
+        val cls = com.lsp.hypersidebar.anchor.AnchorResolver.fqcnOf(role) ?: run {
+            HLog.i(TAG, "touch stream: $role 未解析（等 L2 回调）")
+            return
+        }
+        val hooked = io.github.kyuubiran.ezxhelper.core.finder.MethodFinder.fromClass(
+            Class.forName(cls, false, cl)
+        ).filterByName("onTouch").firstOrNull()?.createBeforeHook { param ->
+            val ev = param.args.lastOrNull() as? android.view.MotionEvent ?: return@createBeforeHook
+            val view = param.args.firstOrNull() as? android.view.View
+            HLog.i(
+                TAG,
+                "touch: a=${ev.actionMasked} x=${ev.x.toInt()} y=${ev.y.toInt()} " +
+                    "vw=${view?.width} vh=${view?.height} rot=${view?.resources?.configuration?.orientation}"
+            )
+        }
+        if (hooked != null) {
+            touchStreamHooked = true
+            HLog.i(TAG, "touch stream hooked on $cls.onTouch (observe-only)")
+        }
     }
 
     /** SideSlideHold 设置值三命名空间探测（§12-1）：securitycenter 写入，类型待实测 */
