@@ -75,6 +75,10 @@ class TurboLayout(private val remotePrefs: SharedPreferences) : BaseHook() {
     private val whiteBarDrawable: String? get() = AnchorResolver.fqcnOf(AnchorRoles.SIDEBAR_DRAWABLE.role)
     private val handleBarView: String? get() = AnchorResolver.fqcnOf(AnchorRoles.SIDEBAR_HANDLE_BAR.role)
 
+    /** R1-J'：OS4 全局侧边栏 binder 契约（AIDL 名未混淆，跨版本稳定；见 hookSidebarEvoke） */
+    private val EVOKE_ITF = "com.miui.sidebar.ISidebarOverlay"
+    private val EVOKE_IMPL = "com.miui.gamebooster.service.DockWindowManagerService\$SidebarOverlayBinder"
+
     override val name: String = "HookTargetBox"
 
     /**
@@ -150,6 +154,64 @@ class TurboLayout(private val remotePrefs: SharedPreferences) : BaseHook() {
     // hookM26633Q（旧 `dock.sidebar.j.Q()` 装载与 sidebarWrapperRef）已删除：
     // 它只服务 getStats() 的 wrapper 计数，而 OS4 上该方法已漂移（j.Q() → p.Q(long)）。
     // 改用 cover 构造器计数（coverCtorCount），三版本等价且不依赖混淆名。
+
+    // ===== R1-J'（OS4 边缘停顿呼出改道，2026-10-03 测绘定稿） =====
+    // 1003 实机测绘：OS4 全局侧边栏把手+面板都在 :ui（DockWindowManagerService 系，
+    // 把手 88x308 DISPLAY_OVERLAY / 面板 FloatingWindow SYSTEM_ALERT 全屏），桌面 Rust
+    // 的"贴边滑+停顿"判定完成后经 binder 调 ISidebarOverlay.p7(x, y, 66, 145, 22)——
+    // 前两参=呼出点屏幕坐标（竖屏右缘 x≈968/1080、横屏左缘 x≈110/2400），后三参恒
+    // 66/145/22（尺寸/类型常量，暂不需要）。呼出编排=客户端 J(canShow) 轮询→
+    // J0(hide)→p7(show)；把手拖出走 :ui 内部路径不过 binder（产品拍板 2026-10-03：
+    // 把手保留原生，只改道边缘停顿——熔断/降级/总开关关时原生面板=完好退路）。
+    // 本 hook：吃掉 p7（原生面板不出现），呼出点换算扇形锚点（x 在屏宽哪半边=
+    // 左右缘，Y 跟随呼出点）。接口名 com.miui.sidebar.ISidebarOverlay 未混淆（AIDL
+    // 稳定），方法按签名形状解析（(IIIII)V 在接口 abstract 里唯一）；OS2/OS3 无此类
+    // =解析失败惰性退出。消费后客户端行为（B1 轮询是否重试 p7）由 SidebarProbe 观测。
+    private fun hookSidebarEvoke() {
+        val cl = io.github.kyuubiran.ezxhelper.core.ClassLoaderProvider.safeClassLoader
+        val itf = runCatching { Class.forName(EVOKE_ITF, false, cl) }.getOrNull() ?: run {
+            HLog.i(TAG, "hookSidebarEvoke: $EVOKE_ITF not found (OS2/OS3?) — inert")
+            return
+        }
+        val impl = runCatching { Class.forName(EVOKE_IMPL, false, cl) }.getOrNull() ?: run {
+            HLog.w(TAG, "hookSidebarEvoke: impl $EVOKE_IMPL not found — inert")
+            return
+        }
+        val entry = itf.declaredMethods.singleOrNull { m ->
+            java.lang.reflect.Modifier.isAbstract(m.modifiers) && m.returnType == Void.TYPE &&
+                m.parameterTypes.size == 5 && m.parameterTypes.all { it == Int::class.javaPrimitiveType }
+        } ?: run {
+            HLog.w(TAG, "hookSidebarEvoke: (IIIII)V abstract 唯一项不成立 — inert")
+            return
+        }
+        runCatching {
+            val m = impl.getDeclaredMethod(entry.name, *entry.parameterTypes)
+            m.isAccessible = true
+            m.createBeforeHook { param ->
+                val x = param.args[0] as Int
+                val y = param.args[1] as Int
+                // 让位面（同 hookOnTouch 横屏分支）：原生面板接管，本 hook 全放行
+                if (!moduleEnabled() || breaker.open || DataDeadState.dead) return@createBeforeHook
+                if (fanController.isShowing) {
+                    // 已在显示：吃掉重复呼出，不重弹（等原生 hide 或用户操作）
+                    param.result = null
+                    return@createBeforeHook
+                }
+                val ctx = runCatching { EzXposed.appContext }.getOrNull()
+                    ?: return@createBeforeHook // 拿不到 context 不吃——宁可原生也别吞呼出
+                val dm = ctx.resources.displayMetrics
+                val anchorX = if (x < dm.widthPixels / 2f) 0f else dm.widthPixels.toFloat()
+                val anchorY = y.coerceIn(0, dm.heightPixels).toFloat()
+                HLog.i(TAG, "evoke→fan: ($x,$y) anchor=($anchorX,$anchorY)")
+                mainHandler.post {
+                    runCatching { fanController.show(ctx, anchorX, anchorY) }
+                        .onFailure { HLog.w(TAG, "evoke→fan show failed: ${it.message}") }
+                }
+                param.result = null
+            }
+            HLog.i(TAG, "hookSidebarEvoke: ${impl.simpleName}.${entry.name}(IIIII)V armed（边缘停顿改道扇形）")
+        }.onFailure { HLog.w(TAG, "hookSidebarEvoke failed: ${it.message}") }
+    }
 
     // ===== B 路线横屏状态机（1B，PRD §7.1/§7.3.1） =====
     // 移植 EdgeGestureHook 的锚点圆法 v2（生产验证），适配 :ui 条上触摸：
@@ -461,7 +523,8 @@ class TurboLayout(private val remotePrefs: SharedPreferences) : BaseHook() {
             { hookCoverPassThrough() },
             { hookCoverLifecycleFlags() },
             { hookHideWhiteBar() },
-            { hookHandleBarPixelKill() }
+            { hookHandleBarPixelKill() },
+            { hookSidebarEvoke() }
         ).forEach { step ->
             runCatching { step() }.onFailure { HLog.e(TAG, "init step failed: ${it.message}", it) }
         }
