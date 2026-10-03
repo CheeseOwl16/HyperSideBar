@@ -68,14 +68,19 @@ internal object AnchorResolver {
     private var hostRescoped = false
 
     /**
-     * 晚解析回调：L2（DexKit）upgrade 出新 role 时触发一次（upgraded>0）。
+     * 晚解析回调（多播）：L2（DexKit）upgrade 出新 role 时逐个触发（upgraded>0）。
      * OS4 上 L1 解析不出（混淆漂移），依赖锚点的 hook/探针在 init 时刻是
      * "未解析→跳过"，必须借本回调 re-arm——否则锚点解出来也永远没人挂
-     * （1003 实机：hookOnTouch skipped 后 L2 5/6 resolved，触摸 hook 始终未装）。
-     * 回调在 DexKit 完成线程上触发，实现方自行处理线程/幂等。
+     * （1002 实机：hookOnTouch skipped 后 L2 5/6 resolved，触摸 hook 始终未装）。
+     * 回调在 DexKit 完成线程上触发，实现方自行处理线程/幂等；
+     * 多播原因：TurboLayout（hook 重装）与 SidebarOverlayProbe（触摸流观测）
+     * 各自独立挂监听，单槽会互相覆盖。
      */
-    @Volatile
-    var onAnchorsLateResolved: (() -> Unit)? = null
+    private val lateResolveListeners = java.util.concurrent.CopyOnWriteArrayList<() -> Unit>()
+
+    fun addOnAnchorsLateResolved(listener: () -> Unit) {
+        lateResolveListeners.add(listener)
+    }
 
     /** 便捷重载：直接吃宿主侧 prefs（总闸读 [PrefKeys.ANCHOR_STRUCTURAL_SCAN]，默认开） */
     fun resolveAll(prefs: android.content.SharedPreferences?): Map<String, RoleResolution> =
@@ -261,8 +266,10 @@ internal object AnchorResolver {
             "L2 complete: upgraded=$upgraded ${summary(out)} | native=${NativeLibLoader.statusLine} index=$indexState"
         )
         if (upgraded > 0) {
-            runCatching { onAnchorsLateResolved?.invoke() }
-                .onFailure { HLog.w(TAG, "late-resolve callback failed: ${it.message}") }
+            for (listener in lateResolveListeners) {
+                runCatching { listener() }
+                    .onFailure { HLog.w(TAG, "late-resolve callback failed: ${it.message}") }
+            }
         }
     }
 

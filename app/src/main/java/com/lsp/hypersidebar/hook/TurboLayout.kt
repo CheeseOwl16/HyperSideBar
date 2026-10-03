@@ -79,6 +79,16 @@ class TurboLayout(private val remotePrefs: SharedPreferences) : BaseHook() {
     private val EVOKE_ITF = "com.miui.sidebar.ISidebarOverlay"
     private val EVOKE_IMPL = "com.miui.gamebooster.service.DockWindowManagerService\$SidebarOverlayBinder"
 
+    /** OS4 判据：ISidebarOverlay 存在即 OS4 系（AIDL 稳定名；OS2/OS3 无此类）。
+     *  决定 hookOnTouch 走哪套条上语义（OS4=吞事件不跑状态机，见该函数注释）。 */
+    @Volatile
+    private var isOs4Sidebar = false
+
+    /** re-arm 幂等守卫（OS4 L2 晚解析重跑用；OS2/3 L1 即成功，守卫不参与） */
+    @Volatile private var touchHookArmed = false
+    @Volatile private var coverPassThroughArmed = false
+    @Volatile private var hideWhiteBarArmed = false
+
     override val name: String = "HookTargetBox"
 
     /**
@@ -117,6 +127,7 @@ class TurboLayout(private val remotePrefs: SharedPreferences) : BaseHook() {
     }
 
     fun hookOnTouch() {
+        if (touchHookArmed) return
         val cls = sideBar ?: run {
             HLog.w(TAG, "hookOnTouch skipped: sidebar_touch 未解析（保持原生行为）")
             return
@@ -129,6 +140,16 @@ class TurboLayout(private val remotePrefs: SharedPreferences) : BaseHook() {
             ?.createBeforeHook {
                 val event = it.args[1] as? MotionEvent ?: return@createBeforeHook
                 val view = it.args[0] as? View ?: return@createBeforeHook
+
+                // OS4 分支（1003 拍板：条隐藏+吞事件）：条上触摸一律吞——原生拖出面板
+                // 失效，判定/呼出走 p7 改道（hookSidebarEvoke，判定白拿桌面 Rust）。
+                // 不计 onCoverTouchLeak：OS4 条触摸是常态而非"穿透失效"信号，误计数会
+                // 假降级。退路=总开关关/熔断/数据源死亡放行原生（条恢复可拖原生面板）。
+                if (isOs4Sidebar) {
+                    if (!moduleEnabled() || breaker.open || DataDeadState.dead) return@createBeforeHook
+                    it.result = true
+                    return@createBeforeHook
+                }
 
                 // 竖屏=吞掉漏到小白条的事件（穿透失效信号，防唤起原生侧边栏/
                 // 幽灵入口）；横屏=B 路线状态机接管（隐藏条即触发器）。
@@ -148,6 +169,7 @@ class TurboLayout(private val remotePrefs: SharedPreferences) : BaseHook() {
                 handleStripGesture(view, event)
                 it.result = true
             }
+        if (hooked != null) touchHookArmed = true
         Log.d(TAG, "hookOnTouch: hooked=$hooked")
     }
 
@@ -203,6 +225,12 @@ class TurboLayout(private val remotePrefs: SharedPreferences) : BaseHook() {
                 val anchorX = if (x < dm.widthPixels / 2f) 0f else dm.widthPixels.toFloat()
                 val anchorY = y.coerceIn(0, dm.heightPixels).toFloat()
                 HLog.i(TAG, "evoke→fan: ($x,$y) anchor=($anchorX,$anchorY)")
+                // OS4 恒点选态（markReleasedOnArrival→showInternal 落地转 released）：
+                // 手势流在桌面 Rust 手里，拖选物理不可得；released 下点图标直启
+                // （跳过 150ms 预选门——否则停顿呼出后快速点图标会被门误拦）、
+                // 点空白收起、10s 看门狗兜底。官方呼出范围无系数可套（侦察定案），
+                // y 不做带外钳制，几何层不可行带二次钳制兜底。
+                fanController.markReleasedOnArrival()
                 mainHandler.post {
                     runCatching { fanController.show(ctx, anchorX, anchorY) }
                         .onFailure { HLog.w(TAG, "evoke→fan show failed: ${it.message}") }
@@ -490,6 +518,10 @@ class TurboLayout(private val remotePrefs: SharedPreferences) : BaseHook() {
         runCatching { AnchorResolver.resolveAll(structuralScan) }
             .onFailure { HLog.w(TAG, "anchor resolve failed: ${it.message}") }
         HLog.i(TAG, "anchor: ${AnchorResolver.stateLine()}")
+        // OS4 判据（AIDL 稳定名，与混淆漂移无关）：决定 hookOnTouch 条上语义分支
+        isOs4Sidebar = runCatching {
+            Class.forName(EVOKE_ITF, false, io.github.kyuubiran.ezxhelper.core.ClassLoaderProvider.safeClassLoader)
+        }.isSuccess
         // 熔断器：发布本进程新鲜状态（清掉上进程生命周期遗留的熔断键）+ 熔断动作
         breaker.forceReset()
         breaker.onTripped = { reason ->
@@ -528,6 +560,18 @@ class TurboLayout(private val remotePrefs: SharedPreferences) : BaseHook() {
         ).forEach { step ->
             runCatching { step() }.onFailure { HLog.e(TAG, "init step failed: ${it.message}", it) }
         }
+        // L2 晚解析 re-arm（OS4）：锚点要等 DexKit（L1 混淆漂移解析不出），init 时刻
+        // 未解析而跳过的 hook 借回调重装（多播回调，与 SidebarOverlayProbe 的触摸流
+        // 观测共存）。OS2/3 L1 已全解析无 skipped，回调不触发或重跑命中幂等守卫=空转。
+        AnchorResolver.addOnAnchorsLateResolved {
+            listOf(
+                { hookOnTouch() },
+                { hookCoverPassThrough() },
+                { hookHideWhiteBar() }
+            ).forEach { step ->
+                runCatching { step() }.onFailure { HLog.e(TAG, "re-arm step failed: ${it.message}") }
+            }
+        }
         // 本类已删除两个"从未生效"的 hook（role 仍保留在锚点表里，自检可继续观察漂移）：
         //   sidebar_hint_cleanup —— 目标类在 OS2/OS3 不存在、OS4 语义已变
         //   dock_layout          —— dock 子系统没有可 setVisibility 的容器（唯一候选是"被打开的面板"本身）
@@ -562,6 +606,7 @@ class TurboLayout(private val remotePrefs: SharedPreferences) : BaseHook() {
      * 屏幕输出恒为空白。已降级（1C）放行（条恢复可见）；类名漂移时安全降级为可见。
      */
     private fun hookHideWhiteBar() {
+        if (hideWhiteBarArmed) return
         val cls = whiteBarDrawable ?: run {
             HLog.w(TAG, "hookHideWhiteBar skipped: sidebar_drawable 未解析（条保持可见，安全降级）")
             return
@@ -574,7 +619,10 @@ class TurboLayout(private val remotePrefs: SharedPreferences) : BaseHook() {
                 ?.createBeforeHook {
                     if (!passthroughDegraded && moduleEnabled()) it.result = null
                 }
-                ?.also { HLog.i(TAG, "hookHideWhiteBar: $cls.draw hooked OK") }
+                ?.also {
+                    hideWhiteBarArmed = true
+                    HLog.i(TAG, "hookHideWhiteBar: $cls.draw hooked OK")
+                }
                 ?: HLog.w(TAG, "hookHideWhiteBar: $cls.draw NOT FOUND（条保持可见，安全降级）")
         }.onFailure { HLog.w(TAG, "hookHideWhiteBar failed: ${it.message}（条保持可见）") }
     }
@@ -592,6 +640,7 @@ class TurboLayout(private val remotePrefs: SharedPreferences) : BaseHook() {
      * 看门狗兜底通道切换、系统重置与旋转后残留收敛；非 EDGE 清除 flag 保原生可用。
      */
     private fun hookCoverPassThrough() {
+        if (coverPassThroughArmed) return
         val cls = coverView ?: run {
             HLog.w(TAG, "hookCoverPassThrough skipped: sidebar_cover 未解析（穿透不生效，不阻断其它 hook）")
             return
@@ -606,6 +655,7 @@ class TurboLayout(private val remotePrefs: SharedPreferences) : BaseHook() {
                     coverRefs.add(WeakReference(view))
                     applyCoverFlag(view)
                 }
+                ?.also { coverPassThroughArmed = true }
                 ?: HLog.w(TAG, "hookCoverPassThrough: $cls ctor NOT FOUND")
         }.onFailure { HLog.w(TAG, "hookCoverPassThrough failed: ${it.message}") }
         startCoverWatchdog()

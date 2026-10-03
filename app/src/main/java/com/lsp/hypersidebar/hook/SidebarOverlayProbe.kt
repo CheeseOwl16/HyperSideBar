@@ -111,7 +111,7 @@ class SidebarOverlayProbe : BaseHook() {
         // 呼出=内部路径不过 binder（1003 实测定案）。observe-only：绝不消费事件。
         // 锚点是 L2 晚解析 → 立即试一次 + 晚解析回调再试，幂等。
         runCatching {
-            com.lsp.hypersidebar.anchor.AnchorResolver.onAnchorsLateResolved = {
+            com.lsp.hypersidebar.anchor.AnchorResolver.addOnAnchorsLateResolved {
                 runCatching { hookHandleTouchStream(cl) }
                     .onFailure { HLog.w(TAG, "touch stream hook failed: ${it.message}") }
             }
