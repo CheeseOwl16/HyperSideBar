@@ -172,26 +172,31 @@ class TurboLayout(private val remotePrefs: SharedPreferences) : BaseHook() {
                 handleStripGesture(view, event)
                 it.result = true
             }
-        if (hooked != null) touchHookArmed = true
-        Log.d(TAG, "hookOnTouch: hooked=$hooked")
+        if (hooked != null) {
+            touchHookArmed = true
+            // Log.d 只进 logcat（OS4 实机已死），re-arm 可见性走 HLog（1003 晚：导出里
+            // 看不到 hookOnTouch 是否重挂成功）
+            HLog.i(TAG, "hookOnTouch: hooked=$hooked (armed=$touchHookArmed)")
+        }
     }
 
     // hookM26633Q（旧 `dock.sidebar.j.Q()` 装载与 sidebarWrapperRef）已删除：
     // 它只服务 getStats() 的 wrapper 计数，而 OS4 上该方法已漂移（j.Q() → p.Q(long)）。
     // 改用 cover 构造器计数（coverCtorCount），三版本等价且不依赖混淆名。
 
-    // ===== R1-J'（OS4 边缘停顿呼出改道，2026-10-03 测绘定稿） =====
+    // ===== R1-J'（OS4 边缘停顿借用系统判定，2026-10-03 测绘定稿，v2 语义修正） =====
     // 1003 实机测绘：OS4 全局侧边栏把手+面板都在 :ui（DockWindowManagerService 系，
     // 把手 88x308 DISPLAY_OVERLAY / 面板 FloatingWindow SYSTEM_ALERT 全屏），桌面 Rust
     // 的"贴边滑+停顿"判定完成后经 binder 调 ISidebarOverlay.p7(x, y, 66, 145, 22)——
     // 前两参=呼出点屏幕坐标（竖屏右缘 x≈968/1080、横屏左缘 x≈110/2400），后三参恒
     // 66/145/22（尺寸/类型常量，暂不需要）。呼出编排=客户端 J(canShow) 轮询→
-    // J0(hide)→p7(show)；把手拖出走 :ui 内部路径不过 binder（产品拍板 2026-10-03：
-    // 把手保留原生，只改道边缘停顿——熔断/降级/总开关关时原生面板=完好退路）。
-    // 本 hook：吃掉 p7（原生面板不出现），呼出点换算扇形锚点（x 在屏宽哪半边=
-    // 左右缘，Y 跟随呼出点）。接口名 com.miui.sidebar.ISidebarOverlay 未混淆（AIDL
-    // 稳定），方法按签名形状解析（(IIIII)V 在接口 abstract 里唯一）；OS2/OS3 无此类
-    // =解析失败惰性退出。消费后客户端行为（B1 轮询是否重试 p7）由 SidebarProbe 观测。
+    // J0(hide)→p7(show)；实测 p7 在松手后才到（OS4 原生时机）。
+    // 本 hook=**时机备选**（开关 EVOKE_BORROW_SYSTEM 默认关）：开=吃掉 p7（原生面板
+    // 不出现）改呼扇形——覆盖全边缘但松手后才出现、恒点选态；关=放行原生（条外边缘
+    // 停顿保持系统行为）。主触发=条上状态机（hookOnTouch OS4 分支，无需松手/OS3 时机），
+    // 不受本开关影响。接口名 com.miui.sidebar.ISidebarOverlay 未混淆（AIDL 稳定），
+    // 方法按签名形状解析（(IIIII)V 在接口 abstract 里唯一）；OS2/OS3 无此类=惰性退出。
+    // 实测消费后客户端无 p7 重试风暴（B1 轮询照常），编排接管不需要。
     private fun hookSidebarEvoke() {
         val cl = io.github.kyuubiran.ezxhelper.core.ClassLoaderProvider.safeClassLoader
         val itf = runCatching { Class.forName(EVOKE_ITF, false, cl) }.getOrNull() ?: run {
@@ -213,11 +218,11 @@ class TurboLayout(private val remotePrefs: SharedPreferences) : BaseHook() {
             val m = impl.getDeclaredMethod(entry.name, *entry.parameterTypes)
             m.isAccessible = true
             m.createBeforeHook { param ->
-                // 改道开关（默认关，用户拍板 1003 晚）：关=放行原生面板（系统行为不动）。
-                // 默认主触发=条上自研状态机（hookOnTouch OS4 分支）；系统判定松手才
-                // 唤出+横屏随游戏场景切模式，仅作备选。
+                // 借用系统判定开关（默认关=条上停顿即呼出无需松手/OS3 时机；用户
+                // 1003 深夜定案：开关=时机选择非面板选择）。关=放行 p7（条外边缘
+                // 停顿保持系统原生行为）；开=拦 p7，松手后呼出扇形（恒点选态）。
                 if (!remotePrefs.getBoolean(
-                        PrefKeys.EVOKE_REDIRECT_ENABLED, LayoutDefaults.EVOKE_REDIRECT_ENABLED
+                        PrefKeys.EVOKE_BORROW_SYSTEM, LayoutDefaults.EVOKE_BORROW_SYSTEM
                     )
                 ) return@createBeforeHook
                 val x = param.args[0] as Int
@@ -247,7 +252,7 @@ class TurboLayout(private val remotePrefs: SharedPreferences) : BaseHook() {
                 }
                 param.result = null
             }
-            HLog.i(TAG, "hookSidebarEvoke: ${impl.simpleName}.${entry.name}(IIIII)V armed（边缘停顿改道扇形）")
+            HLog.i(TAG, "hookSidebarEvoke: ${impl.simpleName}.${entry.name}(IIIII)V armed（借用系统判定：松手后呼出，开关默认关）")
         }.onFailure { HLog.w(TAG, "hookSidebarEvoke failed: ${it.message}") }
     }
 

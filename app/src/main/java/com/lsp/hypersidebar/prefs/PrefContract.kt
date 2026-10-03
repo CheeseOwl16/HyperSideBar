@@ -35,10 +35,10 @@ object PrefKeys {
      *  同时是 OS4 R1-J（securitycenter 侧改道点选模式）的交互地基。 */
     const val FAN_PERSISTENT_ON_RELEASE = "fanPersistentOnRelease"
 
-    /** OS4 边缘停顿改道开关（R1-J'，默认关）：开=拦 ISidebarOverlay.p7 呼出改道扇形
-     *  （判定白拿桌面 Rust，但松手才唤出、横屏随游戏场景切模式）；关=放行原生面板。
-     *  默认关=OS4 主触发为条上自研状态机（hookOnTouch OS4 分支），系统借用仅备选。 */
-    const val EVOKE_REDIRECT_ENABLED = "evokeRedirectEnabled"
+    /** OS4 边缘停顿借用系统判定开关（默认关）：关（默认）=条上停顿即呼出（无需松手，
+     *  与 OS3 时机一致，范围=小白条带）；开=借用系统边缘停顿判定——边缘任意位置
+     *  停顿、松手后呼出扇形（全边缘，OS4 原生时机）。两态面板均为模块扇形。 */
+    const val EVOKE_BORROW_SYSTEM = "evokeBorrowSystem"
 
     /** 底角斜滑扇形独立样式（N1，仅竖屏）：默认值=竖屏布局值，故开箱与竖屏效果一致、可独立微调。 */
     const val CORNER_ICON_SIZE = "cornerIconSize"
@@ -276,8 +276,8 @@ object LayoutDefaults {
     /** 常驻扇形默认开关：默认关=现状交互（未预选松手立即收起）。 */
     const val FAN_PERSISTENT_ON_RELEASE = false
 
-    /** OS4 边缘停顿改道默认开关：默认关=主触发为条上自研状态机（见 PrefKeys 同名键）。 */
-    const val EVOKE_REDIRECT_ENABLED = false
+    /** OS4 边缘停顿借用系统判定默认开关：默认关=条上停顿即呼出（无需松手，OS3 时机）。 */
+    const val EVOKE_BORROW_SYSTEM = false
 
     /** 底角斜滑扇形样式默认值：图标沿用竖屏（32dp），半径与数量独立定档（仿 Flyme 大半径
      *  四分之一弧，双环 13 图标不挤在小弧上）。0922 起数量不再跟竖屏联动。

@@ -109,18 +109,18 @@ internal fun InvokeSettingsPage(prefs: SharedPreferences, modifier: Modifier = M
                             repo.save(PrefKeys.FAN_PERSISTENT_ON_RELEASE, it)
                         }
                     )
-                    // OS4 边缘停顿改道（R1-J' 借用系统判定，默认关；主触发=条上自研
-                    // 状态机）。OS2/3 无该链路，开关无效果（文案已说明）。
-                    var evokeRedirect by remember(effectivePrefs, repo.revision) {
-                        mutableStateOf(repo.evokeRedirectEnabled())
+                    // OS4 边缘停顿时机选择（默认关=条上停顿即呼出，无需松手/OS3 时机；
+                    // 开=借用系统判定，边缘任意位置松手后呼出）。OS2/3 无效果。
+                    var evokeBorrowSystem by remember(effectivePrefs, repo.revision) {
+                        mutableStateOf(repo.evokeBorrowSystem())
                     }
                     SwitchPreference(
-                        title = stringResource(R.string.evoke_redirect_title),
-                        summary = stringResource(R.string.evoke_redirect_summary),
-                        checked = evokeRedirect,
+                        title = stringResource(R.string.evoke_borrow_system_title),
+                        summary = stringResource(R.string.evoke_borrow_system_summary),
+                        checked = evokeBorrowSystem,
                         onCheckedChange = {
-                            evokeRedirect = it
-                            repo.save(PrefKeys.EVOKE_REDIRECT_ENABLED, it)
+                            evokeBorrowSystem = it
+                            repo.save(PrefKeys.EVOKE_BORROW_SYSTEM, it)
                         }
                     )
                 }

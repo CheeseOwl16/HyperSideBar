@@ -65,8 +65,8 @@
     <string name="trigger_dwell_summary">贴边停顿达此时长后展开扇形；改动即时生效</string>
     <string name="fan_persistent_title">呼出后常驻</string>
     <string name="fan_persistent_summary">松手后扇形不自动收起：点图标启动、点空白收起；10 秒无操作自动收起</string>
-    <string name="evoke_redirect_title">边缘停顿呼出（OS4 借用系统判定）</string>
-    <string name="evoke_redirect_summary">借用系统边缘停顿判定呼出扇形（松手后才出现，不支持拖动选择；横屏行为随系统游戏场景变化）。默认关闭：OS4 上以小白条位置停顿呼出为主；OS2/3 无此开关效果</string>
+    <string name="evoke_borrow_system_title">边缘停顿借用系统判定（松手后呼出）</string>
+    <string name="evoke_borrow_system_summary">开启后，屏幕边缘任意位置的停顿在松手后呼出扇形（判定借用系统，OS4 原生时机）。默认关闭=仅小白条位置停顿即呼出（无需松手，与 OS3 时机一致）；条带之外的边缘停顿保持系统原生行为。仅 OS4 生效</string>
     <string name="corner_swipe_title">底角斜滑呼出</string>
     <string name="corner_swipe_summary">从屏幕左下/右下角斜向内上滑，直接呼出扇形（仅竖屏）；与停顿呼出并存，默认关闭</string>
     <string name="corner_width_title">底角触发宽度</string>

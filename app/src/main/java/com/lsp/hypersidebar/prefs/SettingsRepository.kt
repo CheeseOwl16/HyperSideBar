@@ -120,9 +120,9 @@ class SettingsRepository(val prefs: SharedPreferences) {
     fun fanPersistentOnRelease(): Boolean =
         prefs.getBoolean(PrefKeys.FAN_PERSISTENT_ON_RELEASE, LayoutDefaults.FAN_PERSISTENT_ON_RELEASE)
 
-    /** OS4 边缘停顿改道开关（R1-J' 借用系统判定，默认关；主触发=条上自研状态机）。 */
-    fun evokeRedirectEnabled(): Boolean =
-        prefs.getBoolean(PrefKeys.EVOKE_REDIRECT_ENABLED, LayoutDefaults.EVOKE_REDIRECT_ENABLED)
+    /** OS4 边缘停顿借用系统判定开关（默认关=条上停顿即呼出，无需松手）。 */
+    fun evokeBorrowSystem(): Boolean =
+        prefs.getBoolean(PrefKeys.EVOKE_BORROW_SYSTEM, LayoutDefaults.EVOKE_BORROW_SYSTEM)
     /** 背景模糊来源（auto / dialog / wallpaper / behind / off）；非法或缺失值一律回 auto */
     fun fanBlurSource(): String =
         prefs.getString(PrefKeys.FAN_BLUR_SOURCE, LayoutDefaults.FAN_BLUR_SOURCE_DEFAULT)
@@ -214,7 +214,7 @@ class SettingsRepository(val prefs: SharedPreferences) {
             putInt(PrefKeys.CORNER_MIN_ANGLE_DEG, LayoutDefaults.CORNER_MIN_ANGLE_DEG)
             putInt(PrefKeys.CORNER_MAX_ANGLE_DEG, LayoutDefaults.CORNER_MAX_ANGLE_DEG)
             putBoolean(PrefKeys.FAN_PERSISTENT_ON_RELEASE, LayoutDefaults.FAN_PERSISTENT_ON_RELEASE)
-            putBoolean(PrefKeys.EVOKE_REDIRECT_ENABLED, LayoutDefaults.EVOKE_REDIRECT_ENABLED)
+            putBoolean(PrefKeys.EVOKE_BORROW_SYSTEM, LayoutDefaults.EVOKE_BORROW_SYSTEM)
             putFloat(PrefKeys.FAN_FOG_INTENSITY, LayoutDefaults.FAN_FOG_INTENSITY)
             putBoolean(PrefKeys.FAN_DIM_ENABLED, LayoutDefaults.FAN_DIM_ENABLED)
             putString(PrefKeys.FAN_BLUR_SOURCE, LayoutDefaults.FAN_BLUR_SOURCE_DEFAULT)
