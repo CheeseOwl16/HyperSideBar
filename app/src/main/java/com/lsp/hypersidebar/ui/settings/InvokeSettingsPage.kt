@@ -109,6 +109,20 @@ internal fun InvokeSettingsPage(prefs: SharedPreferences, modifier: Modifier = M
                             repo.save(PrefKeys.FAN_PERSISTENT_ON_RELEASE, it)
                         }
                     )
+                    // OS4 边缘停顿改道（R1-J' 借用系统判定，默认关；主触发=条上自研
+                    // 状态机）。OS2/3 无该链路，开关无效果（文案已说明）。
+                    var evokeRedirect by remember(effectivePrefs, repo.revision) {
+                        mutableStateOf(repo.evokeRedirectEnabled())
+                    }
+                    SwitchPreference(
+                        title = stringResource(R.string.evoke_redirect_title),
+                        summary = stringResource(R.string.evoke_redirect_summary),
+                        checked = evokeRedirect,
+                        onCheckedChange = {
+                            evokeRedirect = it
+                            repo.save(PrefKeys.EVOKE_REDIRECT_ENABLED, it)
+                        }
+                    )
                 }
             }
         }

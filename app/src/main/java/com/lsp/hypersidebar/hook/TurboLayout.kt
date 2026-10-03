@@ -141,12 +141,15 @@ class TurboLayout(private val remotePrefs: SharedPreferences) : BaseHook() {
                 val event = it.args[1] as? MotionEvent ?: return@createBeforeHook
                 val view = it.args[0] as? View ?: return@createBeforeHook
 
-                // OS4 分支（1003 拍板：条隐藏+吞事件）：条上触摸一律吞——原生拖出面板
-                // 失效，判定/呼出走 p7 改道（hookSidebarEvoke，判定白拿桌面 Rust）。
-                // 不计 onCoverTouchLeak：OS4 条触摸是常态而非"穿透失效"信号，误计数会
-                // 假降级。退路=总开关关/熔断/数据源死亡放行原生（条恢复可拖原生面板）。
+                // OS4 分支（1003 晚 v2 拍板：回归模块自有判定）：竖屏+横屏条上触摸
+                // 全部进 B 路线状态机（条=触发器）——系统停顿判定松手才唤出且横屏
+                // 随游戏场景切模式，弃用为主触发（p7 借用降级为 switch，默认关，
+                // 见 hookSidebarEvoke）。不计 onCoverTouchLeak：OS4 条触摸是常态
+                // 而非"穿透失效"信号，误计数会假降级。退路=总开关关/熔断/数据源
+                // 死亡放行原生（条恢复可拖原生面板）。
                 if (isOs4Sidebar) {
                     if (!moduleEnabled() || breaker.open || DataDeadState.dead) return@createBeforeHook
+                    handleStripGesture(view, event)
                     it.result = true
                     return@createBeforeHook
                 }
@@ -210,6 +213,13 @@ class TurboLayout(private val remotePrefs: SharedPreferences) : BaseHook() {
             val m = impl.getDeclaredMethod(entry.name, *entry.parameterTypes)
             m.isAccessible = true
             m.createBeforeHook { param ->
+                // 改道开关（默认关，用户拍板 1003 晚）：关=放行原生面板（系统行为不动）。
+                // 默认主触发=条上自研状态机（hookOnTouch OS4 分支）；系统判定松手才
+                // 唤出+横屏随游戏场景切模式，仅作备选。
+                if (!remotePrefs.getBoolean(
+                        PrefKeys.EVOKE_REDIRECT_ENABLED, LayoutDefaults.EVOKE_REDIRECT_ENABLED
+                    )
+                ) return@createBeforeHook
                 val x = param.args[0] as Int
                 val y = param.args[1] as Int
                 // 让位面（同 hookOnTouch 横屏分支）：原生面板接管，本 hook 全放行
@@ -310,7 +320,10 @@ class TurboLayout(private val remotePrefs: SharedPreferences) : BaseHook() {
                 sSwipeConfirmed = false
                 sStallFired = false
                 sFanSeen = false
-                // 内滑轴：DOWN 点就近角落的对角线（指向屏幕内部）
+                // 内滑轴：横屏条=就近角落的对角线（OS2/3 定稿，60° 锥容纳竖直/水平
+                // 内滑）；OS4 竖屏条=右缘中带，轴改水平向内——对角线轴对水平内滑有
+                // 0.707 投影衰减+锥倾斜（正是实测"横屏响应不如竖屏"的主因），竖屏
+                // 条几何下不适用
                 val dm = view.context.resources.displayMetrics
                 // 滑动距离换算（dp→px，DOWN 一次缓存整条手势；设置项即时经 ConfigSync 生效）
                 val distanceDp = try {
@@ -322,9 +335,14 @@ class TurboLayout(private val remotePrefs: SharedPreferences) : BaseHook() {
                 }
                 sConfirmPx = distanceDp * dm.density
                 sResetPx = sConfirmPx * GestureThresholds.SWIPE_RESET_RATIO
-                val inv = 1f / sqrt(2f)
-                sInwardUx = (if (sDownX < dm.widthPixels / 2f) 1f else -1f) * inv
-                sInwardUy = (if (sDownY < dm.heightPixels / 2f) 1f else -1f) * inv
+                if (isOs4Sidebar && !isLandscape(view)) {
+                    sInwardUx = if (sDownX < dm.widthPixels / 2f) 1f else -1f
+                    sInwardUy = 0f
+                } else {
+                    val inv = 1f / sqrt(2f)
+                    sInwardUx = (if (sDownX < dm.widthPixels / 2f) 1f else -1f) * inv
+                    sInwardUy = (if (sDownY < dm.heightPixels / 2f) 1f else -1f) * inv
+                }
                 vlog(
                     "s#$sGestureSeq DOWN raw=(${ev.rawX.toInt()},${ev.rawY.toInt()}) " +
                         "axis=(${"%.2f".format(sInwardUx)},${"%.2f".format(sInwardUy)})"
@@ -416,13 +434,19 @@ class TurboLayout(private val remotePrefs: SharedPreferences) : BaseHook() {
     /**
      * 停顿触发 → 弹 fan。圆心 X=呼出起始侧屏幕边缘（与边缘通道一致）；
      * 圆心 Y 横屏固定为条中心（条=[0,112dp] → 56dp，PRD §9.5 修订 2026-08-30：
-     * 触发范围本就小，圆心不随触摸 Y，配合几何层展开角自适应向下方倾斜展开）。
+     * 触发范围本就小，圆心不随触摸 Y，配合几何层展开角自适应向下方倾斜展开）；
+     * OS4 竖屏（条=右缘中带、无 launcher 通道）跟随 DOWN 高度——同 OS2/3 竖屏
+     * "停顿过程中的滑动漂移不影响呼出位置"定稿（轮六）。
      */
     private fun postShowStripFan(view: View) {
         val ctx = view.context
         val dm = ctx.resources.displayMetrics
         val anchorX = if (sDownX < dm.widthPixels / 2f) 0f else dm.widthPixels.toFloat()
-        val anchorY = LANDSCAPE_ANCHOR_Y_DP * dm.density
+        val anchorY = if (isOs4Sidebar && !isLandscape(view)) {
+            sDownY
+        } else {
+            LANDSCAPE_ANCHOR_Y_DP * dm.density
+        }
         vlog("s#$sGestureSeq showFan: anchor=($anchorX, $anchorY) downY=${sDownY.toInt()} dwell=${stripDwellMs()}ms")
         // 耗时锚点（呼出卡顿归因）：postLag=:ui 主线程繁忙度（同 EdgeGestureHook）
         val postAtMs = android.os.SystemClock.uptimeMillis()
