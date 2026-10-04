@@ -180,6 +180,23 @@ class ComposeFanHost(
     @Volatile private var released = false
     var onOutsideTap: (() -> Unit)? = null
 
+    /**
+     * 孤儿 UP 防护（OS4 借道路径实测，2026-10-04）：
+     *
+     * p7 借道路径下扇窗是在**用户手指仍在屏上**时打开的（该手势的 DOWN 已被系统/launcher
+     * 消费，扇窗永远拿不到配对 DOWN）。手指抬起时这条流的 UP 会落到扇窗上，`released`
+     * 点选态 + 距锚点很远 ⇒ 被判成"点空白"⇒ `TAP_OUTSIDE` 立即收起。
+     * 实测三连：show 后 0.64~0.80s 必收，UP `dist=810/1145/782`、`dwell=0` ⇒ 观感是
+     * "扇形一闪就没、也拖不动"。
+     *
+     * 判据：本窗口会话内**没见过 DOWN**、且 `event.downTime` 早于本窗展示时刻 ⇒
+     * 该事件属于呼出前那条手势的尾巴，直接吞掉，不参与选中/点空白判定。
+     * 真实点空白或窗口内滑动必然先有自己的 DOWN（downTime ≥ 展示时刻）⇒ 不受影响。
+     */
+    private var sawDownInSession = false
+    private var sessionDownTime = 0L
+    private var shownUptime = 0L
+
     fun setReleased(v: Boolean) {
         released = v
     }
@@ -269,6 +286,10 @@ class ComposeFanHost(
                 params.blurBehindRadius = LayoutDefaults.FAN_BEHIND_BLUR_RADIUS_PX.toInt()
             }
             currentParams = params
+            // 新会话：本窗展示时刻 + 未见过 DOWN（孤儿 UP 防护的判据基线，见 sawDownInSession）
+            shownUptime = SystemClock.uptimeMillis()
+            sawDownInSession = false
+            sessionDownTime = 0L
             wm.addView(wrapper, params)
             HLog.i(TAG, "addView: ${SystemClock.elapsedRealtime() - tAddMs}ms source=$blurSource")
         } catch (e: Throwable) {
@@ -423,6 +444,34 @@ class ComposeFanHost(
                 val dx = x - ax
                 val dy = y - ay
                 val dist = sqrt(dx * dx + dy * dy)
+                // 孤儿手势防护（OS4 借道路径，2026-10-04 实测）：本窗展示前就已开始的那条手势，
+                // 其余下事件会迟到地落到刚呼出的扇窗上，点选态下被当成"点空白"立即收起
+                // （实测 show 后 0.64~1.2s 必收）。两种投递形态都要挡：
+                //   ① 只收到 UP/CANCEL（DOWN 被系统消费掉了）；
+                //   ② 先收到一个**带着原始 downTime 的重新投递 DOWN**（新窗口出现时的标准
+                //      行为），再收到同 downTime 的 UP。
+                // 统一判据：`event.downTime < shownUptime` = 该事件属于呼出前的手势。
+                // 真实点选/窗内滑动必然从本窗展示之后开始（downTime ≥ shownUptime）⇒ 不受影响。
+                val preShowGesture = shownUptime != 0L && event.downTime < shownUptime
+                if (preShowGesture) {
+                    if (event.action == MotionEvent.ACTION_DOWN) {
+                        // 形态 ② 的起始：不承认它，避免后续 UP 被算成一次"点空白"
+                        return true
+                    }
+                    if (event.action == MotionEvent.ACTION_UP || event.action == MotionEvent.ACTION_CANCEL) {
+                        HLog.i(
+                            TAG,
+                            "orphan ${if (event.action == MotionEvent.ACTION_UP) "UP" else "CANCEL"} swallowed " +
+                                "(pre-show gesture tail): downTime=${event.downTime} shown=$shownUptime " +
+                                "raw=(${rawX.toInt()},${rawY.toInt()}) dist=${dist.toInt()}"
+                        )
+                        return true
+                    }
+                }
+                if (event.action == MotionEvent.ACTION_DOWN) {
+                    sawDownInSession = true
+                    sessionDownTime = event.downTime
+                }
                 when (event.action) {
                     MotionEvent.ACTION_DOWN -> {
                         lastSelectedFanIndex = -1
