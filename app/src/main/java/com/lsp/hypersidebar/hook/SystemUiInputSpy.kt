@@ -63,7 +63,9 @@ object SystemUiInputSpy {
 
     fun start(context: android.content.Context? = null) {
         if (started || gaveUp) return
-        if (appContext == null) appContext = context?.applicationContext
+        // 存原始 context（attach 传的是 base ContextImpl）：1004 实测 applicationContext
+        // 在 Application.attach 时刻仍为 null（LoadedApk 未挂完），存它导致 ctx 路径全程失联
+        if (appContext == null) appContext = context
         attemptStart()
     }
 
@@ -157,7 +159,9 @@ object SystemUiInputSpy {
         return null
     }
 
-    /** InputMonitor→InputChannel（带逐步日志）；InputChannel 直返。失败返回 null 不抛。 */
+    /** InputMonitor→InputChannel（带逐步日志）；InputChannel 直返。失败返回 null 不抛。
+     *  toString 打印 channel/host/surface 三字段——判读"服务端到底回了什么"的钥匙：
+     *  host/surface 在而 channel null=unparcel 丢字段；三者全 null=服务端短路回了个空壳。 */
     private fun monitorToChannel(r: Any?, label: String): android.view.InputChannel? {
         if (r == null) {
             HLog.w(TAG, "[$label] monitor invoke returned null")
@@ -165,6 +169,7 @@ object SystemUiInputSpy {
         }
         if (r is android.view.InputChannel) return r
         return runCatching {
+            HLog.i(TAG, "[$label] monitor=${r}")
             val ch = r.javaClass.getMethod("getInputChannel").invoke(r) as? android.view.InputChannel
             if (ch == null) HLog.w(TAG, "[$label] getInputChannel returned null")
             ch
