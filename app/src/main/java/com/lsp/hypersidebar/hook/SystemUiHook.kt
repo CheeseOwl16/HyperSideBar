@@ -63,10 +63,6 @@ class SystemUiHook(private val prefs: SharedPreferences) : BaseHook() {
         HLog.i(TAG, "anchor: ${com.lsp.hypersidebar.anchor.AnchorResolver.stateLine()}")
         hookAdapterStash()
         hookClickReceiver()
-        // B1 spy 骨架（os4-trigger-final-plan §6）：observe-only 输入观察副本，
-        // 零抢占零行为影响；失败惰性退出（romer 裁剪 API 时 fail-closed）
-        runCatching { SystemUiInputSpy.start() }
-            .onFailure { HLog.w(TAG, "input spy start failed: ${it.message}") }
     }
 
     private fun hookAdapterStash() {
@@ -168,6 +164,11 @@ class SystemUiHook(private val prefs: SharedPreferences) : BaseHook() {
                 // 本进程不注册 CircuitBreaker/StatsRecorder，只回传 HLog 缓冲。
                 runCatching { LogDumpBridge.register(ctx) }
                     .onFailure { HLog.w(TAG, "log dump register failed: ${it.message}") }
+                // B1 spy（os4-trigger-final-plan §6）：observe-only 输入观察副本。
+                // 挂在 attach（有 context）而非 init——MiuiBackGestureHook 实锤
+                // monitorGestureInput 须从 context 的 InputManager 服务实例发起
+                runCatching { SystemUiInputSpy.start(ctx) }
+                    .onFailure { HLog.w(TAG, "input spy start failed: ${it.message}") }
             }
     }
 

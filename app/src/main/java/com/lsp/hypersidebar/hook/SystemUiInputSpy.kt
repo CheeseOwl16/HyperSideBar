@@ -52,14 +52,14 @@ object SystemUiInputSpy {
     @Volatile var bottomBandDown = 0L; private set
     @Volatile var edgeBandDown = 0L; private set
 
-    fun start() {
+    fun start(context: android.content.Context? = null) {
         if (started) return
         started = true
         runCatching {
             val dm = android.content.res.Resources.getSystem().displayMetrics
             val w = dm.widthPixels
             val h = dm.heightPixels
-            val channel = openSpyChannel() ?: error("no usable monitorInput candidate")
+            val channel = openSpyChannel(context) ?: error("no usable monitorInput candidate")
             object : InputEventReceiver(channel, Looper.getMainLooper()) {
                 override fun onInputEvent(event: InputEvent) {
                     try {
@@ -77,14 +77,14 @@ object SystemUiInputSpy {
     }
 
     /**
-     * 多候选解析（2026-10-04 marble 实锤：`InputManager.getInstance` 不存在——Android 15+
-     * 该 API 已迁 InputManagerGlobal，具体方法名 ROM 各异）。每次启动先把候选类的
-     * monitor 系与 getInstance 方法清单 dump 进日志（下一份导出=ROM API 形状铁证），
-     * 再按序尝试。返回 InputChannel（InputMonitor 路径先 setTouchableRegion(全屏)
-     * 再 getInputChannel；直返 InputChannel 的路径无 region=观测全屏）。
+     * 多候选解析。首选=MiuiBackGestureHook（同 ROM 生产验证）的姿势：SystemUI context
+     * 的 getSystemService(InputManager) 实例直接反射 monitorGestureInput——20:40 导出
+     * 实锤 InputManagerGlobal.getInstance() 路径 invoke 成功却拿不到 channel（静默
+     * continue=返回 null 或 getInputChannel null）。每步结果都落日志，再失败可精确定位。
+     * InputMonitor 路径不调 setTouchableRegion（marble 无此方法，gesture monitor=全屏观察）。
      */
-    private fun openSpyChannel(): android.view.InputChannel? {
-        // 取证：候选类方法清单（只打名字+参数形状，一行一个，恒打——低频一次性）
+    private fun openSpyChannel(context: android.content.Context?): android.view.InputChannel? {
+        // 取证：候选类方法清单（低频一次性，恒打）
         for (cn in CANDIDATE_CLASSES) {
             runCatching {
                 val c = Class.forName(cn, false, SystemUiInputSpy::class.java.classLoader)
@@ -96,6 +96,24 @@ object SystemUiInputSpy {
                 HLog.i(TAG, "api dump $cn: ${lines.ifEmpty { "(no monitor/getInstance methods)" }}")
             }.onFailure { HLog.i(TAG, "api dump $cn: class not found") }
         }
+        // 候选 0（首选，MiuiBackGestureHook 同款）：SystemUI context 的 InputManager 服务实例
+        if (context != null) {
+            runCatching {
+                val im = context.getSystemService(android.hardware.input.InputManager::class.java)
+                    ?: error("getSystemService(InputManager)=null")
+                val m = im.javaClass.methods.firstOrNull {
+                    it.name == "monitorGestureInput" && it.parameterTypes.size == 2 &&
+                        it.parameterTypes[0] == String::class.java &&
+                        it.parameterTypes[1] == Int::class.javaPrimitiveType
+                } ?: error("InputManager.monitorGestureInput(String,int) missing")
+                val r = m.invoke(im, "hypersidebar-spy", 0)
+                HLog.i(TAG, "ctx candidate: monitor=${r?.javaClass?.name}")
+                return monitorToChannel(r, "ctx")
+            }.onFailure { HLog.w(TAG, "ctx candidate failed: ${it.message}") }
+        } else {
+            HLog.i(TAG, "ctx candidate skipped: no context yet")
+        }
+        // 兜底：InputManagerGlobal 单例路径（20:40 实锤拿不到 channel，保留观测）
         for ((cn, mn) in CANDIDATES) {
             val r = runCatching {
                 val c = Class.forName(cn, false, SystemUiInputSpy::class.java.classLoader)
@@ -106,26 +124,33 @@ object SystemUiInputSpy {
                         it.parameterTypes[0] == String::class.java &&
                         it.parameterTypes[1] == Int::class.javaPrimitiveType
                 } ?: error("$mn(String,int) missing")
-                val arg0 = "hypersidebar-spy"
-                val arg1 = 0
-                m.invoke(inst, arg0, arg1)
+                val res = m.invoke(inst, "hypersidebar-spy", 0)
+                HLog.i(TAG, "global candidate $cn.$mn: result=${res?.javaClass?.name}")
+                res
             }.getOrElse { failure ->
                 HLog.w(TAG, "candidate $cn.$mn failed: ${failure.message}")
                 continue
             }
-            when (r) {
-                is android.view.InputChannel -> return r
-                else -> {
-                    // InputMonitor 路径：marble 的 InputMonitor 无 setTouchableRegion
-                    // （dex 方法表实锤）——gesture monitor 无 region=全屏观察副本，正合 B1 用途
-                    val mon = r ?: continue
-                    val ch = mon.javaClass.getMethod("getInputChannel").invoke(mon)
-                        as? android.view.InputChannel ?: continue
-                    return ch
-                }
-            }
+            return monitorToChannel(r, cn.substringAfterLast('.')) ?: continue
         }
         return null
+    }
+
+    /** InputMonitor→InputChannel（带逐步日志）；InputChannel 直返。失败返回 null 不抛。 */
+    private fun monitorToChannel(r: Any?, label: String): android.view.InputChannel? {
+        if (r == null) {
+            HLog.w(TAG, "[$label] monitor invoke returned null")
+            return null
+        }
+        if (r is android.view.InputChannel) return r
+        return runCatching {
+            val ch = r.javaClass.getMethod("getInputChannel").invoke(r) as? android.view.InputChannel
+            if (ch == null) HLog.w(TAG, "[$label] getInputChannel returned null")
+            ch
+        }.getOrElse {
+            HLog.w(TAG, "[$label] getInputChannel failed: ${it.message}")
+            null
+        }
     }
 
     private fun onMotion(ev: MotionEvent, w: Int, h: Int) {
