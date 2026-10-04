@@ -20,9 +20,8 @@
 -keepattributes SourceFile,LineNumberTable
 -renamesourcefileattribute SourceFile
 
-# @hide stub 编译桩（SystemUiInputSpy 用）：运行时 android.view.InputEventReceiver /
-# InputChannel 由 boot classloader 真类顶替（parent delegation），本 dex 里的桩只是
-# 编译期形状。但 R8 若重命名桩，子类字节码里的 superclass 引用会指向改名后的桩
-# （空实现！）——必须保名，否则 spy 收不到事件且无报错。
--keepnames class android.view.InputChannel
--keepnames class android.view.InputEventReceiver
+# @hide 桩已移至 :hidden-api 模块（compileOnly ⇒ 不进 dex，运行时由宿主 boot
+# classloader 解析真类）。**不要**给 android.view.* 桩加任何 keep——keep 会把桩
+# 保进 app dex，重新制造类型遮蔽（2026-10-04 R8 删桩事故，详见
+# docs/adaptation/spy-channel-blocker-briefing.md；旧 keepnames 规则亦无法防止
+# R8 删除桩类——keepnames 只防改名不防裁剪）。

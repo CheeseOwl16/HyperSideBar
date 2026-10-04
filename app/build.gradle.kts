@@ -164,6 +164,12 @@ dependencies {
     implementation(libs.android.utils)
     implementation(libs.ezxhelper.core)
 
+    // @hide 框架类编译桩（InputChannel/InputEventReceiver 等）：compileOnly ⇒ 桩不进 app
+    // dex，运行时由宿主 boot classloader 解析真类。2026-10-04 教训：桩放 :app 源集会被
+    // R8 判死代码删除（usage.txt 实锤），as? 折叠成常量 null ⇒ spy channel 恒 null
+    // （见 docs/adaptation/spy-channel-blocker-briefing.md §复核结论）。禁止加 keep 规则。
+    compileOnly(project(":hidden-api"))
+
     // Compose
     implementation(platform(libs.compose.bom))
     implementation(libs.compose.ui)

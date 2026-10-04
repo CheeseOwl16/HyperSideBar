@@ -45,3 +45,6 @@ _repos/
 analysis/
 analysis_result.md
 result.json
+
+# 模块级 build 目录（/build 只匹配根级，子模块需显式）
+hidden-api/build/

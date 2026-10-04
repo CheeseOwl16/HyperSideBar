@@ -33,4 +33,5 @@ dependencyResolutionManagement {
 
 rootProject.name = "hyperSidebar"
 include(":app")
+include(":hidden-api")
  
