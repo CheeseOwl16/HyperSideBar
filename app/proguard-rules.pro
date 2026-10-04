@@ -19,3 +19,10 @@
 # 崩溃栈可读性（映射文件在 outputs/mapping/release/）
 -keepattributes SourceFile,LineNumberTable
 -renamesourcefileattribute SourceFile
+
+# @hide stub 编译桩（SystemUiInputSpy 用）：运行时 android.view.InputEventReceiver /
+# InputChannel 由 boot classloader 真类顶替（parent delegation），本 dex 里的桩只是
+# 编译期形状。但 R8 若重命名桩，子类字节码里的 superclass 引用会指向改名后的桩
+# （空实现！）——必须保名，否则 spy 收不到事件且无报错。
+-keepnames class android.view.InputChannel
+-keepnames class android.view.InputEventReceiver
