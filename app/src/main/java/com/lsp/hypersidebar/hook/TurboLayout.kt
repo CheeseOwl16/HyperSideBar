@@ -631,6 +631,13 @@ class TurboLayout(private val remotePrefs: SharedPreferences) : BaseHook() {
 
     // ===== 小白条视觉隐藏（EDGE 模式） =====
 
+    /** B0 实验开关（读系统属性，仅实验期存在；结果落 os4-trigger-final-plan 附录） */
+    private fun b0KeepVisible(): Boolean = runCatching {
+        Class.forName("android.os.SystemProperties")
+            .getMethod("get", String::class.java)
+            .invoke(null, "debug.hsb.b0.visible") == "1"
+    }.getOrDefault(false)
+
     /**
      * 小白条像素出口封口（2026-08-25 反编译取证定稿）：
      * 条的可见像素唯一来源是其 drawable 的 draw(Canvas)（运行时类 com.miui.dock.sidebar.c，
@@ -649,6 +656,10 @@ class TurboLayout(private val remotePrefs: SharedPreferences) : BaseHook() {
                 .filterByParamTypes(Canvas::class.java)
                 .firstOrNull()
                 ?.createBeforeHook {
+                    // B0 实验旁路（os4-trigger-final-plan §5）：`adb shell setprop
+                    // debug.hsb.b0.visible 1` 让条临时可见可摸（判别 k 是否真实触摸
+                    // 入口）；重启 :ui 生效，实验完 setprop 0 或删属性即恢复隐藏
+                    if (b0KeepVisible()) return@createBeforeHook
                     if (!passthroughDegraded && moduleEnabled()) it.result = null
                 }
                 ?.also {

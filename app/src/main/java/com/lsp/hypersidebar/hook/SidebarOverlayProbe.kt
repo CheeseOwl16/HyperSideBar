@@ -114,12 +114,63 @@ class SidebarOverlayProbe : BaseHook() {
             com.lsp.hypersidebar.anchor.AnchorResolver.addOnAnchorsLateResolved {
                 runCatching { hookHandleTouchStream(cl) }
                     .onFailure { HLog.w(TAG, "touch stream hook failed: ${it.message}") }
+                runCatching { hookAllSidebarMethods(cl) }
+                    .onFailure { HLog.w(TAG, "all-methods hook failed: ${it.message}") }
+                dumpBandGeometry(cl)
             }
             hookHandleTouchStream(cl)
+            hookAllSidebarMethods(cl)
         }.onFailure { HLog.w(TAG, "probe: touch stream arm failed: ${it.message}") }
     }
 
     private var touchStreamHooked = false
+
+    /** B0 判别（os4-trigger-final-plan §5）：条类全 declared 方法 log-only 观测——
+     *  "零 touch:" 可能是窗口收不到事件，也可能是观测点选错；全方法覆盖若仍零命中
+     *  ⇒ k 不是入口/被绕过。每方法封顶 [PER_METHOD_CAP] 条防环形缓冲被刷。 */
+    private var allMethodsHooked = false
+
+    private fun hookAllSidebarMethods(cl: ClassLoader) {
+        if (allMethodsHooked) return
+        val role = com.lsp.hypersidebar.anchor.AnchorRoles.SIDEBAR_TOUCH.role
+        val cls = com.lsp.hypersidebar.anchor.AnchorResolver.fqcnOf(role) ?: return
+        val klass = Class.forName(cls, false, cl)
+        val caps = HashMap<String, Int>()
+        var count = 0
+        for (m in klass.declaredMethods) {
+            if (m.name == "onTouch") continue // 专用观测已挂，避免双重计数
+            runCatching {
+                m.isAccessible = true
+                m.createBeforeHook { param ->
+                    val left = synchronized(caps) { caps.getOrPut(m.name) { PER_METHOD_CAP } }
+                    if (left <= 0) return@createBeforeHook
+                    synchronized(caps) { caps[m.name] = left - 1 }
+                    HLog.i(TAG, "k.${m.name}(${m.parameterTypes.size}p): ${param.args.joinToString(" ") { it?.javaClass?.simpleName ?: "null" }}")
+                }
+                count++
+            }
+        }
+        if (count > 0) {
+            allMethodsHooked = true
+            HLog.i(TAG, "B0: $count declared methods of $cls hooked (log-only, cap $PER_METHOD_CAP each)")
+        }
+    }
+
+    private val PER_METHOD_CAP = 50
+
+    /** B0 配套：dump 触发带几何三键的实际值（sidebar_bounds 文档描述存在性待证） */
+    private fun dumpBandGeometry(cl: ClassLoader) {
+        val ctx = runCatching {
+            Class.forName("android.app.ActivityThread")
+                .getMethod("currentApplication").invoke(null) as? android.content.Context
+        }.getOrNull() ?: return
+        val cr = ctx.contentResolver
+        for (key in listOf("sidebar_bounds", "dock_line_location", "key_dock_position_y")) {
+            val secure = runCatching { android.provider.Settings.Secure.getString(cr, key) }.getOrNull()
+            val global = runCatching { android.provider.Settings.Global.getString(cr, key) }.getOrNull()
+            HLog.i(TAG, "band geom [$key] secure=$secure global=$global")
+        }
+    }
 
     /** 把手 onTouch 观测挂载（幂等）；呼出时逐事件打 action/x/y，不消费 */
     private fun hookHandleTouchStream(cl: ClassLoader) {
