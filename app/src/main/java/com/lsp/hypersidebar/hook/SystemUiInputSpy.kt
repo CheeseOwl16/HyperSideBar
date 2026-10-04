@@ -31,6 +31,22 @@ object SystemUiInputSpy {
 
     @Volatile private var started = false
 
+    /** 取证类清单（api dump 用） */
+    private val CANDIDATE_CLASSES = arrayOf(
+        "android.hardware.input.InputManagerGlobal",
+        "android.hardware.input.InputManager",
+        "miui.hardware.input.MiuiInputManager",
+    )
+
+    /** 连接候选（类名, 方法名）：marble framework dex 反汇编实锤（framework-marble-os4.jar
+     *  classes2.dex 方法表）=InputManagerGlobal.getInstance().monitorGestureInput(String,int):
+     *  InputMonitor；InputManager.getInstance 已不存在。其余候选=旧 ROM 兜底。 */
+    private val CANDIDATES = arrayOf(
+        "android.hardware.input.InputManagerGlobal" to "monitorGestureInput",
+        "android.hardware.input.InputManagerGlobal" to "monitorInput",
+        "android.hardware.input.InputManager" to "monitorInput",
+    )
+
     /** 恒开计数（B2 前置证据）：累计 DOWN / 底部 1/4 带 DOWN / 屏缘 40px 带 DOWN */
     @Volatile var totalDown = 0L; private set
     @Volatile var bottomBandDown = 0L; private set
@@ -43,16 +59,7 @@ object SystemUiInputSpy {
             val dm = android.content.res.Resources.getSystem().displayMetrics
             val w = dm.widthPixels
             val h = dm.heightPixels
-            val im = Class.forName("android.hardware.input.InputManager")
-                .getMethod("getInstance").invoke(null)
-            val monitor = im.javaClass.getMethod("monitorInput", String::class.java, Int::class.java)
-                .invoke(im, "hypersidebar-spy", 0)
-                ?: error("monitorInput returned null")
-            // B1 观测面=全屏（B0 结论决定 B2 触发带；spy 只读不抢，全屏面无行为影响）
-            monitor.javaClass.getMethod("setTouchableRegion", Rect::class.java)
-                .invoke(monitor, Rect(0, 0, w, h))
-            val channel = monitor.javaClass.getMethod("getInputChannel").invoke(monitor)
-                as android.view.InputChannel
+            val channel = openSpyChannel() ?: error("no usable monitorInput candidate")
             object : InputEventReceiver(channel, Looper.getMainLooper()) {
                 override fun onInputEvent(event: InputEvent) {
                     try {
@@ -62,11 +69,63 @@ object SystemUiInputSpy {
                     }
                 }
             }
-            HLog.i(TAG, "spy started: display ${w}x$h (observe-only, full-screen region)")
+            HLog.i(TAG, "spy started: display ${w}x$h (observe-only)")
         }.onFailure {
             started = false
             HLog.w(TAG, "spy start failed (inert): ${it.message}")
         }
+    }
+
+    /**
+     * 多候选解析（2026-10-04 marble 实锤：`InputManager.getInstance` 不存在——Android 15+
+     * 该 API 已迁 InputManagerGlobal，具体方法名 ROM 各异）。每次启动先把候选类的
+     * monitor 系与 getInstance 方法清单 dump 进日志（下一份导出=ROM API 形状铁证），
+     * 再按序尝试。返回 InputChannel（InputMonitor 路径先 setTouchableRegion(全屏)
+     * 再 getInputChannel；直返 InputChannel 的路径无 region=观测全屏）。
+     */
+    private fun openSpyChannel(): android.view.InputChannel? {
+        // 取证：候选类方法清单（只打名字+参数形状，一行一个，恒打——低频一次性）
+        for (cn in CANDIDATE_CLASSES) {
+            runCatching {
+                val c = Class.forName(cn, false, SystemUiInputSpy::class.java.classLoader)
+                val lines = c.declaredMethods
+                    .filter { it.name.contains("monitor") || it.name == "getInstance" }
+                    .joinToString { m ->
+                        m.name + "(" + m.parameterTypes.joinToString(",") { it.simpleName } + "):" + m.returnType.simpleName
+                    }
+                HLog.i(TAG, "api dump $cn: ${lines.ifEmpty { "(no monitor/getInstance methods)" }}")
+            }.onFailure { HLog.i(TAG, "api dump $cn: class not found") }
+        }
+        for ((cn, mn) in CANDIDATES) {
+            val r = runCatching {
+                val c = Class.forName(cn, false, SystemUiInputSpy::class.java.classLoader)
+                val inst = c.methods.firstOrNull { it.name == "getInstance" && it.parameterTypes.isEmpty() }
+                    ?.invoke(null) ?: error("getInstance() missing")
+                val m = c.methods.firstOrNull {
+                    it.name == mn && it.parameterTypes.size == 2 &&
+                        it.parameterTypes[0] == String::class.java &&
+                        it.parameterTypes[1] == Int::class.javaPrimitiveType
+                } ?: error("$mn(String,int) missing")
+                val arg0 = "hypersidebar-spy"
+                val arg1 = 0
+                m.invoke(inst, arg0, arg1)
+            }.getOrElse { failure ->
+                HLog.w(TAG, "candidate $cn.$mn failed: ${failure.message}")
+                continue
+            }
+            when (r) {
+                is android.view.InputChannel -> return r
+                else -> {
+                    // InputMonitor 路径：marble 的 InputMonitor 无 setTouchableRegion
+                    // （dex 方法表实锤）——gesture monitor 无 region=全屏观察副本，正合 B1 用途
+                    val mon = r ?: continue
+                    val ch = mon.javaClass.getMethod("getInputChannel").invoke(mon)
+                        as? android.view.InputChannel ?: continue
+                    return ch
+                }
+            }
+        }
+        return null
     }
 
     private fun onMotion(ev: MotionEvent, w: Int, h: Int) {
