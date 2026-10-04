@@ -30,6 +30,15 @@ object SystemUiInputSpy {
     private const val TAG = "SysInputSpy"
 
     @Volatile private var started = false
+    @Volatile private var gaveUp = false
+    private var attempts = 0
+    private var appContext: android.content.Context? = null
+    private val mainHandler = android.os.Handler(Looper.getMainLooper())
+
+    /** 重试上限与间隔（1004 实锤：attach 极早期 display/surface 未就绪，服务侧静默返回
+     *  空 channel 的 monitor——SystemUI 自己的 MultiTaskSwitch monitor 创建于就绪后） */
+    private const val MAX_ATTEMPTS = 12
+    private const val RETRY_MS = 5_000L
 
     /** 取证类清单（api dump 用） */
     private val CANDIDATE_CLASSES = arrayOf(
@@ -53,13 +62,19 @@ object SystemUiInputSpy {
     @Volatile var edgeBandDown = 0L; private set
 
     fun start(context: android.content.Context? = null) {
-        if (started) return
-        started = true
+        if (started || gaveUp) return
+        if (appContext == null) appContext = context?.applicationContext
+        attemptStart()
+    }
+
+    private fun attemptStart() {
+        if (started || gaveUp) return
+        attempts++
         runCatching {
             val dm = android.content.res.Resources.getSystem().displayMetrics
             val w = dm.widthPixels
             val h = dm.heightPixels
-            val channel = openSpyChannel(context) ?: error("no usable monitorInput candidate")
+            val channel = openSpyChannel(appContext) ?: error("no usable monitorInput candidate")
             object : InputEventReceiver(channel, Looper.getMainLooper()) {
                 override fun onInputEvent(event: InputEvent) {
                     try {
@@ -69,10 +84,16 @@ object SystemUiInputSpy {
                     }
                 }
             }
-            HLog.i(TAG, "spy started: display ${w}x$h (observe-only)")
+            started = true
+            HLog.i(TAG, "spy started: display ${w}x$h (observe-only, attempts=$attempts)")
         }.onFailure {
-            started = false
-            HLog.w(TAG, "spy start failed (inert): ${it.message}")
+            if (attempts >= MAX_ATTEMPTS) {
+                gaveUp = true
+                HLog.w(TAG, "spy gave up after $attempts attempts (inert): ${it.message}")
+            } else {
+                HLog.i(TAG, "spy attempt #$attempts failed: ${it.message} — retry in ${RETRY_MS}ms")
+                mainHandler.postDelayed({ attemptStart() }, RETRY_MS)
+            }
         }
     }
 
