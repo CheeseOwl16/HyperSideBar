@@ -80,6 +80,12 @@ object HLog {
             .put("msg", msg)
     }
 
+    /** 淘汰计数（缓冲写满后每覆盖一条 +1）：判读"导出里缺某行"是没发生还是被滚掉
+     *  （2026-10-04 P0-2：自检导出截断修复的配套——全量导出后仍需知道丢弃了多少） */
+    @Volatile
+    var dropped: Long = 0L
+        private set
+
     private val buf = ArrayDeque<Entry>(CAPACITY)
     @Volatile private var procName: String? = null
     /** 权威进程名（XposedInit.onModuleLoaded 用 ModuleLoadedParam.getProcessName 播种，
@@ -125,7 +131,10 @@ object HLog {
     private fun record(level: Char, tag: String, rawMsg: String) {
         val entry = Entry(System.currentTimeMillis(), level, proc(), tag, sanitize(rawMsg))
         synchronized(buf) {
-            if (buf.size >= CAPACITY) buf.removeFirst()
+            if (buf.size >= CAPACITY) {
+                buf.removeFirst()
+                dropped++
+            }
             buf.addLast(entry)
         }
     }

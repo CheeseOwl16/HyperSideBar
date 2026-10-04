@@ -4,7 +4,9 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.os.SystemClock
 import com.lsp.hypersidebar.prefs.PrefKeys
+import org.json.JSONObject
 
 /**
  * 日志拉取回传端（迭代六 §11.2，hook 进程侧）。
@@ -33,6 +35,13 @@ object LogDumpBridge {
     @Volatile
     private var statsProvider: () -> String? = { null }
 
+    /** 进程启动时刻（uptime）：object 首次触及即初始化（XposedInit 极早期武装路径），
+     *  用于识别"新包装了但 :ui 旧启动"这类历史事故（os4-trigger-final-plan §4 P0-2） */
+    private val procStartUptime = SystemClock.uptimeMillis()
+
+    /** 分块大小：1000 条全量 ≈150KB，200 条/块 ≈30KB 远离 binder 1MB 上限 */
+    private const val CHUNK = 200
+
     /**
      * 接收器只注册一次；provider 后到者覆盖（EdgeGestureHook 带 CircuitBreaker/StatsRecorder
      * 的富注册到达时自动顶掉 XposedInit 早期注册的空 provider）。
@@ -55,18 +64,35 @@ object LogDumpBridge {
             context.registerReceiver(
                 object : BroadcastReceiver() {
                     override fun onReceive(c: Context, intent: Intent) {
-                        val reply = Intent(PrefKeys.LOG_DUMP_REPLY)
-                            .setPackage(FreeformLauncher.MODULE_PACKAGE)
-                            .putExtra(PrefKeys.LOG_DUMP_EXTRA_PROC, HLog.proc())
-                            .putExtra(PrefKeys.LOG_DUMP_EXTRA_LOGS, HLog.dumpJson())
-                        this@LogDumpBridge.statusProvider()?.let {
-                            reply.putExtra(PrefKeys.LOG_DUMP_EXTRA_STATUS, it)
+                        val roundId = intent.getLongExtra(PrefKeys.LOG_DUMP_EXTRA_ROUND, 0L)
+                        val entries = HLog.snapshot()
+                        val meta = JSONObject()
+                            .put("entries", entries.size)
+                            .put("dropped", HLog.dropped)
+                            .put("verbose", HLog.verboseEnabled)
+                            .put("upMs", procStartUptime)
+                        val chunks = entries.chunked(CHUNK)
+                        val total = chunks.size
+                        chunks.forEachIndexed { seq, chunk ->
+                            val arr = org.json.JSONArray()
+                            chunk.forEach { arr.put(it.toJson()) }
+                            val reply = Intent(PrefKeys.LOG_DUMP_REPLY)
+                                .setPackage(FreeformLauncher.MODULE_PACKAGE)
+                                .putExtra(PrefKeys.LOG_DUMP_EXTRA_PROC, HLog.proc())
+                                .putExtra(PrefKeys.LOG_DUMP_EXTRA_ROUND, roundId)
+                                .putExtra(PrefKeys.LOG_DUMP_EXTRA_CHUNK_SEQ, seq)
+                                .putExtra(PrefKeys.LOG_DUMP_EXTRA_CHUNK_TOTAL, total)
+                                .putExtra(PrefKeys.LOG_DUMP_EXTRA_META, meta.toString())
+                                .putExtra(PrefKeys.LOG_DUMP_EXTRA_LOGS, arr.toString())
+                            this@LogDumpBridge.statusProvider()?.takeIf { seq == 0 }?.let {
+                                reply.putExtra(PrefKeys.LOG_DUMP_EXTRA_STATUS, it)
+                            }
+                            this@LogDumpBridge.statsProvider()?.takeIf { seq == 0 }?.let {
+                                reply.putExtra(PrefKeys.LOG_DUMP_EXTRA_STATS, it)
+                            }
+                            runCatching { c.sendBroadcast(reply) }
+                                .onFailure { HLog.w("LogDump", "reply send failed: ${it.message}") }
                         }
-                        this@LogDumpBridge.statsProvider()?.let {
-                            reply.putExtra(PrefKeys.LOG_DUMP_EXTRA_STATS, it)
-                        }
-                        runCatching { c.sendBroadcast(reply) }
-                            .onFailure { HLog.w("LogDump", "reply send failed: ${it.message}") }
                     }
                 },
                 IntentFilter(PrefKeys.LOG_DUMP_REQUEST),

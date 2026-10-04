@@ -27,8 +27,8 @@ import com.lsp.hypersidebar.util.HLog
 
 private const val TAG = "SelfCheck"
 
-/** 自检报告附带的每进程日志尾条数（§11.2） */
-private const val LOG_TAIL_PER_PROC = 40
+/** 自检报告附带的每进程日志条数上限（2026-10-04 P0-2 改为全量：导出写文件，无渲染理由截断） */
+private const val LOG_TAIL_PER_PROC = Int.MAX_VALUE
 
 /**
  * 自检报告（2026-09-05 用户拍板：探针双路 + 调试开关实值 + 脱敏配置快照，导出为文本文件）。
@@ -188,12 +188,14 @@ object SelfCheck {
                     statuses.forEach { (proc, json) -> appendLine("$proc: $json") }
                 }
                 appendLine()
-                appendLine("== 最近日志（各进程尾部 ${LOG_TAIL_PER_PROC} 条，时间升序）==")
+                appendLine("== 最近日志（各进程全量，时间升序；头部附缓冲元信息）==")
                 if (procLogs.isEmpty()) {
                     appendLine("无（各进程缓冲未回传）")
                 } else {
+                    val metas = LogCollector.metas.toMap()
                     procLogs.forEach { (proc, list) ->
                         appendLine("----- [$proc] -----")
+                        metas[proc]?.let { appendLine("(缓冲: $it)") }
                         list.takeLast(LOG_TAIL_PER_PROC).forEach { appendLine(it.formatLine()) }
                     }
                 }

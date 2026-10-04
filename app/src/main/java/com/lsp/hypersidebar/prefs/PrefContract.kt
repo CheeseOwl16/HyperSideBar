@@ -119,6 +119,17 @@ object PrefKeys {
     /** 回传 extra：StatsRecorder 全量聚合 JSON（§11.3，可缺省） */
     const val LOG_DUMP_EXTRA_STATS = "stats"
 
+    // ===== 日志分块回传协议（2026-10-04 P0-2：全量 1000 条 ≈150KB 逼近 binder 1MB
+    // 事务上限，且 status/stats 同包时更挤——logs 按 200 条/块拆分多发）=====
+    /** 本块序号（0 起） */
+    const val LOG_DUMP_EXTRA_CHUNK_SEQ = "chunkSeq"
+    /** 总块数（=1 时与旧协议等价，单包直收） */
+    const val LOG_DUMP_EXTRA_CHUNK_TOTAL = "chunkTotal"
+    /** 轮次 id（请求方生成、回传方原样带回；采集端只认当前轮，防上一轮迟到块串包） */
+    const val LOG_DUMP_EXTRA_ROUND = "roundId"
+    /** 进程元信息 JSON（entries/dropped/verbose/upMs——判读"没某行"是没发生还是被滚掉） */
+    const val LOG_DUMP_EXTRA_META = "meta"
+
     // ===== :ui → 模块 App 的快捷方式 root 代发通道（§2.4 实测定案） =====
     // :ui（平台签名特权，非 uid 1000）对非 exported 目标 startActivityAsUser 静默假成功且无 su 授权；
     // 模块 App 进程持 root（su am start 可启动非导出组件，编辑页测试已验证）。
