@@ -288,7 +288,9 @@ object SystemUiInputSpy {
     fun registerPilferReceiver(ctx: android.content.Context, modulePrefs: android.content.SharedPreferences) {
         prefs = modulePrefs
         runCatching {
-            ctx.applicationContext.registerReceiver(
+            // 直接用传入的原始 ctx 注册：attach 时刻 applicationContext=null
+            //（1005 三犯——start/sink 同款教训，全部收敛为原始 ctx）
+            ctx.registerReceiver(
                 object : android.content.BroadcastReceiver() {
                     override fun onReceive(c: android.content.Context, intent: android.content.Intent) {
                         if (!sysInputOwner()) return
