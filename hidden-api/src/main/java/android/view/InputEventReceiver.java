@@ -10,6 +10,7 @@ import android.os.Looper;
  *   public InputEventReceiver(InputChannel inputChannel, Looper looper)
  *   protected void onInputEvent(InputEvent event)
  *   public void finishInputEvent(InputEvent event, boolean handled)
+ *   public void dispose()  ← 1005 自愈重建用（真类公开方法）
  */
 public abstract class InputEventReceiver {
 
@@ -20,5 +21,8 @@ public abstract class InputEventReceiver {
     }
 
     public void finishInputEvent(InputEvent event, boolean handled) {
+    }
+
+    public void dispose() {
     }
 }
