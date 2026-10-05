@@ -90,6 +90,13 @@ class FreeformRelayHook(
                             } else {
                                 HookProbeState.uiCode()
                             }
+                            // 附带 OS4 侧边栏在场事实：状态卡据此把桌面探针无应答判为
+                            // OS4 预期形态（桌面纯 native 无 Java hook）而非通道异常
+                            runCatching {
+                                val extras = android.os.Bundle()
+                                extras.putBoolean("os4", Os4Marker.sidebarPresent)
+                                setResultExtras(extras)
+                            }
                         }
                         return
                     }

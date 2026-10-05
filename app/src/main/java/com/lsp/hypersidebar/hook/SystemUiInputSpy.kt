@@ -105,22 +105,25 @@ object SystemUiInputSpy {
         if (started || gaveUp) return
         attempts++
         runCatching {
-            val dm = android.content.res.Resources.getSystem().displayMetrics
-            val w = dm.widthPixels
-            val h = dm.heightPixels
             val channel = openSpyChannel(appContext) ?: error("no usable monitorInput candidate")
             channelRef = channel
             receiverRef = object : InputEventReceiver(channel, Looper.getMainLooper()) {
                 override fun onInputEvent(event: InputEvent) {
                     try {
-                        if (event is MotionEvent) onMotion(event, w, h)
+                        if (event is MotionEvent) {
+                            // 尺寸逐事件现读（构建时捕获在旋转后全部失效——1005 16:41 导出
+                            // 实锤：横屏 x=2306 用竖屏 w=1080 判带恒拒 ⇒ 横屏无法唤出）
+                            val dm = android.content.res.Resources.getSystem().displayMetrics
+                            onMotion(event, dm.widthPixels, dm.heightPixels)
+                        }
                     } finally {
                         finishInputEvent(event, false)
                     }
                 }
             }
             started = true
-            HLog.i(TAG, "spy built: display ${w}x$h (observe-only, build #$attempts" +
+            val dm0 = android.content.res.Resources.getSystem().displayMetrics
+            HLog.i(TAG, "spy built: display ${dm0.widthPixels}x${dm0.heightPixels} (observe-only, build #$attempts" +
                 "${if (deafRebuilds > 0) ", deaf rebuild #$deafRebuilds" else ""})")
             // 聋 monitor 观察窗：窗口内零 DOWN ⇒ dispose 重建（时序根因的自愈收口）
             mainHandler.postDelayed({ deafCheck() }, DEAF_CHECK_WINDOW_MS)
@@ -263,8 +266,6 @@ object SystemUiInputSpy {
 
     /** 转发带半宽（px）：竖屏全高侧带 / 横屏顶部角条盒的 x 向边界；88px 条+余量 */
     private const val BAND_X_PX = 130
-    /** 横屏角条盒的 y 向边界（条 308px+余量） */
-    private const val BAND_Y_LANDSCAPE_PX = 340
 
     /** B 路线开关（sys 进程 prefs=启动快照，改动须重启 SystemUI 生效——设置页已注明） */
     @Volatile private var prefs: android.content.SharedPreferences? = null
@@ -330,14 +331,14 @@ object SystemUiInputSpy {
     }
 
     /** 触发带判定（转发前置粗筛；精判定在 ：ui 状态机）：竖屏=侧带 × Y 范围
-     *  [H/4,3H/4]（1005 用户拍板；3/4 下缘顺带覆盖底部 Home 手势带排除）；横屏=
-     *  顶部角条盒（左/右随 dock 侧，Y 不受限——条本在顶部）。 */
+     *  [H/3,2H/3]（与 OS2/3 launcher 通道同源，GestureThresholds 唯一定义源）；
+     *  横屏=侧带 × 上半屏（角条盒 340px 太紧——16:41 导出实机触摸 y=348-430 全被拒，
+     *  放宽到 h/2；底部手势带由 h/2 自然排除）。w/h 必须逐事件现读（旋转）。 */
     private fun inTriggerBand(x: Float, y: Float, w: Int, h: Int): Boolean {
         val nearSide = x <= BAND_X_PX || x >= w - BAND_X_PX
         return if (w > h) {
-            y <= BAND_Y_LANDSCAPE_PX && nearSide
+            y <= h / 2f && nearSide
         } else {
-            // 竖屏 Y 范围与 OS2/3 launcher 通道同源（GestureThresholds 唯一定义源）
             val top = h * GestureThresholds.TRIGGER_ZONE_TOP_RATIO
             val bottom = h * GestureThresholds.TRIGGER_ZONE_BOTTOM_RATIO
             y >= top && y <= bottom && nearSide

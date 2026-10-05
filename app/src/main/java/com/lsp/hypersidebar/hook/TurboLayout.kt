@@ -600,6 +600,7 @@ class TurboLayout(private val remotePrefs: SharedPreferences) : BaseHook() {
         isOs4Sidebar = runCatching {
             Class.forName(EVOKE_ITF, false, io.github.kyuubiran.ezxhelper.core.ClassLoaderProvider.safeClassLoader)
         }.isSuccess
+        Os4Marker.sidebarPresent = isOs4Sidebar
         // 熔断器：发布本进程新鲜状态（清掉上进程生命周期遗留的熔断键）+ 熔断动作
         breaker.forceReset()
         breaker.onTripped = { reason ->

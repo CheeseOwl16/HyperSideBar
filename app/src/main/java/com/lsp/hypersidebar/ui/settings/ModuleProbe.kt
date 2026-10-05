@@ -15,7 +15,8 @@ import com.lsp.hypersidebar.ui.fan.ACTION_FAN_LAUNCH
 /** 探针结果（code 取 [PrefKeys.PROBE_CODE_*]；null = 检测中） */
 internal data class ModuleProbeState(
     val launcher: Int?,   // 触发端（com.miui.home，边缘手势 + 扇形窗口）
-    val executor: Int?    // 执行端（com.miui.securitycenter:ui，启动执行 + 横屏通道）
+    val executor: Int?,   // 执行端（com.miui.securitycenter:ui，启动执行 + 横屏通道）
+    val os4: Boolean = false // OS4 侧边栏形态在场（:ui 应答回带；桌面无 Java hook 属预期）
 )
 
 /**
@@ -37,24 +38,26 @@ internal class ModuleProbe(private val context: Context) {
             Intent(ACTION_FAN_LAUNCH)
                 .setPackage(HostPackages.UI_HOST)
                 .putExtra(PrefKeys.PROBE_EXTRA, true)
-        ) { code ->
-            state = state.copy(executor = code)
+        ) { code, extras ->
+            state = state.copy(executor = code, os4 = extras?.getBoolean("os4") ?: false)
         }
         // 触发端：home 进程的独立探针 action（EdgeGestureHook 经 Application.attach 注册）
-        sendProbe(Intent(PrefKeys.PROBE_ACTION_HOME).setPackage(HostPackages.HOME)) { code ->
+        // OS4 上桌面纯 native（U2 定案）此探针恒无应答——状态卡按 os4 旗标豁免
+        sendProbe(Intent(PrefKeys.PROBE_ACTION_HOME).setPackage(HostPackages.HOME)) { code, _ ->
             state = state.copy(launcher = code)
         }
     }
 
-    private fun sendProbe(intent: Intent, onCode: (Int) -> Unit) {
+    private fun sendProbe(intent: Intent, onCode: (Int, android.os.Bundle?) -> Unit) {
         runCatching {
             context.sendOrderedBroadcast(
                 intent, null,
                 object : BroadcastReceiver() {
-                    override fun onReceive(c: Context?, i: Intent?) = onCode(resultCode)
+                    override fun onReceive(c: Context?, i: Intent?) =
+                        onCode(resultCode, getResultExtras(true))
                 },
                 Handler(Looper.getMainLooper()), PrefKeys.PROBE_CODE_DEAD, null, null
             )
-        }.onFailure { onCode(PrefKeys.PROBE_CODE_DEAD) }
+        }.onFailure { onCode(PrefKeys.PROBE_CODE_DEAD, null) }
     }
 }

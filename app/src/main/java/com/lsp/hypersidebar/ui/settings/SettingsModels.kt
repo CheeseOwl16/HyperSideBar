@@ -104,8 +104,12 @@ internal fun ModuleStatusComponent(
     val semantic = LocalSemanticColors.current
     val errorColor = MiuixTheme.colorScheme.error
 
-    // 异常端（code 非 1）：黄卡只列异常端，正常态不显示探针细节
-    val launcherIssue = probe?.launcher?.takeIf { it != PrefKeys.PROBE_CODE_OK }
+    // 异常端（code 非 1）：黄卡只列异常端，正常态不显示探针细节。
+    // OS4 豁免：桌面纯 native（U2 定案）触发端探针恒无应答=预期形态，不算异常
+    // （:ui 探针应答回带 os4 旗标；:ui 自身应答正常即代表全链在位）。
+    val launcherIssue = probe?.launcher?.takeIf {
+        it != PrefKeys.PROBE_CODE_OK && !(probe.os4 && it == PrefKeys.PROBE_CODE_DEAD)
+    }
     val executorIssue = probe?.executor?.takeIf { it != PrefKeys.PROBE_CODE_OK }
     // 熔断才可点（手动重试）；降级/无应答无即时动作，未激活纯展示（不跳 LSPosed）
     val anyCircuit = launcherIssue == PrefKeys.PROBE_CODE_CIRCUIT ||
