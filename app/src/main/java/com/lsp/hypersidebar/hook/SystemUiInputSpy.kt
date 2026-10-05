@@ -61,6 +61,16 @@ object SystemUiInputSpy {
     @Volatile var bottomBandDown = 0L; private set
     @Volatile var edgeBandDown = 0L; private set
 
+    /**
+     * InputMonitor 强引用保活（1005 实锤：register 成功、channel 有效、receiver 就位，
+     * 却零事件到达——monitor 对象在 openSpyChannel 返回后即不可达，GC 回收触发 native
+     * dispose ⇒ dispatcher 摘除 spy 窗口。两个参考实现（MiuiBackGestureHook
+     * NativeBackInputMonitor / AOSP ClipboardOverlayController）都把 monitor 存字段保活）。
+     * 同时保 channel 引用（receiver 原生侧持有，双保险）。
+     */
+    @Volatile private var monitorRef: Any? = null
+    @Volatile private var channelRef: android.view.InputChannel? = null
+
     fun start(context: android.content.Context? = null) {
         if (started || gaveUp) return
         // 存原始 context（attach 传的是 base ContextImpl）：1004 实测 applicationContext
@@ -77,6 +87,7 @@ object SystemUiInputSpy {
             val w = dm.widthPixels
             val h = dm.heightPixels
             val channel = openSpyChannel(appContext) ?: error("no usable monitorInput candidate")
+            channelRef = channel
             object : InputEventReceiver(channel, Looper.getMainLooper()) {
                 override fun onInputEvent(event: InputEvent) {
                     try {
@@ -131,6 +142,7 @@ object SystemUiInputSpy {
                 } ?: error("InputManager.monitorGestureInput(String,int) missing")
                 val r = m.invoke(im, "hypersidebar-spy", 0)
                 HLog.i(TAG, "ctx candidate: monitor=${r?.javaClass?.name}")
+                monitorRef = r
                 return monitorToChannel(r, "ctx")
             }.onFailure { HLog.w(TAG, "ctx candidate failed: ${it.message}") }
         } else {
@@ -149,6 +161,7 @@ object SystemUiInputSpy {
                 } ?: error("$mn(String,int) missing")
                 val res = m.invoke(inst, "hypersidebar-spy", 0)
                 HLog.i(TAG, "global candidate $cn.$mn: result=${res?.javaClass?.name}")
+                monitorRef = res
                 res
             }.getOrElse { failure ->
                 HLog.w(TAG, "candidate $cn.$mn failed: ${failure.message}")
