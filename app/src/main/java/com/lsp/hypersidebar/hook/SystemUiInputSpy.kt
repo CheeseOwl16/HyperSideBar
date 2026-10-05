@@ -337,8 +337,9 @@ object SystemUiInputSpy {
         return if (w > h) {
             y <= BAND_Y_LANDSCAPE_PX && nearSide
         } else {
-            val top = h * com.lsp.hypersidebar.prefs.LayoutDefaults.SPY_BAND_TOP_RATIO
-            val bottom = h * com.lsp.hypersidebar.prefs.LayoutDefaults.SPY_BAND_BOTTOM_RATIO
+            // 竖屏 Y 范围与 OS2/3 launcher 通道同源（GestureThresholds 唯一定义源）
+            val top = h * GestureThresholds.TRIGGER_ZONE_TOP_RATIO
+            val bottom = h * GestureThresholds.TRIGGER_ZONE_BOTTOM_RATIO
             y >= top && y <= bottom && nearSide
         }
     }

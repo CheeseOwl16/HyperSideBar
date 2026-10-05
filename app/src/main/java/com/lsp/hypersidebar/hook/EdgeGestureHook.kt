@@ -1119,7 +1119,8 @@ class EdgeGestureHook(
             // 含条顶 [0,108px) 死区），launcher 侧横屏区置空防双触发；原生返回带恢复系统默认
             1f to 0f
         } else {
-            (dm.heightPixels / 3f) to (dm.heightPixels * 2f / 3f)
+            (dm.heightPixels * GestureThresholds.TRIGGER_ZONE_TOP_RATIO) to
+                (dm.heightPixels * GestureThresholds.TRIGGER_ZONE_BOTTOM_RATIO)
         }
 
     private fun inwardDx(x: Float): Float =

@@ -64,4 +64,13 @@ object GestureThresholds {
      * 取窗均值则抖动相互抵消，真实位移才浮出来。
      */
     const val STALL_SPEED_WINDOW_MS = 150L
+
+    /**
+     * 竖屏触发区 Y 范围（PRD §9.5 行为规则 3 的比例形式）：[H/3, 2H/3]。
+     * 唯一定义源——OS2/3 launcher 通道（EdgeGestureHook.zoneBounds）与 OS4 B 路线
+     * spy 带内粗筛（SystemUiInputSpy.inTriggerBand）共用，防两处各写一份漂移
+     * （zoneBounds 注释里"唯一定义源"规矩的落实；1005 曾在 spy 重复定义被用户指出）。
+     */
+    const val TRIGGER_ZONE_TOP_RATIO = 1f / 3f
+    const val TRIGGER_ZONE_BOTTOM_RATIO = 2f / 3f
 }
