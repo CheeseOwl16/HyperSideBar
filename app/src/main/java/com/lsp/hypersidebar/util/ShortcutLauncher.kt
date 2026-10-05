@@ -35,7 +35,8 @@ enum class FailureReason {
     SECURITY_EXCEPTION,   // 权限拒绝
     LAUNCH_EXCEPTION,     // 启动时其他异常
     ROOT_UNAVAILABLE,     // su 不可用
-    ROOT_EXEC_FAILED      // su 执行失败
+    ROOT_EXEC_FAILED,     // su 执行失败
+    SHORTCUT_ROOT_LOOKUP_FAILED // SHORTCUT_ID root 反查（get-shortcuts）或解析失败
 }
 
 /**
@@ -172,7 +173,7 @@ object ShortcutLauncher {
         // SHORTCUT_ID（动态/固定快捷方式，2026-09-08）：目标 intent 对非桌面不可见，
         // 无法组件/intent 直启——launcher 进程桥 startShortcut 代发
         if (action.kind == ShortcutKind.SHORTCUT_ID) {
-            return launchShortcutId(context, action, RelayToken.current())
+            return launchShortcutId(context, action, RelayToken.current(), allowRootFallback)
         }
 
         // COMPONENT 自动探测类型后分发
@@ -577,8 +578,16 @@ object ShortcutLauncher {
      * 本进程（模块/:ui）无从直启——有序广播请 launcher 进程 hook（默认桌面，桌面角色
      * 现成）startShortcut 代发，回执 resultCode 1=已启动。须在后台线程调用（阻塞等
      * 回执 ≤3s）。
+     * OS4 兜底（2026-10-05）：launcher（com.miui.home）纯 native 无 Java 层，代发接收器
+     * 结构性缺席 ⇒ 桥失败后 root 反查 `cmd shortcut get-shortcuts` + am start 兜底
+     * （marble 真机已验证两步链路）。OS3 桥永远成功，兜底分支不触发，零回归。
      */
-    fun launchShortcutId(context: Context, action: ShortcutAction, token: String?): LaunchResult {
+    fun launchShortcutId(
+        context: Context,
+        action: ShortcutAction,
+        token: String?,
+        allowRootFallback: Boolean = true
+    ): LaunchResult {
         val pkg = action.packageName
         val sid = action.shortcutId
         if (pkg.isNullOrEmpty() || sid.isNullOrEmpty()) {
@@ -618,10 +627,138 @@ object ShortcutLauncher {
         return if (ok) {
             LaunchResult.Success(null)
         } else {
-            LaunchResult.Failure(
-                FailureReason.LAUNCH_EXCEPTION,
-                "launcher startShortcut failed/rejected (hook absent? default desktop?)"
+            // OS4：launcher 桥结构性缺席（com.miui.home 无 Java 层）——root 反查兜底。
+            // OS3 上桥永远成功，此处永不触发，零回归。
+            if (allowRootFallback && isRootAvailable()) {
+                launchShortcutIdViaRoot(pkg, sid)
+            } else {
+                LaunchResult.Failure(
+                    FailureReason.LAUNCH_EXCEPTION,
+                    "launcher startShortcut failed/rejected (hook absent? default desktop?)"
+                )
+            }
+        }
+    }
+
+    /**
+     * SHORTCUT_ID root 兜底（2026-10-05，方案见 docs/adaptation/shortcut-id-root-fallback-plan.md）：
+     * ①`cmd shortcut get-shortcuts <pkg>` 反查目标快捷方式的 intent；②解析出 action/
+     * component/extras 后拼 `am start` 启动。extras 一律按 String（--es）——PersistableBundle
+     * 可读形式无法反解类型，实测微信 case 够用，长尾失真留日志比不启动强。
+     * `am start-shortcut` 子命令不存在（实测 Unknown command），必须走反查。
+     */
+    private fun launchShortcutIdViaRoot(pkg: String, sid: String): LaunchResult {
+        // ① 反查：结果在 stdout（launchViaRoot 只读 stderr 的模式不适用），先读流再 waitFor
+        val lookupCmd = listOf(
+            "su", "-c",
+            listOf("/system/bin/cmd", "shortcut", "get-shortcuts", pkg)
+                .joinToString(" ") { shellQuote(it) }
+        )
+        val lookupOut: String = try {
+            val process = ProcessBuilder(lookupCmd).start()
+            try {
+                val stdout = BufferedReader(InputStreamReader(process.inputStream)).use { it.readText() }
+                val exitCode = process.waitFor()
+                if (exitCode != 0) {
+                    HLog.w(TAG, "shortcut root fallback: get-shortcuts exit=$exitCode")
+                    return LaunchResult.Failure(
+                        FailureReason.SHORTCUT_ROOT_LOOKUP_FAILED,
+                        "cmd shortcut get-shortcuts exit=$exitCode"
+                    )
+                }
+                stdout
+            } finally {
+                process.destroy()
+            }
+        } catch (e: Exception) {
+            HLog.w(TAG, "shortcut root fallback: lookup exec failed: ${e.message}")
+            return LaunchResult.Failure(FailureReason.SHORTCUT_ROOT_LOOKUP_FAILED, e.message ?: "su exec failed")
+        }
+
+        // ② 按块切割定位目标 shortcut（sid 字面匹配，勿用单行正则——输出含换行）
+        val blockStart = "ShortcutInfo {id="
+        val blocks = buildList {
+            var idx = lookupOut.indexOf(blockStart)
+            while (idx >= 0) {
+                val next = lookupOut.indexOf(blockStart, idx + blockStart.length)
+                add(lookupOut.substring(idx, if (next < 0) lookupOut.length else next))
+                idx = next
+            }
+        }
+        val block = blocks.firstOrNull { it.contains("id=$sid,") }
+        if (block == null) {
+            HLog.w(TAG, "shortcut root fallback: sid=$sid not found in ${blocks.size} shortcuts of $pkg")
+            return LaunchResult.Failure(
+                FailureReason.SHORTCUT_ROOT_LOOKUP_FAILED,
+                "shortcut id=$sid not found (dynamic shortcuts gone?)"
             )
+        }
+        val act = Regex("act=([^}\\s]+)").find(block)?.groupValues?.get(1)
+        val cmp = Regex("cmp=([^}\\s]+)").find(block)?.groupValues?.get(1)
+        // intent 包约束：ShortcutInfo intents 由 ShortcutService 限定在包内解析，
+        // am 侧必须等价带上 -p（dump 形如 "act=... flg=... pkg=com.tencent.mm"）
+        val pkgInIntent = Regex("\\spkg=([^}\\s]+)").find(block)?.groupValues?.get(1)
+        val extrasContent = Regex("(?s)PersistableBundle\\[\\{(.*?)\\}\\]").find(block)
+            ?.groupValues?.get(1)
+        // action 是 am start 解析目标的最低要求，缺了不盲目启动
+        if (act.isNullOrEmpty()) {
+            HLog.w(TAG, "shortcut root fallback: sid=$sid block has no act= (parse failed)")
+            return LaunchResult.Failure(
+                FailureReason.SHORTCUT_ROOT_LOOKUP_FAILED,
+                "shortcut id=$sid intent unparsable"
+            )
+        }
+
+        // ③ 拼 am start 旗标命令，逐参 shellQuote（extras 值可能含 shell 元字符）
+        val amArgs = mutableListOf("am", "start", "-a", act)
+        cmp?.let { amArgs += listOf("-n", it) }
+        pkgInIntent?.let { amArgs += listOf("-p", it) }
+        // PersistableBundle.toString() 不含类型信息，只能按值形推断（2026-10-05 实锤：
+        // 微信 WX_SHORTCUT 的 type/ext_info_1 是 int，全按 --es 发会被 getIntExtra
+        // 读默认值 → 目标 activity 静默 finish，am 照样 exit=0 假回执）。纯整数字面量
+        // → --ei、超 int 整数 → --el、true/false → --ez、其余 --es。误判代价与全
+        // --es 对称（目标读错类型拿默认值），不更糟。
+        extrasContent?.split(", ")?.forEach { pair ->
+            val eq = pair.indexOf('=')
+            if (eq > 0) {
+                val k = pair.substring(0, eq)
+                val v = pair.substring(eq + 1)
+                amArgs += when {
+                    v == "true" || v == "false" -> listOf("--ez", k, v)
+                    v.toIntOrNull() != null -> listOf("--ei", k, v)
+                    v.toLongOrNull() != null -> listOf("--el", k, v)
+                    else -> listOf("--es", k, v)
+                }
+            }
+        }
+        val execCmd = listOf("su", "-c", amArgs.joinToString(" ") { shellQuote(it) })
+        HLog.i(TAG, "shortcut root fallback: am start cmd=${amArgs.joinToString(" ")}")
+
+        // ④ 执行：exit=0 且 stderr/stdout 无 Error ⇒ Success；"brought to the front"
+        // warning 是成功（目标已在栈内时实测出现此 warning 而目标页已打开），勿按失败
+        // 处理。stdout 首行（Starting: Intent ...）留痕——exit=0 不代表目标真显示
+        // （WX_SHORTCUT 字符串 extras 假回执实锤：Starting 照打、activity 静默 finish）
+        return try {
+            val process = ProcessBuilder(execCmd).start()
+            try {
+                val stdout = BufferedReader(InputStreamReader(process.inputStream)).use { it.readText().trim() }
+                val stderr = BufferedReader(InputStreamReader(process.errorStream)).use { it.readText().trim() }
+                val exitCode = process.waitFor()
+                HLog.i(TAG, "shortcut root fallback: am start out=${stdout.lineSequence().firstOrNull() ?: ""}")
+                val errored = stderr.contains("Error") || stdout.contains("Error: Activity not started")
+                if (exitCode == 0 && !errored) {
+                    HLog.i(TAG, "shortcut root fallback: SUCCESS")
+                    LaunchResult.Success(null)
+                } else {
+                    HLog.w(TAG, "shortcut root fallback: am start exit=$exitCode stderr=$stderr")
+                    LaunchResult.Failure(FailureReason.ROOT_EXEC_FAILED, "exit=$exitCode: $stderr")
+                }
+            } finally {
+                process.destroy()
+            }
+        } catch (e: Exception) {
+            HLog.w(TAG, "shortcut root fallback: am start exec failed: ${e.message}")
+            LaunchResult.Failure(FailureReason.ROOT_EXEC_FAILED, e.message ?: "su exec failed")
         }
     }
 

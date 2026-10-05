@@ -112,15 +112,24 @@ class DirectLaunchStrategy(
         if (shortcut.kind == ShortcutKind.SHORTCUT_ID) {
             val appCtx0 = context.applicationContext
             Thread {
+                // 桥失败后的 root 兜底必须模块 App 代发：本进程（:ui）无 su 授权，
+                // root 反查在此落空（2026-10-05 实测：测试页=模块 App 可行、fan 不行）。
+                // 本进程只试桥（allowRootFallback=false 跳过 su 探测），失败即转发
+                // relay（与 QS_TILE 磁贴回退同通道）；OS3 桥永远成功，relay 不触发。
                 val result = ShortcutLauncher.launchShortcutId(
-                    appCtx0, shortcut, RelayToken.read(remotePrefs)
+                    appCtx0, shortcut, RelayToken.read(remotePrefs), allowRootFallback = false
                 )
+                val relayed = result is LaunchResult.Failure &&
+                    relayLaunchToModule(appCtx0, shortcut)
                 Handler(Looper.getMainLooper()).post {
                     runCatching {
                         Toast.makeText(
                             appCtx0,
-                            if (result is LaunchResult.Success) "已启动：${shortcut.label}"
-                            else "无法启动：${shortcut.label}",
+                            when {
+                                result is LaunchResult.Success -> "已启动：${shortcut.label}"
+                                relayed -> "已转发启动：${shortcut.label}"
+                                else -> "无法启动：${shortcut.label}"
+                            },
                             Toast.LENGTH_SHORT
                         ).show()
                     }.onFailure { HLog.w(TAG, "shortcut toast failed: ${it.message}") }
