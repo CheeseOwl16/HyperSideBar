@@ -102,6 +102,10 @@ object RelayGestureSink {
             HLog.i(TAG, "stream DOWN (${ev.rawX.toInt()},${ev.rawY.toInt()}) land=$landscape")
         }
         o.feedStripGesture(c, landscape, ev)
+        if (ev.actionMasked == MotionEvent.ACTION_UP || ev.actionMasked == MotionEvent.ACTION_CANCEL) {
+            // 流结束清身份：防 STALL 后置的过期 requestPilfer 撞旧手势（1005 实锤 mismatch）
+            streamDownTime = 0L
+        }
     }
 
     /** B2-2 抢占指令：STALL-TIMER fire（TurboLayout 主线程）→ 定向广播回 SystemUI。 */

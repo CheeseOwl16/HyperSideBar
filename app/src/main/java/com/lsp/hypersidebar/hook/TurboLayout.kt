@@ -226,6 +226,11 @@ class TurboLayout(private val remotePrefs: SharedPreferences) : BaseHook() {
             val m = impl.getDeclaredMethod(entry.name, *entry.parameterTypes)
             m.isAccessible = true
             m.createBeforeHook { param ->
+                // B 路线开=p7 放行（原生场景面板回归——游戏 Vtb/普通 Dock 的"不同场景
+                // 活动面板"正是经 p7 唤出的；竖屏带内停顿已被 pilfer 截断不会到 p7，
+                // 能漏出的只有横屏与竖屏带外=恰好是原生行为的领地）。
+                // B 路线关=沿用借用判定开关语义（下）。
+                if (sysInputOwner()) return@createBeforeHook
                 // 借用系统判定开关（默认关；1003 深夜定案：开关=是否借用系统判定，
                 // 非"面板选择"——两态下原生面板都不出现，模块独占触发=OS3 化）：
                 //   开=条外边缘停顿（松手后 p7）改呼扇形（全边缘补充触发，恒点选态）
@@ -303,6 +308,7 @@ class TurboLayout(private val remotePrefs: SharedPreferences) : BaseHook() {
     private var sResetPx = GestureThresholds.SWIPE_CONFIRM_PX * GestureThresholds.SWIPE_RESET_RATIO
 
     private fun handleStripGesture(view: View, ev: MotionEvent) {
+        if (ev.actionMasked == MotionEvent.ACTION_DOWN) sGestureFromSpy = false
         handleStripGestureCore(view.context, isLandscape(view), ev)
     }
 
@@ -312,6 +318,7 @@ class TurboLayout(private val remotePrefs: SharedPreferences) : BaseHook() {
      * 门控由调用方（sink）负责；本函数只做判定与驱动。
      */
     fun feedStripGesture(ctx: Context, landscape: Boolean, ev: MotionEvent) {
+        if (ev.actionMasked == MotionEvent.ACTION_DOWN) sGestureFromSpy = true
         handleStripGestureCore(ctx, landscape, ev)
     }
 
@@ -328,6 +335,10 @@ class TurboLayout(private val remotePrefs: SharedPreferences) : BaseHook() {
 
     /** 条上 hook 侧门禁（OS4 分支用）：B 路线开=纯吞（事件不进状态机，防 spy 双喂）。 */
     private fun stripSwallowOnly(): Boolean = sysInputOwner()
+
+    /** 当前手势是否来自 spy 转发（DOWN 时定，UP/CANCEL 复位）：抢占指令只对
+     *  spy 流有意义——条上路径事件本就归条窗口，发抢占只会撞身份过期（1005 实锤）。 */
+    @Volatile private var sGestureFromSpy = false
 
     private fun handleStripGestureCore(ctx: Context, landscape: Boolean, ev: MotionEvent) {
         // fan 展示中：转发驱动；手势中途落地先合成 DOWN 起始选择状态（边缘通道同款：
@@ -552,8 +563,9 @@ class TurboLayout(private val remotePrefs: SharedPreferences) : BaseHook() {
         StatsRecorder.onStall()
         vlog("s#$sGestureSeq STALL-TIMER fire ${stripDwellMs()}ms anchor=(${sAnchorX.toInt()},${sAnchorY.toInt()})")
         // B2-2 抢占指令先行（广播回程 10~50ms < 600ms 系统判定窗口，稳赢时序竞争）：
-        // pilfer 后原目标收 CANCEL，Rust 停顿判定中止，不产生 p7
-        if (sysInputOwner()) RelayGestureSink.requestPilfer()
+        // pilfer 后原目标收 CANCEL，Rust 停顿判定中止，不产生 p7。仅 spy 流——
+        // 条上路径事件归条窗口，发抢占只会撞身份过期
+        if (sysInputOwner() && sGestureFromSpy) RelayGestureSink.requestPilfer()
         postShowStripFan(ctx, landscape)
     }
 
