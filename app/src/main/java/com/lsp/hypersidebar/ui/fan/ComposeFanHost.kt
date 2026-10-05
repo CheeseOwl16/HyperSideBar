@@ -452,7 +452,11 @@ class ComposeFanHost(
                 //      行为），再收到同 downTime 的 UP。
                 // 统一判据：`event.downTime < shownUptime` = 该事件属于呼出前的手势。
                 // 真实点选/窗内滑动必然从本窗展示之后开始（downTime ≥ shownUptime）⇒ 不受影响。
-                val preShowGesture = shownUptime != 0L && event.downTime < shownUptime
+                // B2 流驱动旁路：转发流的 DOWN/UP 恒满足 preShowGesture（呼出发生在按住
+                // 期间）⇒ 旗标置位期间放行，否则拖选永无法提交（1005 15:54 导出实锤）。
+                // 窗体自身收到的原始尾巴不带旗标 ⇒ 照旧被吞（两条投递路径就此分离）。
+                val preShowGesture = shownUptime != 0L && event.downTime < shownUptime &&
+                    !B2StreamDispatch.active
                 if (preShowGesture) {
                     if (event.action == MotionEvent.ACTION_DOWN) {
                         // 形态 ② 的起始：不承认它，避免后续 UP 被算成一次"点空白"

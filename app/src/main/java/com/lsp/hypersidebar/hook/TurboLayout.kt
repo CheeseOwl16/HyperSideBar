@@ -331,23 +331,31 @@ class TurboLayout(private val remotePrefs: SharedPreferences) : BaseHook() {
 
     private fun handleStripGestureCore(ctx: Context, landscape: Boolean, ev: MotionEvent) {
         // fan 展示中：转发驱动；手势中途落地先合成 DOWN 起始选择状态（边缘通道同款：
-        // showInternal 主线程阻塞期间丢 DOWN 会导致窗口原点/选中起点全部失效）
+        // showInternal 主线程阻塞期间丢 DOWN 会导致窗口原点/选中起点全部失效）。
+        // 派发期间置 B2 流驱动旗标：ComposeFanHost 孤儿防护对转发流的 DOWN/UP 放行
+        // （downTime < shownUptime 对 B 路径恒真，不旁路则拖选永无法提交）——窗体自身
+        // 收到的原始尾巴不带旗标，照旧被吞，两条投递路径分离。
         if (fanController.isShowing) {
-            if (!sFanSeen) {
-                val down = MotionEvent.obtain(
-                    ev.downTime, ev.eventTime, MotionEvent.ACTION_DOWN, ev.rawX, ev.rawY, 0
-                )
-                try { sFanSeen = fanController.dispatchTouchEvent(down) } finally { down.recycle() }
-            }
-            fanController.dispatchTouchEvent(ev)
-            if (ev.actionMasked == MotionEvent.ACTION_UP || ev.actionMasked == MotionEvent.ACTION_CANCEL) {
-                // 常驻模式：松手未提交选中 → 转点选态（窗口保留）；现状=立即收起。
-                // UP 已提交选中时 LAUNCHED 收起在先、isShowing=false，两分支都自然跳过
-                if (fanController.isShowing) {
-                    if (fanPersistentOnRelease()) fanController.onGestureEnded()
-                    else fanController.dismiss()
+            com.lsp.hypersidebar.ui.fan.B2StreamDispatch.active = true
+            try {
+                if (!sFanSeen) {
+                    val down = MotionEvent.obtain(
+                        ev.downTime, ev.eventTime, MotionEvent.ACTION_DOWN, ev.rawX, ev.rawY, 0
+                    )
+                    try { sFanSeen = fanController.dispatchTouchEvent(down) } finally { down.recycle() }
                 }
-                resetStripGesture()
+                fanController.dispatchTouchEvent(ev)
+                if (ev.actionMasked == MotionEvent.ACTION_UP || ev.actionMasked == MotionEvent.ACTION_CANCEL) {
+                    // 常驻模式：松手未提交选中 → 转点选态（窗口保留）；现状=立即收起。
+                    // UP 已提交选中时 LAUNCHED 收起在先、isShowing=false，两分支都自然跳过
+                    if (fanController.isShowing) {
+                        if (fanPersistentOnRelease()) fanController.onGestureEnded()
+                        else fanController.dismiss()
+                    }
+                    resetStripGesture()
+                }
+            } finally {
+                com.lsp.hypersidebar.ui.fan.B2StreamDispatch.active = false
             }
             return
         }
