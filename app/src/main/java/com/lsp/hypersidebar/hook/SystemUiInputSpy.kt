@@ -329,15 +329,17 @@ object SystemUiInputSpy {
         }.onFailure { HLog.w(TAG, "pilfer register failed: ${it.message}") }
     }
 
-    /** 触发带判定（转发前置粗筛；精判定在 ：ui 状态机）：竖屏=全高侧带；横屏=顶部
-     *  角条盒（左/右随 dock 侧）；底部 1/4 恒排除（Home 手势带，B2 排除清单第一条）。 */
+    /** 触发带判定（转发前置粗筛；精判定在 ：ui 状态机）：竖屏=侧带 × Y 范围
+     *  [H/4,3H/4]（1005 用户拍板；3/4 下缘顺带覆盖底部 Home 手势带排除）；横屏=
+     *  顶部角条盒（左/右随 dock 侧，Y 不受限——条本在顶部）。 */
     private fun inTriggerBand(x: Float, y: Float, w: Int, h: Int): Boolean {
-        if (y > h * 3f / 4f) return false
         val nearSide = x <= BAND_X_PX || x >= w - BAND_X_PX
         return if (w > h) {
             y <= BAND_Y_LANDSCAPE_PX && nearSide
         } else {
-            nearSide
+            val top = h * com.lsp.hypersidebar.prefs.LayoutDefaults.SPY_BAND_TOP_RATIO
+            val bottom = h * com.lsp.hypersidebar.prefs.LayoutDefaults.SPY_BAND_BOTTOM_RATIO
+            y >= top && y <= bottom && nearSide
         }
     }
 

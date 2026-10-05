@@ -316,6 +316,12 @@ object LayoutDefaults {
     /** OS4 B 路线总开关默认值（实验特性）：关=现状（条上状态机饿死+p7 借用兜底）。 */
     const val SYS_INPUT_OWNER = false
 
+    /** B 路线竖屏触发带 Y 范围（屏高比例，1005 用户拍板 1/4~3/4）：带外 DOWN 不起转发。
+     *  上限取 3/4 顺带覆盖底部 Home 手势带排除；横屏角条盒不受此限（条在顶部）。
+     *  实测手感定档后若开放用户调节，走 LayoutDefaults 滑条契约（sliderSteps 推导）。 */
+    const val SPY_BAND_TOP_RATIO = 0.25f
+    const val SPY_BAND_BOTTOM_RATIO = 0.75f
+
     /** 底角斜滑扇形样式默认值：图标沿用竖屏（32dp），半径与数量独立定档（仿 Flyme 大半径
      *  四分之一弧，双环 13 图标不挤在小弧上）。0922 起数量不再跟竖屏联动。
      *  可在底角布局 sheet 独立微调。 */
