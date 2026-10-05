@@ -67,6 +67,8 @@
     <string name="fan_persistent_summary">松手后扇形不自动收起：点图标启动、点空白收起；10 秒无操作自动收起</string>
     <string name="evoke_borrow_system_title">边缘停顿借用系统判定（松手后呼出）</string>
     <string name="evoke_borrow_system_summary">开启后，屏幕边缘任意位置的停顿在松手后呼出扇形（判定借用系统，OS4 原生时机）。默认关闭=仅小白条位置停顿即呼出（无需松手，与 OS3 时机一致）；两态下原生侧边栏面板均不出现。开启需系统已启用「侧边停顿呼出」；仅 OS4 生效</string>
+    <string name="sys_input_owner_title">全边缘触发·实验（停顿即呼出+拖选）</string>
+    <string name="sys_input_owner_summary">在系统界面进程观察屏幕边缘输入流，命中停顿判定后接管手势并呼出扇形——恢复 OS3 的全边缘体验（无需松手、可拖选）。开启后小白条触发让位给本通道；返回/底部手势等系统操作不受影响。改动后需重启系统界面生效；异常时关闭开关并重启系统界面即可完全还原。仅 OS4 生效</string>
     <string name="corner_swipe_title">底角斜滑呼出</string>
     <string name="corner_swipe_summary">从屏幕左下/右下角斜向内上滑，直接呼出扇形（仅竖屏）；与停顿呼出并存，默认关闭</string>
     <string name="corner_width_title">底角触发宽度</string>

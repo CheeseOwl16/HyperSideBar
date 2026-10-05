@@ -123,6 +123,20 @@ internal fun InvokeSettingsPage(prefs: SharedPreferences, modifier: Modifier = M
                             repo.save(PrefKeys.EVOKE_BORROW_SYSTEM, it)
                         }
                     )
+                    // OS4 B 路线（实验，默认关）：SystemUI spy 转发边缘流+pilfer 回流，
+                    // 恢复全边缘"停顿即呼出+拖选"（OS3 语义）。改动后重启系统界面生效。
+                    var sysInputOwner by remember(effectivePrefs, repo.revision) {
+                        mutableStateOf(repo.sysInputOwner())
+                    }
+                    SwitchPreference(
+                        title = stringResource(R.string.sys_input_owner_title),
+                        summary = stringResource(R.string.sys_input_owner_summary),
+                        checked = sysInputOwner,
+                        onCheckedChange = {
+                            sysInputOwner = it
+                            repo.save(PrefKeys.SYS_INPUT_OWNER, it)
+                        }
+                    )
                 }
             }
         }

@@ -169,6 +169,9 @@ class SystemUiHook(private val prefs: SharedPreferences) : BaseHook() {
                 // monitorGestureInput 须从 context 的 InputManager 服务实例发起
                 runCatching { SystemUiInputSpy.start(ctx) }
                     .onFailure { HLog.w(TAG, "input spy start failed: ${it.message}") }
+                // B2-2：抢占指令接收端（:ui STALL-TIMER fire → 五要素匹配 → pilfer）
+                runCatching { SystemUiInputSpy.registerPilferReceiver(ctx, prefs) }
+                    .onFailure { HLog.w(TAG, "pilfer receiver register failed: ${it.message}") }
             }
     }
 

@@ -259,6 +259,115 @@ object SystemUiInputSpy {
         }
     }
 
+    // ===== B2-1/B2-2（os4-trigger-final-plan §7）：带内流转发 + 抢占执行 =====
+
+    /** 转发带半宽（px）：竖屏全高侧带 / 横屏顶部角条盒的 x 向边界；88px 条+余量 */
+    private const val BAND_X_PX = 130
+    /** 横屏角条盒的 y 向边界（条 308px+余量） */
+    private const val BAND_Y_LANDSCAPE_PX = 340
+
+    /** B 路线开关（sys 进程 prefs=启动快照，改动须重启 SystemUI 生效——设置页已注明） */
+    @Volatile private var prefs: android.content.SharedPreferences? = null
+
+    private fun sysInputOwner(): Boolean = runCatching {
+        prefs?.getBoolean(
+            com.lsp.hypersidebar.prefs.PrefKeys.SYS_INPUT_OWNER,
+            com.lsp.hypersidebar.prefs.LayoutDefaults.SYS_INPUT_OWNER
+        ) ?: false
+    }.getOrDefault(false)
+
+    /** 当前转发中的手势五要素（DOWN 时快照，供抢占指令匹配） */
+    @Volatile private var fwdDownTime = 0L
+    @Volatile private var fwdDeviceId = -1
+    @Volatile private var fwdSource = 0
+    @Volatile private var fwdEdgeFlags = 0
+    @Volatile private var fwdPointerId = 0
+
+    /** 注册抢占指令接收器（:ui STALL-TIMER fire → 五要素全匹配才 pilferPointers）。
+     *  Token 校验同 QS 点击接收器（0912 审查口径：RECEIVER_EXPORTED 必须带令牌）。 */
+    fun registerPilferReceiver(ctx: android.content.Context, modulePrefs: android.content.SharedPreferences) {
+        prefs = modulePrefs
+        runCatching {
+            ctx.applicationContext.registerReceiver(
+                object : android.content.BroadcastReceiver() {
+                    override fun onReceive(c: android.content.Context, intent: android.content.Intent) {
+                        if (!sysInputOwner()) return
+                        if (!com.lsp.hypersidebar.util.RelayToken.verifyFan(
+                                intent, com.lsp.hypersidebar.util.RelayToken.read(modulePrefs)
+                            )
+                        ) return
+                        val dt = intent.getLongExtra(com.lsp.hypersidebar.prefs.PrefKeys.SPY_EXTRA_DOWN_TIME, 0L)
+                        val dev = intent.getIntExtra(com.lsp.hypersidebar.prefs.PrefKeys.SPY_EXTRA_DEVICE_ID, -1)
+                        val src = intent.getIntExtra(com.lsp.hypersidebar.prefs.PrefKeys.SPY_EXTRA_SOURCE, 0)
+                        val ef = intent.getIntExtra(com.lsp.hypersidebar.prefs.PrefKeys.SPY_EXTRA_EDGE_FLAGS, 0)
+                        val pid = intent.getIntExtra(com.lsp.hypersidebar.prefs.PrefKeys.SPY_EXTRA_POINTER_ID, 0)
+                        // 五要素全匹配才碰流（MiuiBackGestureHook accepted-DOWN 令牌模型；
+                        // 不匹配=完全不碰——pilfer 不可回滚）
+                        val matched = dt == fwdDownTime && dev == fwdDeviceId &&
+                            src == fwdSource && ef == fwdEdgeFlags && pid == fwdPointerId
+                        if (!matched) {
+                            HLog.w(TAG, "pilfer identity mismatch: req(dt=$dt,dev=$dev,src=$src,ef=$ef,pid=$pid) " +
+                                "cur(dt=$fwdDownTime,dev=$fwdDeviceId,src=$fwdSource,ef=$fwdEdgeFlags,pid=$fwdPointerId)")
+                            return
+                        }
+                        runCatching {
+                            monitorRef?.javaClass?.getMethod("pilferPointers")?.invoke(monitorRef)
+                            HLog.i(TAG, "pilfered stream dt=$dt — Rust 判定将收 CANCEL")
+                        }.onFailure { HLog.w(TAG, "pilferPointers failed: ${it.message}") }
+                    }
+                },
+                android.content.IntentFilter(com.lsp.hypersidebar.prefs.PrefKeys.SPY_PILFER_ACTION),
+                android.content.Context.RECEIVER_EXPORTED
+            )
+            HLog.i(TAG, "pilfer receiver registered")
+        }.onFailure { HLog.w(TAG, "pilfer register failed: ${it.message}") }
+    }
+
+    /** 触发带判定（转发前置粗筛；精判定在 ：ui 状态机）：竖屏=全高侧带；横屏=顶部
+     *  角条盒（左/右随 dock 侧）；底部 1/4 恒排除（Home 手势带，B2 排除清单第一条）。 */
+    private fun inTriggerBand(x: Float, y: Float, w: Int, h: Int): Boolean {
+        if (y > h * 3f / 4f) return false
+        val nearSide = x <= BAND_X_PX || x >= w - BAND_X_PX
+        return if (w > h) {
+            y <= BAND_Y_LANDSCAPE_PX && nearSide
+        } else {
+            nearSide
+        }
+    }
+
+    /** 带内 DOWN 起转发该流（UP/CANCEL 结束）；每事件一播（频率实测后优化，计划 §7）。 */
+    private fun forwardIfNeeded(ev: MotionEvent, w: Int, h: Int) {
+        val p = prefs ?: return
+        if (!sysInputOwner()) return
+        val ctx = appContext ?: return
+        val a = ev.actionMasked
+        if (a == MotionEvent.ACTION_DOWN) {
+            if (!inTriggerBand(ev.x, ev.y, w, h)) return
+            fwdDownTime = ev.downTime
+            fwdDeviceId = ev.deviceId
+            fwdSource = ev.source
+            fwdEdgeFlags = ev.edgeFlags
+            fwdPointerId = ev.getPointerId(0)
+        } else if (fwdDownTime != ev.downTime) {
+            return // 非转发流的 MOVE/UP（带外起手）——静默忽略
+        }
+        val intent = android.content.Intent(com.lsp.hypersidebar.prefs.PrefKeys.SPY_STREAM_ACTION)
+            .setPackage(com.lsp.hypersidebar.prefs.HostPackages.UI_HOST)
+            .putExtra(com.lsp.hypersidebar.prefs.PrefKeys.SPY_EXTRA_EVENT, ev)
+            .putExtra(
+                com.lsp.hypersidebar.prefs.PrefKeys.SPY_EXTRA_LANDSCAPE,
+                w > h
+            )
+        com.lsp.hypersidebar.util.RelayToken.attach(
+            intent, com.lsp.hypersidebar.util.RelayToken.read(p)
+        )
+        runCatching { ctx.sendBroadcast(intent) }
+            .onFailure { HLog.w(TAG, "stream forward failed: ${it.message}") }
+        if (a == MotionEvent.ACTION_UP || a == MotionEvent.ACTION_CANCEL) {
+            fwdDownTime = 0L
+        }
+    }
+
     private fun onMotion(ev: MotionEvent, w: Int, h: Int) {
         val a = ev.actionMasked
         if (a == MotionEvent.ACTION_DOWN) {
@@ -283,6 +392,10 @@ object SystemUiInputSpy {
             } else {
                 HLog.i(TAG, "move x=${ev.x.toInt()} y=${ev.y.toInt()} dt=${ev.downTime}")
             }
+        }
+        // B2-1：带内流转发（关=零开销；带外流在 DOWN 处即被排除）
+        if (a == MotionEvent.ACTION_DOWN || fwdDownTime == ev.downTime) {
+            forwardIfNeeded(ev, w, h)
         }
     }
 }

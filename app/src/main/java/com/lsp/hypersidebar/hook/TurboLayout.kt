@@ -149,6 +149,13 @@ class TurboLayout(private val remotePrefs: SharedPreferences) : BaseHook() {
                 // 死亡放行原生（条恢复可拖原生面板）。
                 if (isOs4Sidebar) {
                     if (!moduleEnabled() || breaker.open || DataDeadState.dead) return@createBeforeHook
+                    // B 路线开=纯吞：spy 转发是唯一驱动源（同一触摸条上 hook 与 spy 都
+                    // 看得到，双喂会让状态机双计数/双确认）；退路不变（总开关关/熔断
+                    // /数据死亡=整段放行原生，B 通道由 sink 侧同款门控独立关闭）
+                    if (stripSwallowOnly()) {
+                        it.result = true
+                        return@createBeforeHook
+                    }
                     handleStripGesture(view, event)
                     it.result = true
                     return@createBeforeHook
@@ -296,6 +303,33 @@ class TurboLayout(private val remotePrefs: SharedPreferences) : BaseHook() {
     private var sResetPx = GestureThresholds.SWIPE_CONFIRM_PX * GestureThresholds.SWIPE_RESET_RATIO
 
     private fun handleStripGesture(view: View, ev: MotionEvent) {
+        handleStripGestureCore(view.context, isLandscape(view), ev)
+    }
+
+    /**
+     * B2 喂流入口（sys spy 转发的带内流；RelayGestureSink 调用）：状态机不再依赖
+     * View——横竖屏由转发方判定传入（spy 无 View 可读），上下文=:ui 进程任一 context。
+     * 门控由调用方（sink）负责；本函数只做判定与驱动。
+     */
+    fun feedStripGesture(ctx: Context, landscape: Boolean, ev: MotionEvent) {
+        handleStripGestureCore(ctx, landscape, ev)
+    }
+
+    /** B 路线总开关（实验）：开=条上 hook 让位纯吞、spy 转发为唯一驱动源（防双喂）。 */
+    private fun sysInputOwner(): Boolean = runCatching {
+        remotePrefs.getBoolean(PrefKeys.SYS_INPUT_OWNER, LayoutDefaults.SYS_INPUT_OWNER)
+    }.getOrDefault(LayoutDefaults.SYS_INPUT_OWNER)
+
+    /** B2 sink 侧总门控（isOs4+开关+退路面三合一）；prefs 供 sink 回传令牌读取。 */
+    internal fun b2Enabled(): Boolean =
+        isOs4Sidebar && sysInputOwner() && moduleEnabled() && !breaker.open && !DataDeadState.dead
+
+    internal val b2Prefs: SharedPreferences get() = remotePrefs
+
+    /** 条上 hook 侧门禁（OS4 分支用）：B 路线开=纯吞（事件不进状态机，防 spy 双喂）。 */
+    private fun stripSwallowOnly(): Boolean = sysInputOwner()
+
+    private fun handleStripGestureCore(ctx: Context, landscape: Boolean, ev: MotionEvent) {
         // fan 展示中：转发驱动；手势中途落地先合成 DOWN 起始选择状态（边缘通道同款：
         // showInternal 主线程阻塞期间丢 DOWN 会导致窗口原点/选中起点全部失效）
         if (fanController.isShowing) {
@@ -321,7 +355,7 @@ class TurboLayout(private val remotePrefs: SharedPreferences) : BaseHook() {
         when (ev.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
                 // 配置新鲜度检查（迭代六 §11.1）：过期才后台 bind 拉取，此处仅 volatile 读
-                com.lsp.hypersidebar.util.ConfigPullBridge.refreshIfStale(view.context)
+                com.lsp.hypersidebar.util.ConfigPullBridge.refreshIfStale(ctx)
                 sDownX = ev.rawX
                 sDownY = ev.rawY
                 sGestureSeq++
@@ -332,7 +366,7 @@ class TurboLayout(private val remotePrefs: SharedPreferences) : BaseHook() {
                 // 内滑）；OS4 竖屏条=右缘中带，轴改水平向内——对角线轴对水平内滑有
                 // 0.707 投影衰减+锥倾斜（正是实测"横屏响应不如竖屏"的主因），竖屏
                 // 条几何下不适用
-                val dm = view.context.resources.displayMetrics
+                val dm = ctx.resources.displayMetrics
                 // 滑动距离换算（dp→px，DOWN 一次缓存整条手势；设置项即时经 ConfigSync 生效）
                 val distanceDp = try {
                     remotePrefs.getFloat(
@@ -343,7 +377,7 @@ class TurboLayout(private val remotePrefs: SharedPreferences) : BaseHook() {
                 }
                 sConfirmPx = distanceDp * dm.density
                 sResetPx = sConfirmPx * GestureThresholds.SWIPE_RESET_RATIO
-                if (isOs4Sidebar && !isLandscape(view)) {
+                if (isOs4Sidebar && !landscape) {
                     sInwardUx = if (sDownX < dm.widthPixels / 2f) 1f else -1f
                     sInwardUy = 0f
                 } else {
@@ -392,7 +426,7 @@ class TurboLayout(private val remotePrefs: SharedPreferences) : BaseHook() {
                         sSpeedWinT = ev.eventTime
                         vlog("s#$sGestureSeq swipe confirmed: travel=${travel.toInt()}px (>= ${sConfirmPx.toInt()}) angle=${angle.toInt()}")
                         // 13.1：确认即挂停顿定时器（取代旧 sAnchorT 基准+事件内评估）
-                        armStallTimer(view)
+                        armStallTimer(ctx, landscape)
                     }
                 }
 
@@ -410,7 +444,7 @@ class TurboLayout(private val remotePrefs: SharedPreferences) : BaseHook() {
                         sAnchorX = ev.rawX
                         sAnchorY = ev.rawY
                         sSpeedWinT = ev.eventTime
-                        if (speed > GestureThresholds.STALL_MAX_SPEED_PX_S) restartStallTimer(view)
+                        if (speed > GestureThresholds.STALL_MAX_SPEED_PX_S) restartStallTimer(ctx, landscape)
                     }
                     // 达标判定在定时器 fire（fireStall）：手指静止后无 MOVE 也照常触发
                 }
@@ -446,11 +480,10 @@ class TurboLayout(private val remotePrefs: SharedPreferences) : BaseHook() {
      * OS4 竖屏（条=右缘中带、无 launcher 通道）跟随 DOWN 高度——同 OS2/3 竖屏
      * "停顿过程中的滑动漂移不影响呼出位置"定稿（轮六）。
      */
-    private fun postShowStripFan(view: View) {
-        val ctx = view.context
+    private fun postShowStripFan(ctx: Context, landscape: Boolean) {
         val dm = ctx.resources.displayMetrics
         val anchorX = if (sDownX < dm.widthPixels / 2f) 0f else dm.widthPixels.toFloat()
-        val anchorY = if (isOs4Sidebar && !isLandscape(view)) {
+        val anchorY = if (isOs4Sidebar && !landscape) {
             sDownY
         } else {
             LANDSCAPE_ANCHOR_Y_DP * dm.density
@@ -482,18 +515,18 @@ class TurboLayout(private val remotePrefs: SharedPreferences) : BaseHook() {
 
     // ===== 停顿定时器（13.1，与 EdgeGestureHook 对称；:ui 条上触摸在主线程）=====
 
-    private fun armStallTimer(view: View) {
+    private fun armStallTimer(ctx: Context, landscape: Boolean) {
         cancelStallTimer()
         sStallTimerSeq = sGestureSeq
         val dwell = stripDwellMs()
-        val r = Runnable { fireStall(view) }
+        val r = Runnable { fireStall(ctx, landscape) }
         sStallTimer = r
         mainHandler.postDelayed(r, dwell)
     }
 
     /** 速度窗内超速=手指仍在主动移动：dwell 全额重启（语义同旧 sAnchorT=eventTime 重置）。 */
-    private fun restartStallTimer(view: View) {
-        armStallTimer(view)
+    private fun restartStallTimer(ctx: Context, landscape: Boolean) {
+        armStallTimer(ctx, landscape)
         vlog("s#$sGestureSeq STALL-TIMER restart ${stripDwellMs()}ms (speed > ${GestureThresholds.STALL_MAX_SPEED_PX_S.toInt()}px/s)")
     }
 
@@ -502,7 +535,7 @@ class TurboLayout(private val remotePrefs: SharedPreferences) : BaseHook() {
         sStallTimer = null
     }
 
-    private fun fireStall(view: View) {
+    private fun fireStall(ctx: Context, landscape: Boolean) {
         if (sStallTimer == null) return  // removeCallbacks 与在途任务竞态：已取消则静默退出
         sStallTimer = null
         if (sStallTimerSeq != sGestureSeq || !sSwipeConfirmed || sStallFired) return
@@ -510,7 +543,10 @@ class TurboLayout(private val remotePrefs: SharedPreferences) : BaseHook() {
         sStallFired = true
         StatsRecorder.onStall()
         vlog("s#$sGestureSeq STALL-TIMER fire ${stripDwellMs()}ms anchor=(${sAnchorX.toInt()},${sAnchorY.toInt()})")
-        postShowStripFan(view)
+        // B2-2 抢占指令先行（广播回程 10~50ms < 600ms 系统判定窗口，稳赢时序竞争）：
+        // pilfer 后原目标收 CANCEL，Rust 停顿判定中止，不产生 p7
+        if (sysInputOwner()) RelayGestureSink.requestPilfer()
+        postShowStripFan(ctx, landscape)
     }
 
     private fun stripDwellMs(): Long = try {
@@ -542,6 +578,8 @@ class TurboLayout(private val remotePrefs: SharedPreferences) : BaseHook() {
 
     override fun init() {
         HLog.i(TAG, "=== TurboLayout init ===")
+        // B2-1：spy 转发流的回流终点（:ui；自挂 Application.attach 注册，init 早于 attach）
+        RelayGestureSink.arm(this)
         // 结构化锚点解析（每宿主进程一次）：必须早于所有依赖锚点的 hook 安装。
         // L2 总闸可远程关闭（pref），解析失败逐 role 闭锁（不影响其它 hook、不改变既有默认路径）。
         val structuralScan = runCatching {

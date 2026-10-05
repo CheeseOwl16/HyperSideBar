@@ -40,6 +40,29 @@ object PrefKeys {
      *  停顿、松手后呼出扇形（全边缘，OS4 原生时机）。两态面板均为模块扇形。 */
     const val EVOKE_BORROW_SYSTEM = "evokeBorrowSystem"
 
+    /** OS4 B 路线总开关（实验，默认关）：SystemUI spy 监视条带外的边缘输入流并转发
+     *  :ui 状态机，恢复全边缘"停顿即呼出+拖选"（OS3 语义）。开=条上 hook 让位为纯吞
+     *  （唯一驱动源=spy 转发，防双喂）；判定命中后由 ：ui 广播抢占指令、SystemUI
+     *  pilferPointers 夺流（Rust 判定收 CANCEL 中止，不产生 p7）。改动后重启系统界面生效
+     *  （sys 进程 prefs=启动快照）。 */
+    const val SYS_INPUT_OWNER = "sysInputOwner"
+
+    // ===== B 路线跨进程通道（sys spy ⇄ :ui 状态机，2026-10-05）=====
+    /** spy→:ui 带内手势事件转发（每事件一播，MotionEvent 直塞 extra） */
+    const val SPY_STREAM_ACTION = "com.lsp.hypersidebar.action.SPY_GESTURE_EVENT"
+    /** :ui→sys 抢占指令（STALL-TIMER fire；五要素匹配后才 pilferPointers） */
+    const val SPY_PILFER_ACTION = "com.lsp.hypersidebar.action.SPY_GESTURE_PILFER"
+    /** 转发 extra：MotionEvent 本体（framework Parcelable） */
+    const val SPY_EXTRA_EVENT = "ev"
+    /** 转发 extra：横竖屏（转发方计算，:ui 免依赖 View） */
+    const val SPY_EXTRA_LANDSCAPE = "land"
+    /** 抢占/转发 extra：手势五要素（downTime/deviceId/source/edgeFlags/pointerId）+令牌 */
+    const val SPY_EXTRA_DOWN_TIME = "downTime"
+    const val SPY_EXTRA_DEVICE_ID = "deviceId"
+    const val SPY_EXTRA_SOURCE = "source"
+    const val SPY_EXTRA_EDGE_FLAGS = "edgeFlags"
+    const val SPY_EXTRA_POINTER_ID = "pointerId"
+
     /** 底角斜滑扇形独立样式（N1，仅竖屏）：默认值=竖屏布局值，故开箱与竖屏效果一致、可独立微调。 */
     const val CORNER_ICON_SIZE = "cornerIconSize"
     const val CORNER_INNER_RADIUS = "cornerInnerRadius"
@@ -289,6 +312,9 @@ object LayoutDefaults {
 
     /** OS4 边缘停顿借用系统判定默认开关：默认关=条上停顿即呼出（无需松手，OS3 时机）。 */
     const val EVOKE_BORROW_SYSTEM = false
+
+    /** OS4 B 路线总开关默认值（实验特性）：关=现状（条上状态机饿死+p7 借用兜底）。 */
+    const val SYS_INPUT_OWNER = false
 
     /** 底角斜滑扇形样式默认值：图标沿用竖屏（32dp），半径与数量独立定档（仿 Flyme 大半径
      *  四分之一弧，双环 13 图标不挤在小弧上）。0922 起数量不再跟竖屏联动。
