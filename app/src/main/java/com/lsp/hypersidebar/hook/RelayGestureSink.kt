@@ -66,9 +66,11 @@ object RelayGestureSink {
     private fun register(ctx: Context) {
         if (registered) return
         registered = true
-        appCtx = ctx.applicationContext
+        // 存原始 context（attach 传 base ContextImpl）：applicationContext 在 attach 时刻
+        // 仍为 null（LoadedApk 未挂完）——1005 实锤 register NPE，SystemUiInputSpy 同款教训
+        appCtx = ctx
         runCatching {
-            ctx.applicationContext.registerReceiver(
+            ctx.registerReceiver(
                 object : BroadcastReceiver() {
                     override fun onReceive(c: Context, intent: Intent) {
                         val ev = intent.getParcelableExtra<MotionEvent>(PrefKeys.SPY_EXTRA_EVENT)
