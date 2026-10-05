@@ -292,10 +292,14 @@ object SystemUiInputSpy {
                 object : android.content.BroadcastReceiver() {
                     override fun onReceive(c: android.content.Context, intent: android.content.Intent) {
                         if (!sysInputOwner()) return
+                        // 全链留痕（低频，不会被 MOVE 刷掉）：token/身份/pilfer 结果都可判读
                         if (!com.lsp.hypersidebar.util.RelayToken.verifyFan(
                                 intent, com.lsp.hypersidebar.util.RelayToken.read(modulePrefs)
                             )
-                        ) return
+                        ) {
+                            HLog.w(TAG, "pilfer command rejected: token mismatch")
+                            return
+                        }
                         val dt = intent.getLongExtra(com.lsp.hypersidebar.prefs.PrefKeys.SPY_EXTRA_DOWN_TIME, 0L)
                         val dev = intent.getIntExtra(com.lsp.hypersidebar.prefs.PrefKeys.SPY_EXTRA_DEVICE_ID, -1)
                         val src = intent.getIntExtra(com.lsp.hypersidebar.prefs.PrefKeys.SPY_EXTRA_SOURCE, 0)
@@ -386,11 +390,14 @@ object SystemUiInputSpy {
         } else if (HLog.verboseEnabled && (a == MotionEvent.ACTION_MOVE ||
                 a == MotionEvent.ACTION_UP || a == MotionEvent.ACTION_CANCEL)
         ) {
-            // 高频明细走 vlog 模式（门控在调用侧，关时零字符串构造）
-            if (a != MotionEvent.ACTION_MOVE) {
-                HLog.i(TAG, "a=$a x=${ev.x.toInt()} y=${ev.y.toInt()} dt=${ev.downTime}")
+            // B2 转发模式下 MOVE 打点=纯噪音（1000 条环形缓冲 ~2s 即被刷光，pilfer 等
+            // 低频关键日志全被冲掉——0505 15:30 导出教训）：仅非转发流记 MOVE
+            if (a == MotionEvent.ACTION_MOVE) {
+                if (fwdDownTime != ev.downTime) {
+                    HLog.i(TAG, "move x=${ev.x.toInt()} y=${ev.y.toInt()} dt=${ev.downTime}")
+                }
             } else {
-                HLog.i(TAG, "move x=${ev.x.toInt()} y=${ev.y.toInt()} dt=${ev.downTime}")
+                HLog.i(TAG, "a=$a x=${ev.x.toInt()} y=${ev.y.toInt()} dt=${ev.downTime}")
             }
         }
         // B2-1：带内流转发（关=零开销；带外流在 DOWN 处即被排除）
