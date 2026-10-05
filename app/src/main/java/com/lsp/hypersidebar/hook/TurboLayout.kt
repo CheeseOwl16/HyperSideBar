@@ -149,10 +149,10 @@ class TurboLayout(private val remotePrefs: SharedPreferences) : BaseHook() {
                 // 死亡放行原生（条恢复可拖原生面板）。
                 if (isOs4Sidebar) {
                     if (!moduleEnabled() || breaker.open || DataDeadState.dead) return@createBeforeHook
-                    // B 路线开=纯吞：spy 转发是唯一驱动源（同一触摸条上 hook 与 spy 都
-                    // 看得到，双喂会让状态机双计数/双确认）；退路不变（总开关关/熔断
-                    // /数据死亡=整段放行原生，B 通道由 sink 侧同款门控独立关闭）
-                    if (stripSwallowOnly()) {
+                    // B 路线开=竖屏条上让位纯吞（spy 转发是竖屏唯一驱动源，防双喂）；
+                    // 横屏不接管——条上状态机照旧（OS2/3 横屏语义，成熟路径，触发面小）。
+                    // 退路不变（总开关关/熔断/数据死亡=整段放行原生）
+                    if (stripSwallowOnly() && !isLandscape(view)) {
                         it.result = true
                         return@createBeforeHook
                     }

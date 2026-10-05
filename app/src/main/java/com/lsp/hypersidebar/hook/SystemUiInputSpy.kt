@@ -330,19 +330,16 @@ object SystemUiInputSpy {
         }.onFailure { HLog.w(TAG, "pilfer register failed: ${it.message}") }
     }
 
-    /** 触发带判定（转发前置粗筛；精判定在 ：ui 状态机）：竖屏=侧带 × Y 范围
-     *  [H/3,2H/3]（与 OS2/3 launcher 通道同源，GestureThresholds 唯一定义源）；
-     *  横屏=侧带 × 上半屏（角条盒 340px 太紧——16:41 导出实机触摸 y=348-430 全被拒，
-     *  放宽到 h/2；底部手势带由 h/2 自然排除）。w/h 必须逐事件现读（旋转）。 */
+    /** 触发带判定（转发前置粗筛；精判定在 ：ui 状态机）：**仅竖屏**——侧带 ×
+     *  [H/3,2H/3]（与 OS2/3 launcher 通道同源，GestureThresholds 唯一定义源）。
+     *  横屏不转发：OS2/3 横屏语义=条上触发（条上 hook 路径成熟且触发面小），
+     *  spy 接管横屏既无增益又把返回手势区整段灌进广播（1005 教训）。 */
     private fun inTriggerBand(x: Float, y: Float, w: Int, h: Int): Boolean {
+        if (w > h) return false
         val nearSide = x <= BAND_X_PX || x >= w - BAND_X_PX
-        return if (w > h) {
-            y <= h / 2f && nearSide
-        } else {
-            val top = h * GestureThresholds.TRIGGER_ZONE_TOP_RATIO
-            val bottom = h * GestureThresholds.TRIGGER_ZONE_BOTTOM_RATIO
-            y >= top && y <= bottom && nearSide
-        }
+        val top = h * GestureThresholds.TRIGGER_ZONE_TOP_RATIO
+        val bottom = h * GestureThresholds.TRIGGER_ZONE_BOTTOM_RATIO
+        return y >= top && y <= bottom && nearSide
     }
 
     /** 带内 DOWN 起转发该流（UP/CANCEL 结束）；每事件一播（频率实测后优化，计划 §7）。 */
