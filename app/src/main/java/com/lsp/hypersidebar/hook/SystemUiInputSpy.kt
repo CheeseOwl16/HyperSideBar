@@ -264,8 +264,11 @@ object SystemUiInputSpy {
 
     // ===== B2-1/B2-2（os4-trigger-final-plan §7）：带内流转发 + 抢占执行 =====
 
-    /** 转发带半宽（px）：竖屏全高侧带 / 横屏顶部角条盒的 x 向边界；88px 条+余量 */
-    private const val BAND_X_PX = 130
+    /** 转发带半宽（dp）：=官方小白条宽 32dp（marble 2.75 密度=88px）。首版 130px
+     *  （88+余量）实机反馈过宽——DOWN 离边 12% 屏宽即入判定面，非边缘触摸也触发
+     *  （1005 用户实测）；收窄到条宽对齐 OS2/3「条=触发面」语义。密度运行时现算，
+     *  对屏宽/密度漂移免疫（同 [[anchorY]] 的 heightPixels 教训）。 */
+    private const val BAND_X_DP = 32f
 
     /** B 路线开关（sys 进程 prefs=启动快照，改动须重启 SystemUI 生效——设置页已注明） */
     @Volatile private var prefs: android.content.SharedPreferences? = null
@@ -336,7 +339,8 @@ object SystemUiInputSpy {
      *  spy 接管横屏既无增益又把返回手势区整段灌进广播（1005 教训）。 */
     private fun inTriggerBand(x: Float, y: Float, w: Int, h: Int): Boolean {
         if (w > h) return false
-        val nearSide = x <= BAND_X_PX || x >= w - BAND_X_PX
+        val bandPx = BAND_X_DP * android.content.res.Resources.getSystem().displayMetrics.density
+        val nearSide = x <= bandPx || x >= w - bandPx
         val top = h * GestureThresholds.TRIGGER_ZONE_TOP_RATIO
         val bottom = h * GestureThresholds.TRIGGER_ZONE_BOTTOM_RATIO
         return y >= top && y <= bottom && nearSide
