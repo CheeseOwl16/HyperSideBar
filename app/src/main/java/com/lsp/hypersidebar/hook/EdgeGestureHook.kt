@@ -501,15 +501,23 @@ class EdgeGestureHook(
                 )
                 try { fanSeenThisGesture = fanController.dispatchTouchEvent(down) } finally { down.recycle() }
             }
-            fanController.dispatchTouchEvent(ev)
-            if (ev.actionMasked == MotionEvent.ACTION_UP || ev.actionMasked == MotionEvent.ACTION_CANCEL) {
-                // 常驻模式：松手未提交选中 → 转点选态（窗口保留）；现状=立即收起。
-                // UP 已提交选中时 LAUNCHED 收起在先、isShowing=false，两分支都自然跳过
-                if (fanController.isShowing) {
-                    if (fanPersistentOnRelease()) fanController.onGestureEnded()
-                    else fanController.dismiss()
+            // 流驱动旗标（与 :ui 条上通道同款）：孤儿防护对呼出前起始的手势流放行——
+            // OS2/3 拖选的 downTime < shownUptime 恒真，无旗标则 UP 被吞、选中永无法
+            // 提交（1006 merlin 实锤：每次拖选都 orphan UP swallowed 后直接收起）
+            com.lsp.hypersidebar.ui.fan.B2StreamDispatch.active = true
+            try {
+                fanController.dispatchTouchEvent(ev)
+                if (ev.actionMasked == MotionEvent.ACTION_UP || ev.actionMasked == MotionEvent.ACTION_CANCEL) {
+                    // 常驻模式：松手未提交选中 → 转点选态（窗口保留）；现状=立即收起。
+                    // UP 已提交选中时 LAUNCHED 收起在先、isShowing=false，两分支都自然跳过
+                    if (fanController.isShowing) {
+                        if (fanPersistentOnRelease()) fanController.onGestureEnded()
+                        else fanController.dismiss()
+                    }
+                    resetGesture()
                 }
-                resetGesture()
+            } finally {
+                com.lsp.hypersidebar.ui.fan.B2StreamDispatch.active = false
             }
             return true
         }
@@ -748,15 +756,21 @@ class EdgeGestureHook(
                 )
                 try { fanSeenThisGesture = fanController.dispatchTouchEvent(down) } finally { down.recycle() }
             }
-            fanController.dispatchTouchEvent(ev)
-            if (ev.actionMasked == MotionEvent.ACTION_UP || ev.actionMasked == MotionEvent.ACTION_CANCEL) {
-                // 常驻模式：松手未提交选中 → 转点选态（窗口保留）；现状=立即收起。
-                // UP 已提交选中时 LAUNCHED 收起在先、isShowing=false，两分支都自然跳过
-                if (fanController.isShowing) {
-                    if (fanPersistentOnRelease()) fanController.onGestureEnded()
-                    else fanController.dismiss()
+            // 流驱动旗标（同底角通道）：孤儿防护放行呼出前起始的手势流，拖选 UP 不被吞
+            com.lsp.hypersidebar.ui.fan.B2StreamDispatch.active = true
+            try {
+                fanController.dispatchTouchEvent(ev)
+                if (ev.actionMasked == MotionEvent.ACTION_UP || ev.actionMasked == MotionEvent.ACTION_CANCEL) {
+                    // 常驻模式：松手未提交选中 → 转点选态（窗口保留）；现状=立即收起。
+                    // UP 已提交选中时 LAUNCHED 收起在先、isShowing=false，两分支都自然跳过
+                    if (fanController.isShowing) {
+                        if (fanPersistentOnRelease()) fanController.onGestureEnded()
+                        else fanController.dismiss()
+                    }
+                    resetGesture()
                 }
-                resetGesture()
+            } finally {
+                com.lsp.hypersidebar.ui.fan.B2StreamDispatch.active = false
             }
             return true
         }
