@@ -164,6 +164,12 @@ class SystemUiHook(private val prefs: SharedPreferences) : BaseHook() {
                 // 本进程不注册 CircuitBreaker/StatsRecorder，只回传 HLog 缓冲。
                 runCatching { LogDumpBridge.register(ctx) }
                     .onFailure { HLog.w(TAG, "log dump register failed: ${it.message}") }
+                // ConfigSync 活同步（1007 教训）：本进程此前只有"启动快照"——装包+连续
+                // 重启的时序里快照可能读到陈旧门控值（162021 导出：sysInputOwner/cornerSwipe
+                // 服务端真值全 true，spy 却整窗零转发；重启宿主自愈）。挂上 hook 侧接收器
+                // 后门控值随设置页改动实时生效，快照陈旧自愈（:ui 同款机制）。
+                runCatching { com.lsp.hypersidebar.util.ConfigSync.registerHookSide(ctx) }
+                    .onFailure { HLog.w(TAG, "config sync register failed: ${it.message}") }
                 // B1 spy（os4-trigger-final-plan §6）：observe-only 输入观察副本。
                 // 挂在 attach（有 context）而非 init——MiuiBackGestureHook 实锤
                 // monitorGestureInput 须从 context 的 InputManager 服务实例发起
