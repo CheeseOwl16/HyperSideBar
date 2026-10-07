@@ -651,7 +651,9 @@ class TurboLayout(private val remotePrefs: SharedPreferences) : BaseHook() {
                     GestureThresholds.CORNER_ABANDON_EXTRA_DEG,
                     GestureThresholds.CORNER_CONFIRM_FRAMES_FAST
                 )
-                vlog("k#$cornerSeq corner DOWN raw=(${ev.rawX.toInt()},${ev.rawY.toInt()}) claimed=$claimed " +
+                // 恒打（每手势一行，低频）：底角成功率的分子=SHOW、分母=本行——
+                // 曾是 vlog 致 225324 导出 verbose 关时分母缺失、无法判读调参效果
+                HLog.i(TAG, "k#$cornerSeq corner DOWN raw=(${ev.rawX.toInt()},${ev.rawY.toInt()}) claimed=$claimed " +
                     "width=${(dm.widthPixels * widthRatio).toInt()} cone=[$minDeg,$maxDeg]")
             }
 

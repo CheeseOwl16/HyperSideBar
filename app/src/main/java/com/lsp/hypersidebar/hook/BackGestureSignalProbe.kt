@@ -60,6 +60,112 @@ class BackGestureSignalProbe : BaseHook() {
         candidates.forEach { c -> hookEdge(c) }
         hookDisplayHandler()
         dumpProxyListener()
+        // ===== 第二轮（225324 判读后追加）=====
+        // 第一轮结论：BackPanelController.onMotionEvent / onGestureCommitted 整窗零命中
+        // （38 DOWN、edge=8、bottom=18），EdgeBackGestureHandler 只有启动期 updateIsEnabled
+        // ⇒ OS4 贴边手势的认领方大概率不在 SystemUI Java。第二轮问三件收尾的事：
+        hookClassAll(
+            "com.android.systemui.navigationbar.gestural.EdgeBackGestureHandler",
+            "EdgeHandler.*", 4,
+        )
+        hookClassAll(
+            "com.android.systemui.LauncherProxyService",
+            "ProxySvc.*", 4,
+        )
+        hookMonitorCreators()
+        dumpDisplayFields()
+    }
+
+    /**
+     * 某类全部声明方法 log-only 挂（每方法命中上限 [cap]，超量只计数不再打——
+     * 防 0505 那种刷屏冲掉关键行的事故）。回答"SystemUI 这套类在整个手势窗口里
+     * 到底有没有被调用过"，比逐个猜方法名可靠。
+     */
+    private fun hookClassAll(cn: String, label: String, cap: Int) {
+        val cl = ClassLoaderProvider.safeClassLoader
+        val c = runCatching { Class.forName(cn, false, cl) }.getOrNull() ?: run {
+            HLog.i(TAG, "NOT_FOUND class $cn（$label 二轮跳过）")
+            return
+        }
+        val counters = java.util.concurrent.ConcurrentHashMap<String, Int>()
+        var n = 0
+        c.declaredMethods.forEach { m ->
+            runCatching {
+                m.isAccessible = true
+                m.createBeforeHook { param ->
+                    val key = m.name
+                    val hits = counters.merge(key, 1) { a, b -> (a ?: 0) + (b ?: 0) } ?: 0
+                    if (hits > cap) return@createBeforeHook
+                    val mv = param.args.firstOrNull { it is MotionEvent } as? MotionEvent
+                    val argDesc = if (mv != null) {
+                        "a=${mv.actionMasked} xy=${mv.rawX.toInt()},${mv.rawY.toInt()} t=${mv.eventTime}"
+                    } else {
+                        param.args.joinToString(",") { a -> a?.toString()?.take(20) ?: "null" }
+                    }
+                    HLog.i(TAG, "$label${m.name}#$hits($argDesc)")
+                }
+                n++
+            }.onFailure { HLog.w(TAG, "hook $cn#${m.name} failed: ${it.message}") }
+        }
+        HLog.i(TAG, "$label: ${c.declaredMethods.size} 声明方法，挂上 $n 个（每方法上限 $cap）")
+    }
+
+    /**
+     * 谁在创建手势监视器：SystemUI 进程内 monitorGestureInput/monitorInput 的调用方栈。
+     * 若整窗零调用 ⇒ SystemUI 根本没有自己的边手势输入通道（认领方在桌面 Rust），
+     * Java 门控判死；若有调用 ⇒ 打印调用方类名，看它是不是我们该挂的地方。
+     */
+    private fun hookMonitorCreators() {
+        val cl = ClassLoaderProvider.safeClassLoader
+        val c = runCatching {
+            Class.forName("android.hardware.input.InputManagerGlobal", false, cl)
+        }.getOrNull() ?: run {
+            HLog.i(TAG, "NOT_FOUND InputManagerGlobal（monitor 创建观测跳过）")
+            return
+        }
+        var n = 0
+        c.declaredMethods.filter { it.name.startsWith("monitor") }.forEach { m ->
+            runCatching {
+                m.isAccessible = true
+                m.createBeforeHook { param ->
+                    if (n >= 6) return@createBeforeHook
+                    n++
+                    val nameArg = param.args.firstOrNull { it is String } as? String
+                    val caller = Thread.currentThread().stackTrace
+                        .drop(2)
+                        .filter { f ->
+                            !f.className.startsWith("android.hardware.input") &&
+                                !f.className.startsWith("android.view") &&
+                                !f.className.startsWith("com.lsp.hypersidebar")
+                        }
+                        .take(4)
+                        .joinToString(" < ") { f ->
+                            "${f.className.substringAfterLast('.')}.${f.methodName}"
+                        }
+                    HLog.i(TAG, "monitorCreate#$n ${m.name} name=$nameArg by $caller")
+                }
+                HLog.i(TAG, "hooked monitor creator ${m.name}(${m.parameterTypes.size}p)")
+            }.onFailure { HLog.w(TAG, "hook ${m.name} failed: ${it.message}") }
+        }
+    }
+
+    /**
+     * DisplayBackGestureHandlerImpl 第一轮 declaredClasses=0（内部类未加载/命名不同），
+     * 改看字段清单——`$inputEventReceiver$1` 之类会以字段存在，字段名+类型能告诉我们
+     * OS4 的 Java 边手势输入接收器到底建没建。
+     */
+    private fun dumpDisplayFields() {
+        val cl = ClassLoaderProvider.safeClassLoader
+        val c = runCatching {
+            Class.forName(
+                "com.android.systemui.navigationbar.gestural.DisplayBackGestureHandlerImpl",
+                false, cl
+            )
+        }.getOrNull() ?: return
+        val fs = c.declaredFields.joinToString(" | ") {
+            "${it.type.simpleName} ${it.name}"
+        }
+        HLog.i(TAG, "DisplayHandler fields: $fs")
     }
 
     private fun enabled(): Boolean = runCatching {
