@@ -10,6 +10,7 @@ import io.github.kyuubiran.ezxhelper.xposed.dsl.HookFactory.`-Static`.createAfte
 import com.lsp.hypersidebar.util.HLog
 import com.lsp.hypersidebar.util.LogDumpBridge
 import com.lsp.hypersidebar.hook.BaseHook
+import com.lsp.hypersidebar.hook.BackGestureSignalProbe
 import com.lsp.hypersidebar.hook.EdgeGestureHook
 import com.lsp.hypersidebar.hook.FreeformRelayHook
 import com.lsp.hypersidebar.hook.SidebarOverlayProbe
@@ -26,6 +27,7 @@ class XposedInit : XposedModule() {
     private var edgeGestureHook: EdgeGestureHook? = null
     private var systemUiHook: SystemUiHook? = null
     private var sidebarOverlayProbe: SidebarOverlayProbe? = null
+    private var backGestureSignalProbe: BackGestureSignalProbe? = null
 
     override fun onModuleLoaded(param: ModuleLoadedParam) {
         EzXposed.initOnModuleLoaded(this, param)
@@ -112,7 +114,10 @@ class XposedInit : XposedModule() {
                         com.lsp.hypersidebar.util.SyncedPrefs(hookSidePrefs())
                     )
                 }
-                initHooks(systemUiHook!!)
+                // 探针 0（log-only，prop 门控：debug.hsb.bgprobe=1）：判"系统手势识别信号
+                // 在 OS4 的 Java 侧是否可得"，决定门控落 Java 还是必须 native。
+                if (backGestureSignalProbe == null) backGestureSignalProbe = BackGestureSignalProbe()
+                initHooks(systemUiHook!!, backGestureSignalProbe!!)
             }
             else -> HLog.w(TAG, "Skip package/process: pkg=${param.packageName} proc=$procName")
         }
