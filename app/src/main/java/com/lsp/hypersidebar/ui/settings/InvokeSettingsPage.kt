@@ -137,6 +137,69 @@ internal fun InvokeSettingsPage(prefs: SharedPreferences, modifier: Modifier = M
                             repo.save(PrefKeys.SYS_INPUT_OWNER, it)
                         }
                     )
+                    // B 路线触发带几何（2026-10-07 参考 MiuiBackGestureHook 百分比模型）：
+                    // 带高/带位双百分比（默认 33/50=[H/3,2H/3]）+ 半宽 dp（默认=官方条宽）。
+                    // 仅 OS4 B 路线消费（sys 启动快照，改动须重启系统界面）；OS2/3 无效果。
+                    val bandHMin = LayoutDefaults.BAND_HEIGHT_PERCENT_MIN.toFloat()
+                    val bandHMax = LayoutDefaults.BAND_HEIGHT_PERCENT_MAX.toFloat()
+                    val bandHStep = LayoutDefaults.BAND_HEIGHT_PERCENT_STEP.toFloat()
+                    var bandHeightPct by remember(effectivePrefs, repo.revision) {
+                        mutableStateOf(repo.bandHeightPercent())
+                    }
+                    SliderPreference(
+                        title = stringResource(R.string.band_height_title),
+                        summary = stringResource(R.string.band_height_summary),
+                        valueText = "$bandHeightPct %",
+                        value = bandHeightPct.toFloat(),
+                        valueRange = bandHMin..bandHMax,
+                        steps = sliderSteps(bandHMin, bandHMax, bandHStep),
+                        onValueChange = {
+                            bandHeightPct = quantizeToStep(it, bandHMin, bandHMax, bandHStep).roundToInt()
+                        },
+                        onValueChangeFinished = {
+                            repo.save(PrefKeys.BAND_HEIGHT_PERCENT, bandHeightPct)
+                        }
+                    )
+                    val bandPMin = LayoutDefaults.BAND_POSITION_PERCENT_MIN.toFloat()
+                    val bandPMax = LayoutDefaults.BAND_POSITION_PERCENT_MAX.toFloat()
+                    val bandPStep = LayoutDefaults.BAND_POSITION_PERCENT_STEP.toFloat()
+                    var bandPositionPct by remember(effectivePrefs, repo.revision) {
+                        mutableStateOf(repo.bandPositionPercent())
+                    }
+                    SliderPreference(
+                        title = stringResource(R.string.band_position_title),
+                        summary = stringResource(R.string.band_position_summary),
+                        valueText = "$bandPositionPct %",
+                        value = bandPositionPct.toFloat(),
+                        valueRange = bandPMin..bandPMax,
+                        steps = sliderSteps(bandPMin, bandPMax, bandPStep),
+                        onValueChange = {
+                            bandPositionPct = quantizeToStep(it, bandPMin, bandPMax, bandPStep).roundToInt()
+                        },
+                        onValueChangeFinished = {
+                            repo.save(PrefKeys.BAND_POSITION_PERCENT, bandPositionPct)
+                        }
+                    )
+                    val bandWMin = LayoutDefaults.BAND_WIDTH_DP_MIN.toFloat()
+                    val bandWMax = LayoutDefaults.BAND_WIDTH_DP_MAX.toFloat()
+                    val bandWStep = LayoutDefaults.BAND_WIDTH_DP_STEP.toFloat()
+                    var bandWidthDp by remember(effectivePrefs, repo.revision) {
+                        mutableStateOf(repo.bandWidthDp())
+                    }
+                    SliderPreference(
+                        title = stringResource(R.string.band_width_title),
+                        summary = stringResource(R.string.band_width_summary),
+                        valueText = "$bandWidthDp dp",
+                        value = bandWidthDp.toFloat(),
+                        valueRange = bandWMin..bandWMax,
+                        steps = sliderSteps(bandWMin, bandWMax, bandWStep),
+                        onValueChange = {
+                            bandWidthDp = quantizeToStep(it, bandWMin, bandWMax, bandWStep).roundToInt()
+                        },
+                        onValueChangeFinished = {
+                            repo.save(PrefKeys.BAND_WIDTH_DP, bandWidthDp)
+                        }
+                    )
                 }
             }
         }

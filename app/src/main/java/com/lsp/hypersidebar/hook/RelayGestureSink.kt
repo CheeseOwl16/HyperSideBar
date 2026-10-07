@@ -44,6 +44,8 @@ object RelayGestureSink {
     @Volatile private var streamSource: Int = 0
     @Volatile private var streamEdgeFlags: Int = 0
     @Volatile private var streamPointerId: Int = 0
+    /** 当前流区域（spy DOWN 处判定单源，随流下发；角落流走独立状态机 §14.6） */
+    @Volatile private var streamCorner = false
 
     /** TurboLayout init 调用（:ui）：挂 attach 钩子，attach 时注册接收器 */
     fun arm(ownerInstance: TurboLayout) {
@@ -99,9 +101,17 @@ object RelayGestureSink {
             streamSource = ev.source
             streamEdgeFlags = ev.edgeFlags
             streamPointerId = ev.getPointerId(0)
-            HLog.i(TAG, "stream DOWN (${ev.rawX.toInt()},${ev.rawY.toInt()}) land=$landscape")
+            streamCorner = intent.getIntExtra(
+                PrefKeys.SPY_EXTRA_ZONE, PrefKeys.SPY_ZONE_STRIP
+            ) == PrefKeys.SPY_ZONE_CORNER
+            HLog.i(TAG, "stream DOWN (${ev.rawX.toInt()},${ev.rawY.toInt()}) land=$landscape" +
+                if (streamCorner) " zone=corner" else "")
         }
-        o.feedStripGesture(c, landscape, ev)
+        if (streamCorner) {
+            o.feedCornerGesture(c, ev)
+        } else {
+            o.feedStripGesture(c, landscape, ev)
+        }
         if (ev.actionMasked == MotionEvent.ACTION_UP || ev.actionMasked == MotionEvent.ACTION_CANCEL) {
             // 流结束清身份：防 STALL 后置的过期 requestPilfer 撞旧手势（1005 实锤 mismatch）
             streamDownTime = 0L

@@ -40,6 +40,15 @@ object GestureThresholds {
      */
     const val CORNER_CONFIRM_FRAMES = 2
 
+    /**
+     * OS4 底角专用帧数（1007 晚用户拍板）：抢跑模型下 2 帧累计纯是自缚——Rust 侧滑
+     * 检测 ~10-30ms 即认领快扫流（201757 导出：83 次尝试仅 10 成，失败样本 DOWN→UP
+     * 2ms 零 MOVE=流被 Rust 收走），确认必须压到单帧。防误触主力=内滑下限 12dp +
+     * 底角热区（低频触摸区），单帧抖动风险由「抖出锥即清零 + 锥外竖直永不 pilfer」
+     * 兜底。OS3（DOWN 即接管、无竞争）仍用 CORNER_CONFIRM_FRAMES。
+     */
+    const val CORNER_CONFIRM_FRAMES_FAST = 1
+
     /** 竖直判定余量（度）：deg > 锥上限+此值 连续 N 帧 = 明确竖直意图 → 重放透传。 */
     const val CORNER_ABANDON_EXTRA_DEG = 3f
 

@@ -73,6 +73,14 @@
     <string name="corner_swipe_summary">从屏幕左下/右下角斜向内上滑，直接呼出扇形（仅竖屏）；与停顿呼出并存，默认关闭</string>
     <string name="corner_width_title">底角触发宽度</string>
     <string name="corner_width_summary">左右底角各占屏宽的比例；越窄越不易误触，但起手位置要求越准</string>
+    <string name="corner_hot_title">底角热区高度</string>
+    <string name="corner_hot_summary">底部起手带占屏高的比例；越低起手位置要求越贴底。竖直上滑（回桌面）任何高度都不会触发。改动后需重启系统界面生效（触发转发在系统界面进程）</string>
+    <string name="band_height_title">触发带高度（全边缘）</string>
+    <string name="band_height_summary">边缘停顿触发带占屏高的比例（全边缘·实验开启后生效，改动重启系统界面）；默认 33% 即小白条中带</string>
+    <string name="band_position_title">触发带位置（全边缘）</string>
+    <string name="band_position_summary">触发带在屏上的垂直位置：0=贴顶，100=贴底；与高度组合出起手范围</string>
+    <string name="band_width_title">触发带宽度（全边缘）</string>
+    <string name="band_width_summary">左右边缘触发带的半宽；默认 32dp=官方小白条宽，越宽越易触发但越易误触</string>
     <string name="corner_min_angle_title">斜滑角度下限</string>
     <string name="corner_min_angle_summary">低于此角度视为水平滑动，不触发</string>
     <string name="corner_max_angle_title">斜滑角度上限</string>

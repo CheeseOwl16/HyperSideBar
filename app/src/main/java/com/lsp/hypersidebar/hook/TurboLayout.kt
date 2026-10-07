@@ -575,6 +575,169 @@ class TurboLayout(private val remotePrefs: SharedPreferences) : BaseHook() {
         LayoutDefaults.TRIGGER_DWELL_MS.toLong()
     }
 
+    // ===== B4 底角斜滑（os4-trigger-final-plan §14，反向接管=方向即仲裁）=====
+    // 消费 sink 路由来的角落三角流（zone extra 单源在 spy）。判定复用 CornerTrigger
+    // （OS2/3 单源，纯 x/y 数学）：仅 Action.SHOW 有意义=锥内确认 → 抢占+角落呼出；
+    // CONSUME=判定中继续旁观；ABANDON_REPLAY/PASS 不接线——从未接管，系统全程未被
+    // 打扰，无需重放（反向模型对锥外竖直天然免疫，§14.1）。
+    private val cornerTrigger = CornerTrigger()
+    private var cornerSeq = 0
+    /** 本流是否进角落判定（DOWN 时定：开关+场景避让命中=全程旁观，零模块反应） */
+    private var cornerEngaged = false
+    /** 角落流是否已喂过 fan 合成 DOWN（同条上通道 sFanSeen 语义） */
+    private var cFanSeen = false
+
+    fun feedCornerGesture(ctx: Context, ev: MotionEvent) {
+        // fan 展示中：转发流驱动拖选（与条上通道同款；B2 流驱动旗标放行孤儿防护）
+        if (fanController.isShowing) {
+            com.lsp.hypersidebar.ui.fan.B2StreamDispatch.active = true
+            try {
+                if (!cFanSeen) {
+                    val down = MotionEvent.obtain(
+                        ev.downTime, ev.eventTime, MotionEvent.ACTION_DOWN, ev.rawX, ev.rawY, 0
+                    )
+                    try { cFanSeen = fanController.dispatchTouchEvent(down) } finally { down.recycle() }
+                }
+                fanController.dispatchTouchEvent(ev)
+                if (ev.actionMasked == MotionEvent.ACTION_UP || ev.actionMasked == MotionEvent.ACTION_CANCEL) {
+                    if (fanController.isShowing) {
+                        if (fanPersistentOnRelease()) fanController.onGestureEnded()
+                        else fanController.dismiss()
+                    }
+                    cornerTrigger.reset()
+                    cFanSeen = false
+                }
+            } finally {
+                com.lsp.hypersidebar.ui.fan.B2StreamDispatch.active = false
+            }
+            return
+        }
+
+        when (ev.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                cornerSeq++
+                cFanSeen = false
+                cornerEngaged = cornerSwipeEnabled() && !cornerAvoided(ctx)
+                if (!cornerEngaged) return
+                val dm = ctx.resources.displayMetrics
+                val density = dm.density
+                // 确认距离=内滑下限（12dp）：OS4 是抢跑模型——系统的 Rust 侧滑检测 ~10-30ms
+                // 即认领快扫流（172311 导出：失败样本全是 [ui] 收到 UP/CANCEL 时未到 SHOW，
+                // 确认距离用滑动距离 30dp≈82px 时 SHOW 需要 ~100-200ms，快扫必输）。
+                // 防误触由锥+内滑下限+2 帧一致性承担，行程门只留锥评估的启动线。
+                // OS3（DOWN 即接管、无竞争）仍用滑动距离，不受影响。
+                val cornerConfirmPx = GestureThresholds.CORNER_INWARD_MIN_DP * density
+                // 角落参数与 OS3 同键（底角 sheet）：角窗/锥角设置项化，幅度/帧数常量单源
+                val widthRatio = runCatching {
+                    remotePrefs.getFloat(PrefKeys.CORNER_WIDTH_RATIO, LayoutDefaults.CORNER_WIDTH_RATIO)
+                }.getOrDefault(LayoutDefaults.CORNER_WIDTH_RATIO)
+                val minDeg = runCatching {
+                    remotePrefs.getInt(PrefKeys.CORNER_MIN_ANGLE_DEG, LayoutDefaults.CORNER_MIN_ANGLE_DEG)
+                }.getOrDefault(LayoutDefaults.CORNER_MIN_ANGLE_DEG).toFloat()
+                val maxDeg = runCatching {
+                    remotePrefs.getInt(PrefKeys.CORNER_MAX_ANGLE_DEG, LayoutDefaults.CORNER_MAX_ANGLE_DEG)
+                }.getOrDefault(LayoutDefaults.CORNER_MAX_ANGLE_DEG).toFloat()
+                val claimed = cornerTrigger.onDown(
+                    ev.rawX, ev.rawY,
+                    dm.widthPixels.toFloat(), dm.heightPixels.toFloat(),
+                    // 热区=屏高百分比（cornerHotPercent，与 spy 同键；OS4 无 NavStubView 可反射）
+                    dm.heightPixels * runCatching {
+                        remotePrefs.getInt(PrefKeys.CORNER_HOT_PERCENT, LayoutDefaults.CORNER_HOT_PERCENT)
+                    }.getOrDefault(LayoutDefaults.CORNER_HOT_PERCENT) / 100f,
+                    dm.widthPixels * widthRatio,
+                    cornerConfirmPx,
+                    GestureThresholds.CORNER_INWARD_MIN_DP * density,
+                    minDeg, maxDeg,
+                    GestureThresholds.CORNER_ABANDON_EXTRA_DEG,
+                    GestureThresholds.CORNER_CONFIRM_FRAMES_FAST
+                )
+                vlog("k#$cornerSeq corner DOWN raw=(${ev.rawX.toInt()},${ev.rawY.toInt()}) claimed=$claimed " +
+                    "width=${(dm.widthPixels * widthRatio).toInt()} cone=[$minDeg,$maxDeg]")
+            }
+
+            MotionEvent.ACTION_MOVE -> {
+                if (!cornerEngaged) return
+                // 只认 SHOW：锥内确认 → 抢占（系统收 CANCEL 中止）+ 角落呼出
+                if (cornerTrigger.onMove(ev.rawX, ev.rawY) == CornerTrigger.Action.SHOW) {
+                    HLog.i(TAG, "k#$cornerSeq corner SHOW raw=(${ev.rawX.toInt()},${ev.rawY.toInt()})")
+                    StatsRecorder.onStall()
+                    RelayGestureSink.requestPilfer()
+                    postShowCornerFan(ctx, ev)
+                }
+            }
+
+            MotionEvent.ACTION_POINTER_DOWN -> {
+                if (cornerEngaged) cornerTrigger.onPointerDown() // 多指=放弃判定，永不 pilfer
+            }
+
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                if (!cornerEngaged) return
+                val engaged = cornerTrigger.claimed && !cornerTrigger.abandoned && !cornerTrigger.consumedToEnd
+                if (engaged) {
+                    if (fanController.isShowing) {
+                        if (fanPersistentOnRelease()) fanController.onGestureEnded()
+                        else {
+                            cancelPendingStripShow()
+                            fanController.dismiss()
+                        }
+                    } else if (sPendingShow != null) {
+                        // 快扫整包到达（1007 晚）：SHOW 已发但 fan 尚未落地时手指已抬起——
+                        // 沿用"撤销排队 show"会让快扫永远白做（201757 导出：整段流压缩成
+                        // DOWN+UP 一次到达）。落地转点选态：点图标直启、点空白/看门狗收。
+                        fanController.markReleasedOnArrival()
+                    } else {
+                        cancelPendingStripShow()
+                    }
+                }
+                vlog("k#$cornerSeq UP engaged=$engaged shown=${fanController.isShowing}")
+                cornerTrigger.reset()
+            }
+        }
+    }
+
+    private fun cornerSwipeEnabled(): Boolean =
+        runCatching {
+            remotePrefs.getBoolean(PrefKeys.CORNER_SWIPE_ENABLED, LayoutDefaults.CORNER_SWIPE_ENABLED)
+        }.getOrDefault(LayoutDefaults.CORNER_SWIPE_ENABLED)
+
+    /**
+     * B4 场景避让（§14.5，用户拍板：全局作用域但游戏等场景不主动开启）：
+     * ① 游戏加速中=Settings.Secure "gb_boosting"==1（gamebooster 服务写、DockMonitorService
+     *    等三组件消费的权威信号；反编译取证 ear/bt）；
+     * ② 全局隐藏手势提示线=Settings.Global "hide_gesture_line"==1（SystemUI SettingsManager
+     *    同键；实现假设随本批带上）。
+     * Settings 客户端按 generation 失效自刷新，DOWN 直读即可（无需自建 observer）；
+     * 任一读失败=fail-open 不避让（退化=全局生效，不比现状差）。
+     */
+    private fun cornerAvoided(ctx: Context): Boolean {
+        val boosting = runCatching {
+            android.provider.Settings.Secure.getInt(ctx.contentResolver, "gb_boosting", 0) == 1
+        }.getOrDefault(false)
+        if (boosting) return true
+        return runCatching {
+            android.provider.Settings.Global.getInt(ctx.contentResolver, "hide_gesture_line", 0) == 1
+        }.getOrDefault(false)
+    }
+
+    /** 角落呼出：锚点=精确底角（cornerAnchor=true → 弧占向上象限，OS3 N1 option B 语义）。
+     *  :ui 无 rootView insets 可求手势条上沿（OS3 postShowFanCorner 用 launcher rootView）——
+     *  锚点 y ≥ 渲染端窗口底即可，最终位置由 FanGeometry 窗口钳制定（同 OS3 注释语义）。 */
+    private fun postShowCornerFan(ctx: Context, ev: MotionEvent) {
+        val dm = ctx.resources.displayMetrics
+        val anchorX = if (ev.rawX < dm.widthPixels / 2f) 0f else dm.widthPixels.toFloat()
+        val anchorY = dm.heightPixels.toFloat()
+        HLog.i(TAG, "corner→fan: anchor=($anchorX,$anchorY) down=(${ev.rawX.toInt()},${ev.rawY.toInt()})")
+        val postAtMs = android.os.SystemClock.uptimeMillis()
+        val r = Runnable {
+            sPendingShow = null
+            vlog("k#$cornerSeq showFan(corner) runnable: postLag=${android.os.SystemClock.uptimeMillis() - postAtMs}ms")
+            runCatching { fanController.show(ctx, anchorX, anchorY, cornerAnchor = true) }
+                .onFailure { HLog.w(TAG, "corner show failed: ${it.message}") }
+        }
+        sPendingShow = r
+        mainHandler.post(r)
+    }
+
     private fun isLandscape(view: View): Boolean =
         view.resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
 

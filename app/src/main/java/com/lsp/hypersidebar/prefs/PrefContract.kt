@@ -30,6 +30,19 @@ object PrefKeys {
     /** 底角斜滑触发开关（N1，仅竖屏）：默认关（opt-in）。开=底部两角斜向内上滑呼出扇形。 */
     const val CORNER_SWIPE_ENABLED = "cornerSwipeEnabled"
 
+    /** 底角热区高度（屏高百分比，2026-10-07 参考 MiuiBackGestureHook 百分比模型）：
+     *  原 25dp(≈3% 屏高) 实机反馈"不易触发"。OS3 的 NavStubView.getHotSpaceHeight=25dp
+     *  是系统手势条自身高度，spy 模型下无此物理约束，热区独立可调。 */
+    const val CORNER_HOT_PERCENT = "cornerHotPercent"
+
+    /** B 路线停顿触发带（OS4 spy 竖屏，2026-10-07 参考 MiuiBackGestureHook 双百分比模型）：
+     *  带=[(H−H×height%)×position%, 同值+H×height%)；默认 33/50 精确复刻现役 [H/3,2H/3]。
+     *  sys 进程 prefs=启动快照，改动须重启系统界面。 */
+    const val BAND_HEIGHT_PERCENT = "bandHeightPercent"
+    const val BAND_POSITION_PERCENT = "bandPositionPercent"
+    /** 停顿触发带半宽（dp）：原 BAND_X_DP=32 常量（=官方小白条宽）升滑条 */
+    const val BAND_WIDTH_DP = "bandWidthDp"
+
     /** 常驻扇形（呼出后松手不收起，13.1 同批新增）：开=松手后扇形停留，点图标启动、
      *  点空白收起（吞点击）、10s 无操作看门狗自动收起；关=现状（未预选松手立即收起）。
      *  同时是 OS4 R1-J（securitycenter 侧改道点选模式）的交互地基。 */
@@ -56,6 +69,12 @@ object PrefKeys {
     const val SPY_EXTRA_EVENT = "ev"
     /** 转发 extra：横竖屏（转发方计算，:ui 免依赖 View） */
     const val SPY_EXTRA_LANDSCAPE = "land"
+    /** 转发 extra：流区域（转发方在 DOWN 处判定，单源；:ui 据此路由条上/底角状态机） */
+    const val SPY_EXTRA_ZONE = "zone"
+    /** zone 值：侧带触发带（条上停顿状态机，os4-trigger-final-plan §7） */
+    const val SPY_ZONE_STRIP = 0
+    /** zone 值：底角三角（CornerTrigger 反向接管，os4-trigger-final-plan §14） */
+    const val SPY_ZONE_CORNER = 1
     /** 抢占/转发 extra：手势五要素（downTime/deviceId/source/edgeFlags/pointerId）+令牌 */
     const val SPY_EXTRA_DOWN_TIME = "downTime"
     const val SPY_EXTRA_DEVICE_ID = "deviceId"
@@ -337,6 +356,26 @@ object LayoutDefaults {
     const val CORNER_MAX_ANGLE_DEG = 65
     const val CORNER_MAX_ANGLE_MIN = 45
     const val CORNER_MAX_ANGLE_MAX = 80
+
+    /** 底角热区高度（屏高百分比）：默认 10%（marble 2400px=240px，原 25dp≈69px 的 3.5 倍） */
+    const val CORNER_HOT_PERCENT = 10
+    const val CORNER_HOT_PERCENT_MIN = 3
+    const val CORNER_HOT_PERCENT_MAX = 25
+    const val CORNER_HOT_PERCENT_STEP = 1
+
+    /** B 路线停顿触发带（百分比模型）：默认 33/50 = 现役 [H/3, 2H/3]；半宽默认 32dp=官方条宽 */
+    const val BAND_HEIGHT_PERCENT = 33
+    const val BAND_HEIGHT_PERCENT_MIN = 10
+    const val BAND_HEIGHT_PERCENT_MAX = 100
+    const val BAND_HEIGHT_PERCENT_STEP = 1
+    const val BAND_POSITION_PERCENT = 50
+    const val BAND_POSITION_PERCENT_MIN = 0
+    const val BAND_POSITION_PERCENT_MAX = 100
+    const val BAND_POSITION_PERCENT_STEP = 1
+    const val BAND_WIDTH_DP = 32
+    const val BAND_WIDTH_DP_MIN = 12
+    const val BAND_WIDTH_DP_MAX = 64
+    const val BAND_WIDTH_DP_STEP = 2
     const val CORNER_ANGLE_STEP = 5
 
     // ===== 滑条量程契约（0913 用户拍板：量程/步进与默认值同源定义，UI 禁止内联数字）=====

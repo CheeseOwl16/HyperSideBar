@@ -404,6 +404,30 @@ private fun LayoutSheetContent(
                         repo.putDraft(PrefKeys.CORNER_WIDTH_RATIO, widthPct / 100f)
                     }
                 )
+                var hotPct by remember { mutableStateOf(repo.cornerHotPercent()) }
+                SliderPreference(
+                    title = stringResource(R.string.corner_hot_title),
+                    summary = stringResource(R.string.corner_hot_summary),
+                    valueText = "$hotPct %",
+                    value = hotPct.toFloat(),
+                    valueRange = LayoutDefaults.CORNER_HOT_PERCENT_MIN.toFloat()..
+                        LayoutDefaults.CORNER_HOT_PERCENT_MAX.toFloat(),
+                    steps = sliderSteps(
+                        LayoutDefaults.CORNER_HOT_PERCENT_MIN.toFloat(),
+                        LayoutDefaults.CORNER_HOT_PERCENT_MAX.toFloat(),
+                        LayoutDefaults.CORNER_HOT_PERCENT_STEP.toFloat()
+                    ),
+                    enabled = cornerParamsActive,
+                    onValueChange = {
+                        hotPct = quantizeToStep(
+                            it,
+                            LayoutDefaults.CORNER_HOT_PERCENT_MIN.toFloat(),
+                            LayoutDefaults.CORNER_HOT_PERCENT_MAX.toFloat(),
+                            LayoutDefaults.CORNER_HOT_PERCENT_STEP.toFloat()
+                        ).roundToInt()
+                        repo.putDraft(PrefKeys.CORNER_HOT_PERCENT, hotPct)
+                    }
+                )
                 var minDeg by remember { mutableStateOf(repo.cornerMinAngleDeg()) }
                 SliderPreference(
                     title = stringResource(R.string.corner_min_angle_title),

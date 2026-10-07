@@ -125,6 +125,10 @@ object SystemUiInputSpy {
             val dm0 = android.content.res.Resources.getSystem().displayMetrics
             HLog.i(TAG, "spy built: display ${dm0.widthPixels}x${dm0.heightPixels} (observe-only, build #$attempts" +
                 "${if (deafRebuilds > 0) ", deaf rebuild #$deafRebuilds" else ""})")
+            // 门控快照（1007 导出 162021 教训：角落 DOWN 被门静默拒=导出无法判读是哪个门关了）。
+            // sys prefs=启动快照，本行即本进程全部转发决策的依据
+            HLog.i(TAG, "forward gates: sysInputOwner=${sysInputOwner()} cornerSwipe=${cornerSwipeEnabled()} " +
+                "cornerHot=%=${cornerHotPercent()} band=${bandWidthDp()}dp/${bandHeightPercent()}%+${bandPositionPercent()}%")
             // 聋 monitor 观察窗：窗口内零 DOWN ⇒ dispose 重建（时序根因的自愈收口）
             mainHandler.postDelayed({ deafCheck() }, DEAF_CHECK_WINDOW_MS)
         }.onFailure {
@@ -263,12 +267,9 @@ object SystemUiInputSpy {
     }
 
     // ===== B2-1/B2-2（os4-trigger-final-plan §7）：带内流转发 + 抢占执行 =====
-
-    /** 转发带半宽（dp）：=官方小白条宽 32dp（marble 2.75 密度=88px）。首版 130px
-     *  （88+余量）实机反馈过宽——DOWN 离边 12% 屏宽即入判定面，非边缘触摸也触发
-     *  （1005 用户实测）；收窄到条宽对齐 OS2/3「条=触发面」语义。密度运行时现算，
-     *  对屏宽/密度漂移免疫（同 [[anchorY]] 的 heightPixels 教训）。 */
-    private const val BAND_X_DP = 32f
+    // 触发带几何（半宽/y 带高/带位）2026-10-07 起全部设置项化（bandWidthDp/bandHeightPercent/
+    // bandPositionPercent，参考 MiuiBackGestureHook 百分比模型）；历史沿革：首版 130px 过宽
+    // → 32dp（=官方小白条宽）→ 现滑条。密度运行时现算，对屏宽/密度漂移免疫。
 
     /** B 路线开关（sys 进程 prefs=启动快照，改动须重启 SystemUI 生效——设置页已注明） */
     @Volatile private var prefs: android.content.SharedPreferences? = null
@@ -286,6 +287,14 @@ object SystemUiInputSpy {
     @Volatile private var fwdSource = 0
     @Volatile private var fwdEdgeFlags = 0
     @Volatile private var fwdPointerId = 0
+    /** 当前转发流的区域（DOWN 处判定，单源，随每事件下发；:ui 据此路由状态机） */
+    @Volatile private var fwdZone = com.lsp.hypersidebar.prefs.PrefKeys.SPY_ZONE_STRIP
+
+    /** MOVE 合流窗（ms）：窗口内只留最新一帧，终态事件前冲刷。事件时间计。 */
+    private const val MOVE_COALESCE_MS = 16L
+    /** 合流窗内被扣下的最新 MOVE（框架回收 ev 前的副本；UP/CANCEL 前冲刷保序） */
+    private var pendingMove: MotionEvent? = null
+    private var lastMoveFwdEventTime = 0L
 
     /** 注册抢占指令接收器（:ui STALL-TIMER fire → 五要素全匹配才 pilferPointers）。
      *  Token 校验同 QS 点击接收器（0912 审查口径：RECEIVER_EXPORTED 必须带令牌）。 */
@@ -333,35 +342,130 @@ object SystemUiInputSpy {
         }.onFailure { HLog.w(TAG, "pilfer register failed: ${it.message}") }
     }
 
-    /** 触发带判定（转发前置粗筛；精判定在 ：ui 状态机）：**仅竖屏**——侧带 ×
-     *  [H/3,2H/3]（与 OS2/3 launcher 通道同源，GestureThresholds 唯一定义源）。
+    /** 触发带判定（转发前置粗筛；精判定在 ：ui 状态机）：**仅竖屏**——侧带 × 百分比
+     *  y 带（2026-10-07 参考 MiuiBackGestureHook：带高/带位双百分比，默认 33/50=
+     *  现役 [H/3,2H/3]；OS2/3 launcher 通道不受影响，仍用 GestureThresholds 比例）。
      *  横屏不转发：OS2/3 横屏语义=条上触发（条上 hook 路径成熟且触发面小），
      *  spy 接管横屏既无增益又把返回手势区整段灌进广播（1005 教训）。 */
     private fun inTriggerBand(x: Float, y: Float, w: Int, h: Int): Boolean {
         if (w > h) return false
-        val bandPx = BAND_X_DP * android.content.res.Resources.getSystem().displayMetrics.density
+        val bandPx = bandWidthDp() * android.content.res.Resources.getSystem().displayMetrics.density
         val nearSide = x <= bandPx || x >= w - bandPx
-        val top = h * GestureThresholds.TRIGGER_ZONE_TOP_RATIO
-        val bottom = h * GestureThresholds.TRIGGER_ZONE_BOTTOM_RATIO
-        return y >= top && y <= bottom && nearSide
+        val bandH = h * bandHeightPercent() / 100f
+        val top = (h - bandH) * bandPositionPercent() / 100f
+        return y >= top && y <= top + bandH && nearSide
     }
 
-    /** 带内 DOWN 起转发该流（UP/CANCEL 结束）；每事件一播（频率实测后优化，计划 §7）。 */
+    /** 底角三角（B4 转发门，os4-trigger-final-plan §14.6）：竖屏，左右角窗
+     *  （宽=屏宽×CORNER_WIDTH_RATIO，:ui 同键）× 底部热区（屏高百分比，
+     *  cornerHotPercent——原 25dp≈3% 实机反馈"不易触发"，升为可调滑条）。与条带在
+     *  DOWN 处天然不相交（默认条带下沿 2H/3 << 热区上沿），zone 判定无歧义。 */
+    private fun inCornerTriangle(x: Float, y: Float, w: Int, h: Int): Boolean {
+        if (w > h) return false
+        val hotPx = h * cornerHotPercent() / 100f
+        if (y < h - hotPx) return false
+        val cornerPx = w * cornerWidthRatio()
+        return x <= cornerPx || x >= w - cornerPx
+    }
+
+    private fun bandWidthDp(): Int = runCatching {
+        prefs?.getInt(
+            com.lsp.hypersidebar.prefs.PrefKeys.BAND_WIDTH_DP,
+            com.lsp.hypersidebar.prefs.LayoutDefaults.BAND_WIDTH_DP
+        ) ?: com.lsp.hypersidebar.prefs.LayoutDefaults.BAND_WIDTH_DP
+    }.getOrDefault(com.lsp.hypersidebar.prefs.LayoutDefaults.BAND_WIDTH_DP)
+
+    private fun bandHeightPercent(): Int = runCatching {
+        prefs?.getInt(
+            com.lsp.hypersidebar.prefs.PrefKeys.BAND_HEIGHT_PERCENT,
+            com.lsp.hypersidebar.prefs.LayoutDefaults.BAND_HEIGHT_PERCENT
+        ) ?: com.lsp.hypersidebar.prefs.LayoutDefaults.BAND_HEIGHT_PERCENT
+    }.getOrDefault(com.lsp.hypersidebar.prefs.LayoutDefaults.BAND_HEIGHT_PERCENT)
+
+    private fun bandPositionPercent(): Int = runCatching {
+        prefs?.getInt(
+            com.lsp.hypersidebar.prefs.PrefKeys.BAND_POSITION_PERCENT,
+            com.lsp.hypersidebar.prefs.LayoutDefaults.BAND_POSITION_PERCENT
+        ) ?: com.lsp.hypersidebar.prefs.LayoutDefaults.BAND_POSITION_PERCENT
+    }.getOrDefault(com.lsp.hypersidebar.prefs.LayoutDefaults.BAND_POSITION_PERCENT)
+
+    private fun cornerHotPercent(): Int = runCatching {
+        prefs?.getInt(
+            com.lsp.hypersidebar.prefs.PrefKeys.CORNER_HOT_PERCENT,
+            com.lsp.hypersidebar.prefs.LayoutDefaults.CORNER_HOT_PERCENT
+        ) ?: com.lsp.hypersidebar.prefs.LayoutDefaults.CORNER_HOT_PERCENT
+    }.getOrDefault(com.lsp.hypersidebar.prefs.LayoutDefaults.CORNER_HOT_PERCENT)
+
+    private fun cornerWidthRatio(): Float = runCatching {
+        prefs?.getFloat(
+            com.lsp.hypersidebar.prefs.PrefKeys.CORNER_WIDTH_RATIO,
+            com.lsp.hypersidebar.prefs.LayoutDefaults.CORNER_WIDTH_RATIO
+        ) ?: com.lsp.hypersidebar.prefs.LayoutDefaults.CORNER_WIDTH_RATIO
+    }.getOrDefault(com.lsp.hypersidebar.prefs.LayoutDefaults.CORNER_WIDTH_RATIO)
+
+    /** 底角功能开关（与 OS3 EdgeGestureHook 同键；关=角落流不转发） */
+    private fun cornerSwipeEnabled(): Boolean = runCatching {
+        prefs?.getBoolean(
+            com.lsp.hypersidebar.prefs.PrefKeys.CORNER_SWIPE_ENABLED,
+            com.lsp.hypersidebar.prefs.LayoutDefaults.CORNER_SWIPE_ENABLED
+        ) ?: false
+    }.getOrDefault(false)
+
+    /** 带内 DOWN 起转发该流（UP/CANCEL 结束）。MOVE 合流（1007 晚用户拍板）：
+     *  120Hz 逐事件广播在拖选上表现 1-2 帧滞后——16ms 窗口只留最新一帧，
+     *  UP/CANCEL 前冲刷保序（:ui 侧判定/合流的回放顺序不变）。 */
     private fun forwardIfNeeded(ev: MotionEvent, w: Int, h: Int) {
         val p = prefs ?: return
         if (!sysInputOwner()) return
         val ctx = appContext ?: return
         val a = ev.actionMasked
         if (a == MotionEvent.ACTION_DOWN) {
-            if (!inTriggerBand(ev.x, ev.y, w, h)) return
+            // zone 判定单源（§14.6）：底角三角优先（条带与三角不相交，顺序无歧义）；
+            // 底角另有独立开关门控（关=角落流不转发，OS3 同键语义）
+            val corner = inCornerTriangle(ev.x, ev.y, w, h)
+            if (corner) {
+                if (!cornerSwipeEnabled()) return
+            } else if (!inTriggerBand(ev.x, ev.y, w, h)) {
+                return
+            }
+            fwdZone = if (corner) {
+                com.lsp.hypersidebar.prefs.PrefKeys.SPY_ZONE_CORNER
+            } else {
+                com.lsp.hypersidebar.prefs.PrefKeys.SPY_ZONE_STRIP
+            }
             fwdDownTime = ev.downTime
             fwdDeviceId = ev.deviceId
             fwdSource = ev.source
             fwdEdgeFlags = ev.edgeFlags
             fwdPointerId = ev.getPointerId(0)
+            pendingMove?.recycle()
+            pendingMove = null
+            lastMoveFwdEventTime = ev.eventTime
         } else if (fwdDownTime != ev.downTime) {
             return // 非转发流的 MOVE/UP（带外起手）——静默忽略
         }
+        if (a == MotionEvent.ACTION_MOVE) {
+            if (ev.eventTime - lastMoveFwdEventTime < MOVE_COALESCE_MS) {
+                // 窗口内：只留最新（框架会在 finishInputEvent 后回收 ev，故必须 obtain 副本）
+                pendingMove?.recycle()
+                pendingMove = MotionEvent.obtain(ev)
+                return
+            }
+            lastMoveFwdEventTime = ev.eventTime
+        } else if (a == MotionEvent.ACTION_UP || a == MotionEvent.ACTION_CANCEL) {
+            pendingMove?.let {
+                sendStream(it, ctx, w, h, p)
+                it.recycle()
+            }
+            pendingMove = null
+        }
+        sendStream(ev, ctx, w, h, p)
+        if (a == MotionEvent.ACTION_UP || a == MotionEvent.ACTION_CANCEL) {
+            fwdDownTime = 0L
+        }
+    }
+
+    private fun sendStream(ev: MotionEvent, ctx: android.content.Context, w: Int, h: Int, p: android.content.SharedPreferences) {
         val intent = android.content.Intent(com.lsp.hypersidebar.prefs.PrefKeys.SPY_STREAM_ACTION)
             .setPackage(com.lsp.hypersidebar.prefs.HostPackages.UI_HOST)
             .putExtra(com.lsp.hypersidebar.prefs.PrefKeys.SPY_EXTRA_EVENT, ev)
@@ -369,14 +473,12 @@ object SystemUiInputSpy {
                 com.lsp.hypersidebar.prefs.PrefKeys.SPY_EXTRA_LANDSCAPE,
                 w > h
             )
+            .putExtra(com.lsp.hypersidebar.prefs.PrefKeys.SPY_EXTRA_ZONE, fwdZone)
         com.lsp.hypersidebar.util.RelayToken.attach(
             intent, com.lsp.hypersidebar.util.RelayToken.read(p)
         )
         runCatching { ctx.sendBroadcast(intent) }
             .onFailure { HLog.w(TAG, "stream forward failed: ${it.message}") }
-        if (a == MotionEvent.ACTION_UP || a == MotionEvent.ACTION_CANCEL) {
-            fwdDownTime = 0L
-        }
     }
 
     private fun onMotion(ev: MotionEvent, w: Int, h: Int) {

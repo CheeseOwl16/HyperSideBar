@@ -111,6 +111,19 @@ class SettingsRepository(val prefs: SharedPreferences) {
         prefs.getInt(PrefKeys.CORNER_MAX_ANGLE_DEG, LayoutDefaults.CORNER_MAX_ANGLE_DEG)
     }
 
+    /** 底角热区高度（屏高百分比，2026-10-07）。draft-aware 同底角 sheet 滑条。 */
+    fun cornerHotPercent(): Int = getDraft(PrefKeys.CORNER_HOT_PERCENT) {
+        prefs.getInt(PrefKeys.CORNER_HOT_PERCENT, LayoutDefaults.CORNER_HOT_PERCENT)
+    }
+
+    /** B 路线停顿触发带（百分比模型 + 半宽 dp，OS4；sys 侧启动快照须重启 SystemUI）。 */
+    fun bandHeightPercent(): Int =
+        prefs.getInt(PrefKeys.BAND_HEIGHT_PERCENT, LayoutDefaults.BAND_HEIGHT_PERCENT)
+    fun bandPositionPercent(): Int =
+        prefs.getInt(PrefKeys.BAND_POSITION_PERCENT, LayoutDefaults.BAND_POSITION_PERCENT)
+    fun bandWidthDp(): Int =
+        prefs.getInt(PrefKeys.BAND_WIDTH_DP, LayoutDefaults.BAND_WIDTH_DP)
+
     fun fanFogIntensity(): Float =
         prefs.getFloat(PrefKeys.FAN_FOG_INTENSITY, LayoutDefaults.FAN_FOG_INTENSITY)
     fun fanDimEnabled(): Boolean =
