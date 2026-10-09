@@ -247,6 +247,7 @@ static struct {
     int has_xy;               /* 该锚点以 s0/s1 传坐标 ⇒ 日志打 x/y（见 HsbFn16） */
     int has_ret;              /* 返回值带门控信息 ⇒ 日志打 ret=（见 hsb_anchor_has_ret） */
     int has_args4;            /* 签名验证轮 ⇒ 日志打全 a0-a3（见 hsb_anchor_has_args4） */
+    int has_dims;             /* 日志打 self+0x244/+0x260 两个 int（见 hsb_anchor_has_dims） */
 } g_hook;
 
 static HsbFn16 g_orig;
@@ -328,6 +329,37 @@ static int hsb_anchor_has_args4(const char *name) {
     return strcmp(name, "cancel_home_gesture_to_engine") == 0 ? 1 : 0;
 }
 
+/*
+ * 第 3 步 3.1 结论：cancel_home_gesture_to_engine **不在正常手势路径上**。
+ * 调用点 dispatch_to_inner_monitor+0x324 前有四重守卫，全中才调：
+ *     cmp w23,#0x5 / ldr w8,[x21+0x108] cmp #0x1 / ldar w8,[0xf1908d0] cbnz /
+ *     ldrb w8,[0xf1908d4+1] tbz #0
+ * 装后实测零命中，与反汇编一致。它是"放弃手势"的兜底（无障碍/被抢占场景），
+ * 不是"识别→pilfer"主链路 ⇒ 作为角区动作函数是错的，已弃用。
+ *
+ * 真正的主链路（日志串实锤）：`Home gesture recognized, delay pilfer` →
+ * `Home pilfer_pointers`，pilfer 的调用方全在 on_input_event 里。
+ * 但直接调 pilfer_pointers(self) 也没用——它让**系统自己的 monitor** 抢流，
+ * 正是要阻止的事。所以动作只能落在"分类结果"上：match_region_check 对
+ * 不命中任何矩形返回 4，系统对此有设计好路径 `Down event ... outside valid
+ * region, redirecting`（重定向给当前窗口、不认领、不 pilfer）。
+ *
+ * 屏宽屏高从哪来（三个 lever 的差别）：
+ *   is_in_bottom_gesture_region → x0=**Impl self** ⇒ 可从 self+0x244 / self+0x260
+ *     读两个 int（is_point_out_of_screen 就是这么用的：fcmp x↔[+0x260]、y↔[+0x244]）
+ *   match_region_check         → x0=region 结构，且不同调用点偏移不同
+ *     （init_gesture_type 传 impl+0x138、is_in_bottom_* 传 impl+0x238）⇒ 推不出 Impl
+ *   pilfer_pointers            → x0=monitor = impl+0x10 ⇒ 要推两跳，未验证
+ * ⇒ 先确认 is_in_bottom_gesture_region 这条路的屏宽屏高，再定 lever。
+ */
+
+/* is_in_bottom_gesture_region 专用：把 self+0x244 / self+0x260 两个 int 打出来。
+ * 期望 1080 / 2400（ marble 1080x2400）。顺序待实机确认：按
+ * is_point_out_of_screen 的用法，+0x260 与 x(s0) 比 ⇒ 宽，+0x244 与 y(s1) 比 ⇒ 高。 */
+static int hsb_anchor_has_dims(const char *name) {
+    return strcmp(name, "is_in_bottom_gesture_region") == 0 ? 1 : 0;
+}
+
 /* 心跳用的单调时钟与上次出声时刻（秒） */
 static uint64_t hsb_now_s(void) {
     struct timespec ts;
@@ -375,8 +407,22 @@ static uintptr_t hsb_stub(uintptr_t a0, uintptr_t a1, uintptr_t a2, uintptr_t a3
             snprintf(detail, sizeof(detail), "a0=%p a1=%p", (void *) a0, (void *) a1);
         }
         if (g_hook.has_ret) {
-            char t[40];
+            char t[64];
             snprintf(t, sizeof(t), " ret=0x%lx", (unsigned long) rv);
+            strncat(detail, t, sizeof(detail) - strlen(detail) - 1);
+        }
+        if (g_hook.has_dims) {
+            /* self+0x244 / +0x260 两个 int：is_point_out_of_screen 的用法是与 x/y 比较的
+             * 屏幕尺寸。读之前先验指针可读——野指针会让热路径上的 hook 直接崩桌面。 */
+            char t[80];
+            const volatile int *p = (const volatile int *) ((const char *) a0 + 0x244);
+            int h = p[0];
+            int w = p[13];   /* (0x260 - 0x244) / 4 = 13 个 int */
+            if (w > 0 && w < 100000 && h > 0 && h < 100000) {
+                snprintf(t, sizeof(t), " w@0x260=%d h@0x244=%d", w, h);
+            } else {
+                snprintf(t, sizeof(t), " dims? w@0x260=%d h@0x244=%d", w, h);
+            }
             strncat(detail, t, sizeof(detail) - strlen(detail) - 1);
         }
         LOGI("%s %s #%u %s d0=%016llx d1=%016llx since_install=%llus%s",
@@ -571,9 +617,11 @@ static void hsb_install_at(const HsbLauncherAnchor *a, uintptr_t at, uintptr_t b
         g_hook.has_xy = hsb_anchor_has_xy(a->name);
         g_hook.has_ret = hsb_anchor_has_ret(a->name);
         g_hook.has_args4 = hsb_anchor_has_args4(a->name);
-        LOGI("hook installed %s target=%p backup=%p size=%llu via=%s bias=%p lib=%s xy=%d ret=%d args4=%d",
+        g_hook.has_dims = hsb_anchor_has_dims(a->name);
+        LOGI("hook installed %s target=%p backup=%p size=%llu via=%s bias=%p lib=%s xy=%d ret=%d args4=%d dims=%d",
              a->name, (void *) at, backup, (unsigned long long) a->size, how,
-             (void *) base, g_hook.lib_path, g_hook.has_xy, g_hook.has_ret, g_hook.has_args4);
+             (void *) base, g_hook.lib_path, g_hook.has_xy, g_hook.has_ret,
+             g_hook.has_args4, g_hook.has_dims);
     } else {
         g_hook.hook_failed++;
         snprintf(g_hook.reason, sizeof(g_hook.reason),
