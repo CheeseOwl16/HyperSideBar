@@ -207,6 +207,12 @@ object SelfCheck {
 
     /** 导出到公共下载目录（MediaStore，无需存储权限）；返回展示用路径描述 */
     suspend fun export(context: Context, content: String): String = withContext(Dispatchers.IO) {
+        // 三条导出路径（诊断页 / 日志页 / 使用数据页）都收口在这里 ⇒ native 取证段保证带得上。
+        // 桌面进程无模块 Java 半侧（导出永远不会有 [launcher] 段），hook 的活性与命中只能经
+        // root 抓一拍；1009 的教训是只加在自检报告里，用户按"日志页导出"就一个字都没拿到。
+        val withNative = content + "\n\n== native root 取证（spike 分支）==\n" +
+            runCatching { NativeRootProbe.snapshot(context) }
+                .getOrElse { "取证失败：${it.message}" } + "\n"
         val fileName = "hypersidebar_selfcheck_" +
             SimpleDateFormat("yyyyMMdd_HHmmss", Locale.getDefault()).format(Date()) + ".txt"
         runCatching {
@@ -216,7 +222,7 @@ object SelfCheck {
             }
             val uri = context.contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
                 ?: error("MediaStore insert returned null")
-            context.contentResolver.openOutputStream(uri)?.use { it.write(content.toByteArray()) }
+            context.contentResolver.openOutputStream(uri)?.use { it.write(withNative.toByteArray()) }
                 ?: error("openOutputStream returned null")
             "下载/$fileName"
         }.getOrElse { e ->
@@ -224,7 +230,7 @@ object SelfCheck {
             // 兜底：应用私有外部目录（文件管理器可达性差但至少能取到）
             val dir = context.getExternalFilesDir(Environment.DIRECTORY_DOCUMENTS)
                 ?: context.filesDir
-            java.io.File(dir, fileName).writeText(content)
+            java.io.File(dir, fileName).writeText(withNative)
             "应用目录/${dir.name}/$fileName"
         }
     }

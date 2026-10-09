@@ -268,5 +268,7 @@ private suspend fun exportLogs(context: Context, logs: Map<String, List<HLog.Ent
             sb.append("\n===== [$proc] ${list.size} 条 =====\n")
             list.forEach { sb.append(it.formatLine()).append('\n') }
         }
+        // native 取证段由 `SelfCheck.export()` 统一附加（三条导出路径共用那个收口，
+        // 免得按哪个按钮结果不一样——1009 就是踩在这里：日志页导出里没有 hook 状态）
         SelfCheck.export(context, sb.toString())
     }

@@ -65,6 +65,11 @@ object LogDumpBridge {
                 object : BroadcastReceiver() {
                     override fun onReceive(c: Context, intent: Intent) {
                         val roundId = intent.getLongExtra(PrefKeys.LOG_DUMP_EXTRA_ROUND, 0L)
+                        // native 现状即时回灌（spike 取证）：installed/hits 是运行期累积量，
+                        // 模块加载时那份快照看不到；logcat 在这台 ROM 上不可靠 ⇒ 导出必须带活体
+                        runCatching { NativeProbe.report() }.getOrNull()
+                            ?.split('\n')
+                            ?.forEach { HLog.i("HSBNative", "live: $it") }
                         val entries = HLog.snapshot()
                         val meta = JSONObject()
                             .put("entries", entries.size)
