@@ -413,11 +413,12 @@ static uintptr_t hsb_stub(uintptr_t a0, uintptr_t a1, uintptr_t a2, uintptr_t a3
         }
         if (g_hook.has_dims) {
             /* self+0x244 / +0x260 两个 int：is_point_out_of_screen 的用法是与 x/y 比较的
-             * 屏幕尺寸。读之前先验指针可读——野指针会让热路径上的 hook 直接崩桌面。 */
+             * 屏幕尺寸。用显式偏移而不是数组下标——曾经把 (0x260-0x244)/4 算成 13
+             * （实际 7），野出一整个字段。读之前先验值域，野指针会让热路径直接崩桌面。 */
             char t[80];
-            const volatile int *p = (const volatile int *) ((const char *) a0 + 0x244);
-            int h = p[0];
-            int w = p[13];   /* (0x260 - 0x244) / 4 = 13 个 int */
+            const volatile int *base = (const volatile int *) a0;
+            int h = base[0x244 / 4];   /* 与 y(s1) 比 ⇒ 高 */
+            int w = base[0x260 / 4];   /* 与 x(s0) 比 ⇒ 宽 */
             if (w > 0 && w < 100000 && h > 0 && h < 100000) {
                 snprintf(t, sizeof(t), " w@0x260=%d h@0x244=%d", w, h);
             } else {
