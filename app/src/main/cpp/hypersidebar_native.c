@@ -192,6 +192,9 @@ static const char *const kHsbAnchorWhitelist[] = {
     "init_gesture_type",              /* 1012B，DOWN 时 (x,y)∈s0/s1 + 定手势类型 */
     "is_in_bottom_gesture_region",    /* 168B，底部手势区判定（底角落点） */
     "match_region_check",             /* 344B，纯分类：4 矩形 → 类型码 0/1/2 */
+    /* --- 第 3 步 3.1：动作函数签名验证（log-only，不调用）--- */
+    "cancel_home_gesture_to_engine",  /* 532B，反汇编定签名 (x0=self+0x10, x1=rodata 串, x2, x3) */
+    "pilfer_pointers",                /* 140B，1 参 (x0=self)，null 即返回 */
     NULL,
 };
 
@@ -243,6 +246,7 @@ static struct {
     char lib_path[192];       /* maps 里目标库首条映射路径（namespace 取证） */
     int has_xy;               /* 该锚点以 s0/s1 传坐标 ⇒ 日志打 x/y（见 HsbFn16） */
     int has_ret;              /* 返回值带门控信息 ⇒ 日志打 ret=（见 hsb_anchor_has_ret） */
+    int has_args4;            /* 签名验证轮 ⇒ 日志打全 a0-a3（见 hsb_anchor_has_args4） */
 } g_hook;
 
 static HsbFn16 g_orig;
@@ -309,6 +313,21 @@ static int hsb_anchor_has_ret(const char *name) {
     return 0;
 }
 
+/*
+ * 第 3 步 3.1 签名验证：打全 4 个整型参数。
+ * 背景——反汇编从调用点定出的签名（但仍未实机确认）：
+ *   cancel_home_gesture_to_engine(x0=self+0x10, x1=rodata 常量串, x2=?, x3=?)
+ *     调用点 dispatch_to_inner_monitor+0x324：`add x0,x21,#0x10` / `adrp+add x1` /
+ *     `mov x2,x24` / `mov x3,x20`。x1 是 rodata 常量（日志/原因标签），真正要确认的是
+ *     x2/x3——对着同手势的 (x,y) 看它们像不像屏幕坐标。
+ *   pilfer_pointers(x0=self)：本体首条 `cbz x0, ...`，null 即返回 ⇒ 只 1 参。
+ * 本阶段**只打日志不调用**：签名未验证前调用 = 崩桌面。x1 是常量串这件事本身也是
+ * 证据——打出来若始终是同一个固定地址，就证实 x1 不是调用方数据。
+ */
+static int hsb_anchor_has_args4(const char *name) {
+    return strcmp(name, "cancel_home_gesture_to_engine") == 0 ? 1 : 0;
+}
+
 /* 心跳用的单调时钟与上次出声时刻（秒） */
 static uint64_t hsb_now_s(void) {
     struct timespec ts;
@@ -344,7 +363,12 @@ static uintptr_t hsb_stub(uintptr_t a0, uintptr_t a1, uintptr_t a2, uintptr_t a3
                        : 0u;
     if (first || quiet) {
         char detail[192];
-        if (g_hook.has_xy) {
+        if (g_hook.has_args4) {
+            /* 3.1 签名验证：全 4 个整型参数。a2/a3 是不是屏幕坐标，对着同手势的
+             * is_in_bottom_gesture_region 读数一比就知道。 */
+            snprintf(detail, sizeof(detail), "a0=%p a1=%p a2=%p a3=%p",
+                     (void *) a0, (void *) a1, (void *) a2, (void *) a3);
+        } else if (g_hook.has_xy) {
             snprintf(detail, sizeof(detail), "x=%.1f y=%.1f",
                      hsb_lo32_float(d0), hsb_lo32_float(d1));
         } else {
@@ -546,9 +570,10 @@ static void hsb_install_at(const HsbLauncherAnchor *a, uintptr_t at, uintptr_t b
         snprintf(g_hook.how, sizeof(g_hook.how), "%s", how);
         g_hook.has_xy = hsb_anchor_has_xy(a->name);
         g_hook.has_ret = hsb_anchor_has_ret(a->name);
-        LOGI("hook installed %s target=%p backup=%p size=%llu via=%s bias=%p lib=%s xy=%d ret=%d",
+        g_hook.has_args4 = hsb_anchor_has_args4(a->name);
+        LOGI("hook installed %s target=%p backup=%p size=%llu via=%s bias=%p lib=%s xy=%d ret=%d args4=%d",
              a->name, (void *) at, backup, (unsigned long long) a->size, how,
-             (void *) base, g_hook.lib_path, g_hook.has_xy, g_hook.has_ret);
+             (void *) base, g_hook.lib_path, g_hook.has_xy, g_hook.has_ret, g_hook.has_args4);
     } else {
         g_hook.hook_failed++;
         snprintf(g_hook.reason, sizeof(g_hook.reason),
