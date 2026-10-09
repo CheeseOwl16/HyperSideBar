@@ -1,6 +1,17 @@
 cmake_minimum_required(VERSION 3.22)
 project(hypersidebar_native C)
 
+# spike/os4-native 专用总闸。C 侧默认 0（=hook 不可达，主线包的安全态）；
+# **本分支这两行不许合回主线**——漏过去就等于把桌面 inline hook 发给 OS2/3 用户。
+# 为什么用普通变量而不是 option()/CACHE：CMake 会把 cache 变量值粘在 `app/.cxx` 里，
+# 改了默认值不重配就不生效（1008 实踩过两次：一次把 OFF 误判成"没生效"，一次装机包其实
+# 没编进 hook）。普通变量不进缓存 ⇒ 双向都不受旧缓存影响，删掉这行必然回到 C 的默认 0，
+# 这才是可信的 tripwire。
+set(HSB_NATIVE_SPIKE ON)
+if(HSB_NATIVE_SPIKE)
+    add_compile_definitions(HSB_NATIVE_SPIKE=1)
+endif()
+
 add_library(hypersidebar_native SHARED hypersidebar_native.c)
 
 # 纯 C、不用 STL；日志走 liblog

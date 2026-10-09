@@ -778,6 +778,17 @@ class TurboLayout(private val remotePrefs: SharedPreferences) : BaseHook() {
             Class.forName(EVOKE_ITF, false, io.github.kyuubiran.ezxhelper.core.ClassLoaderProvider.safeClassLoader)
         }.isSuccess
         Os4Marker.sidebarPresent = isOs4Sidebar
+        // native hook 补拍（仅 spike 分支；prop debug.hsb.native.hook 关=C 侧空操作）：
+        // native_init 那一拍通常早于桌面自己 loadLibrary(libapp_launcher.so)，框架 dlopen
+        // 回调能否覆盖该 namespace 未证 ⇒ 桌面进程这里再给两次确定可达的机会。
+        if (isOs4Sidebar) {
+            runCatching { com.lsp.hypersidebar.util.NativeProbe.retry() }
+                .onFailure { HLog.w(TAG, "native retry failed: ${it.message}") }
+            mainHandler.postDelayed({
+                runCatching { com.lsp.hypersidebar.util.NativeProbe.retry() }
+                    .onFailure { HLog.w(TAG, "native retry(5s) failed: ${it.message}") }
+            }, 5_000L)
+        }
         // 熔断器：发布本进程新鲜状态（清掉上进程生命周期遗留的熔断键）+ 熔断动作
         breaker.forceReset()
         breaker.onTripped = { reason ->
