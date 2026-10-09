@@ -242,6 +242,7 @@ static struct {
     char how[16];             /* offset | sigscan */
     char lib_path[192];       /* maps 里目标库首条映射路径（namespace 取证） */
     int has_xy;               /* 该锚点以 s0/s1 传坐标 ⇒ 日志打 x/y（见 HsbFn16） */
+    int has_ret;              /* 返回值带门控信息 ⇒ 日志打 ret=（见 hsb_anchor_has_ret） */
 } g_hook;
 
 static HsbFn16 g_orig;
@@ -282,6 +283,32 @@ static uint64_t hsb_bits64(double d) {
     return b;
 }
 
+/*
+ * 返回值是否带门控信息（2026-10-09 定，只给这三个打 ret=）：
+ *  - is_in_bottom_gesture_region：168B，`cmp w0,#1; cset w0,eq` ⇒ **返回布尔"在底部手势区"**。
+ *    它就是 match_region_check 的一层包装，且只吃 s0/s1、不暴露内部 region 结构，
+ *    是底角门控的首选锚点（比直接挂 match_region_check 稳：不用解析 Rust 私有字段布局）。
+ *  - match_region_check：344B 纯分类，返回区域类型码。反汇编出的完整映射：
+ *        @0x30 矩形              → w0=2
+ *        @0x10 矩形              → w0=0（w1=0）
+ *        @0x20 矩形              → w0=0（w1=1）
+ *        @0x04 矩形+#0x50 开关    → w0=1   ← **底部手势区**（is_in_bottom_* 比的就是它）
+ *        @0x40/#0x48/#0x4c 复合条件满足 → w0=1（同上一条的另一分支）
+ *        都不中                   → w0=4   ← 对应日志串 "Down event ... outside valid region, redirecting"
+ *    我们只收 x0（w0=主判别值）；w1 在 x1、C 收不到，底角门控用 is_in_bottom_* 代替。
+ *  - try_delegate_back_to_sidebar：返回 back 是否委托给侧边栏，第 1 步已验有意义。
+ * 其余不打：init_gesture_type 的返回值被调用方**整段丢弃**（判定写进 self 字段），
+ * on_swipe_start/on_swipe_process 等属过程信号，返回值不是门控判据。
+ */
+static int hsb_anchor_has_ret(const char *name) {
+    static const char *const kRet[] = {
+        "is_in_bottom_gesture_region", "match_region_check",
+        "try_delegate_back_to_sidebar", NULL,
+    };
+    for (int i = 0; kRet[i]; i++) if (strcmp(name, kRet[i]) == 0) return 1;
+    return 0;
+}
+
 /* 心跳用的单调时钟与上次出声时刻（秒） */
 static uint64_t hsb_now_s(void) {
     struct timespec ts;
@@ -308,27 +335,35 @@ static uintptr_t hsb_stub(uintptr_t a0, uintptr_t a1, uintptr_t a2, uintptr_t a3
     uint64_t last = g_hook.last_log_s ? g_hook.last_log_s : g_hook.installed_at_s;
     int quiet = (now >= last + HSB_HEARTBEAT_S);
     int first = __atomic_fetch_add(&g_stub_logged, 1u, __ATOMIC_RELAXED) < HSB_LOG_LIMIT;
+    /* 先接住返回值再打日志（原来是尾部调用，返回值直接透传、打不到）。
+     * 只给 has_ret 的点打——见 hsb_anchor_has_ret：其余锚点返回值无门控意义
+     * （init_gesture_type 甚至被调用方整段丢弃，判定写进对象字段）。 */
+    uintptr_t rv = g_orig
+                       ? g_orig(a0, a1, a2, a3, a4, a5, a6, a7,
+                                d0, d1, d2, d3, d4, d5, d6, d7)
+                       : 0u;
     if (first || quiet) {
+        char detail[192];
         if (g_hook.has_xy) {
-            LOGI("%s %s #%u x=%.1f y=%.1f d0=%016llx d1=%016llx since_install=%llus%s",
-                 first ? "hook HIT" : "hook ALIVE", anchor, n,
-                 hsb_lo32_float(d0), hsb_lo32_float(d1),
-                 (unsigned long long) hsb_bits64(d0),
-                 (unsigned long long) hsb_bits64(d1),
-                 (unsigned long long) (now - g_hook.installed_at_s),
-                 quiet ? " (quiet)" : "");
+            snprintf(detail, sizeof(detail), "x=%.1f y=%.1f",
+                     hsb_lo32_float(d0), hsb_lo32_float(d1));
         } else {
-            LOGI("%s %s #%u a0=%p a1=%p since_install=%llus%s",
-                 first ? "hook HIT" : "hook ALIVE", anchor, n,
-                 (void *) a0, (void *) a1,
-                 (unsigned long long) (now - g_hook.installed_at_s),
-                 quiet ? " (quiet)" : "");
+            snprintf(detail, sizeof(detail), "a0=%p a1=%p", (void *) a0, (void *) a1);
         }
+        if (g_hook.has_ret) {
+            char t[40];
+            snprintf(t, sizeof(t), " ret=0x%lx", (unsigned long) rv);
+            strncat(detail, t, sizeof(detail) - strlen(detail) - 1);
+        }
+        LOGI("%s %s #%u %s d0=%016llx d1=%016llx since_install=%llus%s",
+             first ? "hook HIT" : "hook ALIVE", anchor, n, detail,
+             (unsigned long long) hsb_bits64(d0),
+             (unsigned long long) hsb_bits64(d1),
+             (unsigned long long) (now - g_hook.installed_at_s),
+             quiet ? " (quiet)" : "");
         g_hook.last_log_s = now;
     }
-    return g_orig
-           ? g_orig(a0, a1, a2, a3, a4, a5, a6, a7,
-                    d0, d1, d2, d3, d4, d5, d6, d7) : 0u;
+    return rv;
 }
 
 /* --- 候选 load bias + 可执行段边界（两条来源共用，先 phdr 后 maps 追加） --- */
@@ -510,9 +545,10 @@ static void hsb_install_at(const HsbLauncherAnchor *a, uintptr_t at, uintptr_t b
         snprintf(g_hook.anchor, sizeof(g_hook.anchor), "%s", a->name);
         snprintf(g_hook.how, sizeof(g_hook.how), "%s", how);
         g_hook.has_xy = hsb_anchor_has_xy(a->name);
-        LOGI("hook installed %s target=%p backup=%p size=%llu via=%s bias=%p lib=%s xy=%d",
+        g_hook.has_ret = hsb_anchor_has_ret(a->name);
+        LOGI("hook installed %s target=%p backup=%p size=%llu via=%s bias=%p lib=%s xy=%d ret=%d",
              a->name, (void *) at, backup, (unsigned long long) a->size, how,
-             (void *) base, g_hook.lib_path, g_hook.has_xy);
+             (void *) base, g_hook.lib_path, g_hook.has_xy, g_hook.has_ret);
     } else {
         g_hook.hook_failed++;
         snprintf(g_hook.reason, sizeof(g_hook.reason),
