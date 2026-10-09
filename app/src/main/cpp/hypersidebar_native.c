@@ -170,17 +170,28 @@ static void probe_dtor(void) {
 #define HSB_ANCHOR_PROP "debug.hsb.native.anchor"
 
 /*
- * 可换的挂点白名单（2026-10-08 加）：装机轮稀缺，"installed=1 但 hits 恒 0"这种**选点**
- * 问题不该再烧一次 APK，`setprop debug.hsb.native.anchor <名字>` + 重启桌面就能换。
- * 只收序言里**不保存 FP 寄存器**的函数（`ff..d1 / fd..a9 / f?..f9` 全是 x 寄存器）：
- * 我们的桩是 x0-x7 盲转发，若目标用 s0-d7 传参会丢参数——on_swipe_start/on_swipe_process/
- * handle_back_gesture 的序言都在存 d8-d15，属于"可能有浮点参数或大量 FP 使用"，本 spike
- * 阶段不放进白名单（第 2 步真要挂它们时再按真实签名写桩）。
+ * 可换的挂点白名单（2026-10-08 加，2026-10-09 第 2 步扩容）：装机轮稀缺，
+ * "installed=1 但 hits 恒 0"这种**选点**问题不该再烧一次 APK，
+ * `setprop debug.hsb.native.anchor <名字>` + 重启桌面就能换。
+ *
+ * 2026-10-09 更正（离线反汇编实锤，旧注释是误读）：原来以"序言存 d8-d15 ⇒ 可能有浮点参数"
+ * 把 on_swipe_start/on_swipe_process/handle_back_gesture 全排除。实际逐个看过序言：
+ *  - on_swipe_start：只存 **d8 一个**（自己用的 callee-saved），**不吃 FP 参数** ⇒ 可挂；
+ *  - on_swipe_process / handle_back_gesture：同样只存 x/d8 级，且 args 是 x0-x2 ⇒ 可挂；
+ *  - init_gesture_type / match_region_check / is_in_bottom_gesture_region：
+ *    **真的以 s0/s1 传坐标**（init_gesture_type 里 `fmov s8,s0`+`stp s0,s1,[x29,#-8]`）
+ *    ⇒ 必须靠桩的 d0-d7 透传，见 HsbFn16。
  */
 static const char *const kHsbAnchorWhitelist[] = {
+    /* --- 第 1 步已验证（返回委托分叉）--- */
     "try_delegate_back_to_sidebar",   /* 188B，back 委托侧边栏的分叉 */
     "on_back_cancelled",              /* 456B，判定失败/取消 */
     "on_back_invoke",                 /* 1476B，commit 时刻 */
+    /* --- 第 2 步：门控与底角的观测点 --- */
+    "on_swipe_start",                 /* 1504B，系统认领边缘滑=门控主信号，无 FP 参数 */
+    "init_gesture_type",              /* 1012B，DOWN 时 (x,y)∈s0/s1 + 定手势类型 */
+    "is_in_bottom_gesture_region",    /* 168B，底部手势区判定（底角落点） */
+    "match_region_check",             /* 344B，纯分类：4 矩形 → 类型码 0/1/2 */
     NULL,
 };
 
@@ -193,8 +204,23 @@ static const char *hsb_chosen_anchor(void) {
     return HSB_ONLY_ANCHOR;   /* 名单外的值=忽略，仍用默认点（不猜） */
 }
 
-typedef uintptr_t (*HsbFn8)(uintptr_t, uintptr_t, uintptr_t, uintptr_t,
-                            uintptr_t, uintptr_t, uintptr_t, uintptr_t);
+typedef uintptr_t (*HsbFn16)(uintptr_t a0, uintptr_t a1, uintptr_t a2, uintptr_t a3,
+                             uintptr_t a4, uintptr_t a5, uintptr_t a6, uintptr_t a7,
+                             double d0, double d1, double d2, double d3,
+                             double d4, double d5, double d6, double d7);
+/*
+ * 为什么桩要显式收 d0-d7（2026-10-09 第 2 步）：AAPCS64 的实参/形参分配是**两套独立队列**——
+ * 前 8 个整型进 x0-x7，前 8 个浮点/SIMD 进 v0-v7（s0-s7/d0-d7）。Rust 侧
+ * `init_gesture_type` / `match_region_check` / `is_in_bottom_gesture_region` 就是用
+ * s0/s1 传 DOWN 坐标的。若桩只声明 8 个整型参数，编译器可自由拿 v0-v7 当临时寄存器，
+ * 等我们把参数转给 backup 时坐标已经变成垃圾——对纯分类函数来说这等于把系统手势判废。
+ *
+ * 声明成"8 整型 + 8 double"后，编译器必须把这 16 个值分别放回 x0-x7 / v0-v7，
+ * 于是**原样进、原样出**：对不吃 FP 参数的锚点，v0-v7 里是上一个函数留下的垃圾，
+ * 我们不看也不碰，转给 backup 时又原样还回去，寄存器状态与入口逐位一致。
+ * 用 double 而非 float/uint64：double 才会落进 d0-d7；位级上，调用方若只写了 s0-s7
+ * 的低 32 位，转发时高 32 位是无意义填充，被调方只读低 32 位 ⇒ 两种情况都安全。
+ */
 
 static struct {
     uint32_t attempts;        /* 扫描+安装尝试次数（多来源每拍一次） */
@@ -215,10 +241,20 @@ static struct {
     char anchor[40];          /* 实际挂上的锚点名（桩日志与报告都用它） */
     char how[16];             /* offset | sigscan */
     char lib_path[192];       /* maps 里目标库首条映射路径（namespace 取证） */
+    int has_xy;               /* 该锚点以 s0/s1 传坐标 ⇒ 日志打 x/y（见 HsbFn16） */
 } g_hook;
 
-static HsbFn8 g_orig_try_delegate;
+static HsbFn16 g_orig;
 static volatile uint32_t g_stub_logged;
+
+/* 该锚点是否以 s0/s1 传坐标（决定日志要不要打 x/y；见 HsbFn16 的注释） */
+static int hsb_anchor_has_xy(const char *name) {
+    static const char *const kXy[] = {
+        "init_gesture_type", "is_in_bottom_gesture_region", "match_region_check", NULL,
+    };
+    for (int i = 0; kXy[i]; i++) if (strcmp(name, kXy[i]) == 0) return 1;
+    return 0;
+}
 
 /* 心跳用的单调时钟与上次出声时刻（秒） */
 static uint64_t hsb_now_s(void) {
@@ -227,34 +263,44 @@ static uint64_t hsb_now_s(void) {
     return (uint64_t) ts.tv_sec;
 }
 
-static uintptr_t hsb_stub_try_delegate(uintptr_t a0, uintptr_t a1, uintptr_t a2,
-                                       uintptr_t a3, uintptr_t a4, uintptr_t a5,
-                                       uintptr_t a6, uintptr_t a7) {
+static uintptr_t hsb_stub(uintptr_t a0, uintptr_t a1, uintptr_t a2, uintptr_t a3,
+                          uintptr_t a4, uintptr_t a5, uintptr_t a6, uintptr_t a7,
+                          double d0, double d1, double d2, double d3,
+                          double d4, double d5, double d6, double d7) {
+    (void) a2; (void) a3; (void) a4; (void) a5; (void) a6; (void) a7;
+    (void) d0; (void) d1; (void) d2; (void) d3;
+    (void) d4; (void) d5; (void) d6; (void) d7;
     uint32_t n = __atomic_add_fetch(&g_hook.hits, 1u, __ATOMIC_RELAXED);
     /* soak 判据"30 分钟后还活着、还在响"**按时间**成立，不按次数：
      * 次数阈值（原来的 16/32/64 对数里程碑）把两件事混成一件——"hook 没被打回文件映射"
      * 和"用户正好做了 16 次手势"。低频使用下 30 分钟可能只有 3 次命中，阈值永远等不到，
      * 于是"没日志"会被误读成"hook 掉了"。现在：任何一次命中，只要距上次出声 ≥60s，
      * 就打一行带"安装后秒数"的心跳——30 分钟后第一次手势即证据。
-     * g_hook.since_install_s 是"安装→此刻"的固定差值（不是空闲时长，故无需独立时间戳）；
-     * 空闲时长由 logcat 自己的时间戳给出。 */
+     * g_hook.installed_at_s 是"安装→此刻"的固定基准；空闲时长由 logcat 时间戳给出。 */
     const char *anchor = g_hook.anchor[0] ? g_hook.anchor : "?";
     uint64_t now = hsb_now_s();
     uint64_t last = g_hook.last_log_s ? g_hook.last_log_s : g_hook.installed_at_s;
     int quiet = (now >= last + HSB_HEARTBEAT_S);
-    if (__atomic_fetch_add(&g_stub_logged, 1u, __ATOMIC_RELAXED) < HSB_LOG_LIMIT) {
-        LOGI("hook HIT %s #%u a0=%p a1=%p since_install=%llus", anchor, n,
-             (void *) a0, (void *) a1,
-             (unsigned long long) (now - g_hook.installed_at_s));
-        g_hook.last_log_s = now;
-    } else if (quiet) {
-        LOGI("hook ALIVE %s hits=%u since_install=%llus quiet=%llus", anchor, n,
-             (unsigned long long) (now - g_hook.installed_at_s),
-             (unsigned long long) (now - last));
+    int first = __atomic_fetch_add(&g_stub_logged, 1u, __ATOMIC_RELAXED) < HSB_LOG_LIMIT;
+    if (first || quiet) {
+        if (g_hook.has_xy) {
+            LOGI("%s %s #%u x=%.1f y=%.1f since_install=%llus%s",
+                 first ? "hook HIT" : "hook ALIVE", anchor, n,
+                 (float) d0, (float) d1,
+                 (unsigned long long) (now - g_hook.installed_at_s),
+                 quiet ? " (quiet)" : "");
+        } else {
+            LOGI("%s %s #%u a0=%p a1=%p since_install=%llus%s",
+                 first ? "hook HIT" : "hook ALIVE", anchor, n,
+                 (void *) a0, (void *) a1,
+                 (unsigned long long) (now - g_hook.installed_at_s),
+                 quiet ? " (quiet)" : "");
+        }
         g_hook.last_log_s = now;
     }
-    return g_orig_try_delegate
-           ? g_orig_try_delegate(a0, a1, a2, a3, a4, a5, a6, a7) : 0u;
+    return g_orig
+           ? g_orig(a0, a1, a2, a3, a4, a5, a6, a7,
+                    d0, d1, d2, d3, d4, d5, d6, d7) : 0u;
 }
 
 /* --- 候选 load bias + 可执行段边界（两条来源共用，先 phdr 后 maps 追加） --- */
@@ -425,9 +471,9 @@ static uintptr_t hsb_sigscan(const uint8_t *pat, uint32_t *hits_out) {
 static void hsb_install_at(const HsbLauncherAnchor *a, uintptr_t at, uintptr_t base,
                            const char *how) {
     void *backup = NULL;
-    int rc = g_api->hook_func((void *) at, (void *) hsb_stub_try_delegate, &backup);
+    int rc = g_api->hook_func((void *) at, (void *) hsb_stub, &backup);
     if (rc == 0 && backup != NULL) {
-        g_orig_try_delegate = (HsbFn8) (uintptr_t) backup;
+        g_orig = (HsbFn16) (uintptr_t) backup;
         g_hook.hook_installed++;
         g_hook.bias = base;
         g_hook.target = at;
@@ -435,9 +481,10 @@ static void hsb_install_at(const HsbLauncherAnchor *a, uintptr_t at, uintptr_t b
         g_hook.last_log_s = g_hook.installed_at_s;
         snprintf(g_hook.anchor, sizeof(g_hook.anchor), "%s", a->name);
         snprintf(g_hook.how, sizeof(g_hook.how), "%s", how);
-        LOGI("hook installed %s target=%p backup=%p size=%llu via=%s bias=%p lib=%s",
+        g_hook.has_xy = hsb_anchor_has_xy(a->name);
+        LOGI("hook installed %s target=%p backup=%p size=%llu via=%s bias=%p lib=%s xy=%d",
              a->name, (void *) at, backup, (unsigned long long) a->size, how,
-             (void *) base, g_hook.lib_path);
+             (void *) base, g_hook.lib_path, g_hook.has_xy);
     } else {
         g_hook.hook_failed++;
         snprintf(g_hook.reason, sizeof(g_hook.reason),
