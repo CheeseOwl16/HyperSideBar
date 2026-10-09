@@ -256,6 +256,32 @@ static int hsb_anchor_has_xy(const char *name) {
     return 0;
 }
 
+/*
+ * AArch64 读 FP 参数的正确姿势（2026-10-09 实踩）：**写 S 寄存器会把 V 寄存器的高 32 位
+ * 清零**。Rust 侧传的是 float（`match_region_check` 里是 `fcvtzs w8, s0`，double 会写 d0），
+ * 于是调用方留下的是 `v0 = [0x00000000][float_bits]`。桩按 double 收参（转发要位级不变），
+ * 直接 `(float) d0` 会把整个 64 位当成一个次正规 double（指数域全 0）⇒ 转出来恒为 0.0——
+ * 首轮装机就是这么错的：装对了、五个坐标全是 0。
+ *  ⇒ 取**低 32 位**按 float 重新解释；double 调用方高位非 0，此时取低 32 位会得 0，
+ *    靠同时打原始 hex 分辨（见 hsb_stub 的日志）。
+ * 转发侧不用改：把 double 原样传回 backup，被调方只读低 32 位就对——所以这个 bug
+ * 从头到尾只影响我们的日志，没有影响过系统行为。
+ */
+static float hsb_lo32_float(double d) {
+    uint32_t bits;
+    memcpy(&bits, &d, sizeof(bits));
+    float f;
+    memcpy(&f, &bits, sizeof(f));
+    return f;
+}
+
+/* 原始位型，只为日志里能一眼分清"float 传参"还是"double 传参" */
+static uint64_t hsb_bits64(double d) {
+    uint64_t b;
+    memcpy(&b, &d, sizeof(b));
+    return b;
+}
+
 /* 心跳用的单调时钟与上次出声时刻（秒） */
 static uint64_t hsb_now_s(void) {
     struct timespec ts;
@@ -284,9 +310,11 @@ static uintptr_t hsb_stub(uintptr_t a0, uintptr_t a1, uintptr_t a2, uintptr_t a3
     int first = __atomic_fetch_add(&g_stub_logged, 1u, __ATOMIC_RELAXED) < HSB_LOG_LIMIT;
     if (first || quiet) {
         if (g_hook.has_xy) {
-            LOGI("%s %s #%u x=%.1f y=%.1f since_install=%llus%s",
+            LOGI("%s %s #%u x=%.1f y=%.1f d0=%016llx d1=%016llx since_install=%llus%s",
                  first ? "hook HIT" : "hook ALIVE", anchor, n,
-                 (float) d0, (float) d1,
+                 hsb_lo32_float(d0), hsb_lo32_float(d1),
+                 (unsigned long long) hsb_bits64(d0),
+                 (unsigned long long) hsb_bits64(d1),
                  (unsigned long long) (now - g_hook.installed_at_s),
                  quiet ? " (quiet)" : "");
         } else {
