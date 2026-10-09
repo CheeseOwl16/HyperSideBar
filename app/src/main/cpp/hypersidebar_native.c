@@ -248,6 +248,7 @@ static struct {
     int has_ret;              /* 返回值带门控信息 ⇒ 日志打 ret=（见 hsb_anchor_has_ret） */
     int has_args4;            /* 签名验证轮 ⇒ 日志打全 a0-a3（见 hsb_anchor_has_args4） */
     int has_dims;             /* 日志打 self+0x244/+0x260 两个 int（见 hsb_anchor_has_dims） */
+    int has_gate;             /* 跑角区门控（见 hsb_anchor_has_gate） */
 } g_hook;
 
 static HsbFn16 g_orig;
@@ -360,6 +361,78 @@ static int hsb_anchor_has_dims(const char *name) {
     return strcmp(name, "is_in_bottom_gesture_region") == 0 ? 1 : 0;
 }
 
+/* ===== 第 3 步 3.2：角区门控（分档，见下方） =====
+ *
+ * 屏宽屏高已实机坐实（22:23 那轮）：self+0x260 = 宽 = 1080，self+0x244 = 高 = 2400，
+ * 与 is_point_out_of_screen 的用法一致。所以三个输入（is_in_bottom_gesture_region 的
+ * 返回值、坐标 s0/s1、屏幕尺寸）全在同一个 hook 里，不需要跨进程也不需要额外挂点。
+ *
+ * 门控判据：
+ *     命中 = (rv == 1) && (x < w/5 || x > 4*w/5) && (y > h*0.90)
+ *   - rv==1     系统判定"在底部手势区"（12 次角区实测全 1，中部 6 次全 0）
+ *   - x 收窄    12 次角区 x 落在 39-131 与 1029-1061；中部 Home 的 x 是 446-755
+ *   - y 冗余    实测角区 y 2355-2400，取 h*0.90 = 2160，留 240px 余量（防横屏定义变化）
+ *
+ * **分档**（用户拍板：先观测再动作）：
+ *   debug.hsb.native.corner = 0（默认）⇒ 只打 `corner gate` 判定日志，不改任何返回值。
+ *       目的是拿真实命中分布 + 确认判定阈值，且不承担任何行为风险。
+ *   debug.hsb.native.corner = 1 ⇒ 命中时把 rv 强改成 0（"不在底部区"）。
+ *       风险已识别：系统此前已由 match_region_check 判成底部区（返回 1），我们事后再把
+ *       这个布尔摁成 0，on_input_event 可能转而评估边缘区，而角区的 x 落在左/右边缘区
+ *       范围内 ⇒ 有可能把角滑误判成返回手势，比现状更糟。所以必须先跑 =0 看分布。
+ *       若真出误判，弃用本 lever，转 pilfer_pointers（monitor = impl+0x10，需另验两跳）。
+ *
+ * 只对 is_in_bottom_gesture_region 生效：它是唯一 x0=Impl self 的锚点，也是唯一
+ * 手里同时有"系统判定 + 坐标 + 屏幕尺寸"的点。 */
+#define HSB_CORNER_PROP "debug.hsb.native.corner"
+
+static int hsb_anchor_has_gate(const char *name) {
+    return strcmp(name, "is_in_bottom_gesture_region") == 0 ? 1 : 0;
+}
+
+/* 属性读取按 1 秒粒度缓存：__system_property_get 不是免费的，
+ * 而这个 hook 在每个输入事件上都会跑（on_input_event 的两处调用）。 */
+static uint64_t hsb_now_s(void);   /* 定义在下方，前向声明供本处使用 */
+
+static int g_corner_on;
+static uint64_t g_corner_checked_s;
+
+static int hsb_corner_enabled(void) {
+    uint64_t now = hsb_now_s();
+    if (g_corner_checked_s != now) {
+        char v[8] = {0};
+        g_corner_checked_s = now;
+        g_corner_on = __system_property_get(HSB_CORNER_PROP, v) > 0 && v[0] == '1';
+    }
+    return g_corner_on;
+}
+
+#define HSB_CORNER_EDGE_DIV 5        /* x < w/5 或 x > 4*w/5 ⇒ 角区 */
+#define HSB_CORNER_Y_RATIO 0.90f     /* y > h*0.90 ⇒ 底部带 */
+
+/*
+ * 角区判定。force=1 时命中即把 *io_rv 改成 0。
+ * x/y 走 hsb_lo32_float（低 32 位按 float，见该函数注释——AArch64 写 S 寄存器
+ * 会清零 V 高位，按 double 读整个 64 位会得次正规数）。
+ * w/h 读自 self（已实测 +0x260=宽 / +0x244=高），并做值域校验——野指针会让
+ * 这个跑在每个输入事件上的 hook 直接崩桌面，宁可不判也不能崩。
+ */
+static int hsb_corner_gate(uintptr_t self, double dx, double dy, uintptr_t rv,
+                           int force, uintptr_t *io_rv) {
+    if (rv != 1u) return 0;                     /* 系统都没判成底部区，无需收窄 */
+    const volatile int *b = (const volatile int *) self;
+    int w = b[0x260 / 4];
+    int h = b[0x244 / 4];
+    if (w <= 0 || w >= 100000 || h <= 0 || h >= 100000) return 0;
+    float x = hsb_lo32_float(dx);
+    float y = hsb_lo32_float(dy);
+    float edge = (float) w / (float) HSB_CORNER_EDGE_DIV;
+    float yband = (float) h * HSB_CORNER_Y_RATIO;
+    int hit = (x < edge || x > (float) w - edge) && (y > yband);
+    if (hit && force) *io_rv = 0u;
+    return hit;
+}
+
 /* 心跳用的单调时钟与上次出声时刻（秒） */
 static uint64_t hsb_now_s(void) {
     struct timespec ts;
@@ -393,6 +466,30 @@ static uintptr_t hsb_stub(uintptr_t a0, uintptr_t a1, uintptr_t a2, uintptr_t a3
                        ? g_orig(a0, a1, a2, a3, a4, a5, a6, a7,
                                 d0, d1, d2, d3, d4, d5, d6, d7)
                        : 0u;
+    /* ===== 3.2 角区门控 =====
+     * 只在 rv==1（系统已判底部区）时才跑判定——其余情况 hsb_corner_gate 第一行就返回 0，
+     * 提前跳过省一次属性查询和两次内存读。
+     * corner=0：命中只打 WOULD-HIT，rv 不动。目的是拿判定分布、校准阈值。
+     * corner=1：命中即把 rv 强改 0，让 on_input_event 认为"不在底部区"
+     *   ⇒ 期望系统走它自己的"区外重定向"路径，不认领、不 pilfer，流留给 spy。
+     * 只打命中行、不打 pass 行：这个 hook 跑在每个输入事件上，pass 行会把.logcat 冲爆。
+     * 强改时把系统原值一起打出来，出了事能一眼回放"系统本来判什么、我们改成了什么"。 */
+    int gate_hit = 0;
+    if (g_hook.has_gate && rv == 1u) {
+        int corner_on = hsb_corner_enabled();
+        uintptr_t orig_rv = rv;
+        gate_hit = hsb_corner_gate(a0, d0, d1, rv, corner_on, &rv);
+        if (gate_hit) {
+            if (corner_on) {
+                LOGI("corner gate FORCE x=%.1f y=%.1f sys_ret=0x%lx -> ret=0x%lx",
+                     hsb_lo32_float(d0), hsb_lo32_float(d1),
+                     (unsigned long) orig_rv, (unsigned long) rv);
+            } else {
+                LOGI("corner gate WOULD-HIT x=%.1f y=%.1f ret=0x%lx (corner=0, rv unchanged)",
+                     hsb_lo32_float(d0), hsb_lo32_float(d1), (unsigned long) orig_rv);
+            }
+        }
+    }
     if (first || quiet) {
         char detail[192];
         if (g_hook.has_args4) {
@@ -619,10 +716,12 @@ static void hsb_install_at(const HsbLauncherAnchor *a, uintptr_t at, uintptr_t b
         g_hook.has_ret = hsb_anchor_has_ret(a->name);
         g_hook.has_args4 = hsb_anchor_has_args4(a->name);
         g_hook.has_dims = hsb_anchor_has_dims(a->name);
-        LOGI("hook installed %s target=%p backup=%p size=%llu via=%s bias=%p lib=%s xy=%d ret=%d args4=%d dims=%d",
+        g_hook.has_gate = hsb_anchor_has_gate(a->name);
+        g_corner_checked_s = 0;   /* 换锚点时强制重读 corner 开关，别用上一个人的缓存 */
+        LOGI("hook installed %s target=%p backup=%p size=%llu via=%s bias=%p lib=%s xy=%d ret=%d args4=%d dims=%d gate=%d",
              a->name, (void *) at, backup, (unsigned long long) a->size, how,
              (void *) base, g_hook.lib_path, g_hook.has_xy, g_hook.has_ret,
-             g_hook.has_args4, g_hook.has_dims);
+             g_hook.has_args4, g_hook.has_dims, g_hook.has_gate);
     } else {
         g_hook.hook_failed++;
         snprintf(g_hook.reason, sizeof(g_hook.reason),
