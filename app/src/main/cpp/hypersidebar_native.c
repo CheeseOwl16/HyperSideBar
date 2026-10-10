@@ -21,6 +21,7 @@
 #include <link.h>   /* dl_iterate_phdr / struct dl_phdr_info */
 #include <elf.h>    /* ElfW(Phdr) / PT_LOAD / PF_X */
 #include <stdio.h>
+#include <stdlib.h>   /* strtoul —— loglimit 属性解析 */
 #include <stdint.h>
 #include <string.h>
 #include <jni.h>
@@ -62,6 +63,36 @@ static const char *const kReplayLibs[] = {
 };
 
 #define HSB_LOG_LIMIT 12u
+/*
+ * HIT 行的打印上限，运行期可调（2026-10-10 加）：`debug.hsb.native.loglimit <N>`。
+ * 调大的用途：密集采样时不需要改代码重编——例如角区链路归因时要看每一次
+ * `is_in_bottom_gesture_region` 的调用，12 条只够抽样。
+ * 按 1 秒粒度缓存（这个判断在每个输入事件上都会跑）。
+ * 上限 5 万：防手滑设个大值把 logcat 冲爆。 */
+#define HSB_LOGLIMIT_PROP "debug.hsb.native.loglimit"
+#define HSB_LOGLIMIT_MAX 50000u
+
+static uint64_t hsb_now_s(void);   /* 定义在下方（心率/缓存都用它），此处前向声明 */
+
+static uint32_t g_log_limit = HSB_LOG_LIMIT;
+static uint64_t g_limit_checked_s;
+
+static uint32_t hsb_log_limit(void) {
+    uint64_t now = hsb_now_s();
+    if (g_limit_checked_s != now) {
+        char v[16] = {0};
+        g_limit_checked_s = now;
+        if (__system_property_get(HSB_LOGLIMIT_PROP, v) > 0 && v[0]) {
+            unsigned long n = strtoul(v, NULL, 10);
+            if (n == 0ul) n = HSB_LOG_LIMIT;
+            if (n > HSB_LOGLIMIT_MAX) n = HSB_LOGLIMIT_MAX;
+            g_log_limit = (uint32_t) n;
+        } else {
+            g_log_limit = HSB_LOG_LIMIT;
+        }
+    }
+    return g_log_limit;
+}
 
 /* 报告结构：写入集中在加载路径（单线程），读在 JNI，无竞争 */
 static struct {
@@ -411,6 +442,29 @@ static int hsb_corner_enabled(void) {
 #define HSB_CORNER_Y_RATIO 0.90f     /* y > h*0.90 ⇒ 底部带 */
 
 /*
+ * 角区链路累计计数（2026-10-10 加）。
+ *
+ * 为什么必须加：19:15 那轮 15 次角滑只出 1 条 `corner gate FORCE`，而 FORCE 行是
+ * **无条件打印**的（不受 HSB_LOG_LIMIT 约束）⇒ 缺行就是真没命中。但"没命中"有三种
+ * 完全不同的病，旧日志里长得一模一样，无法归因：
+ *   fires 不涨      ⇒ hook 根本没被调用（系统不再走这条路，或让路已生效）
+ *   fires 涨 eval=0 ⇒ hook 在跑，但系统不再判底部区
+ *   eval 涨 hit=0   ⇒ 判定在跑，但坐标/阈值不对
+ *   hit 涨 force 不涨 ⇒ 属性没读到（缓存问题）
+ * 四个数分开，一眼定位，不用再烧一轮装机试错。
+ *
+ * 计数器只在此函数内累加，返回给调用方拼进日志。 */
+typedef struct {
+    uint32_t fires;   /* hook 被调用总次数（含没打日志的） */
+    uint32_t eval;    /* 其中 rv==1（系统判成底部区）的次数 */
+    uint32_t hit;     /* 其中命中角区的次数 */
+    uint32_t miss;    /* eval 了但没命中角区的次数 */
+    uint32_t force;   /* 其中真的强改了返回值的次数 */
+} HsbCornerStats;
+
+static HsbCornerStats g_cs;
+
+/*
  * 角区判定。force=1 时命中即把 *io_rv 改成 0。
  * x/y 走 hsb_lo32_float（低 32 位按 float，见该函数注释——AArch64 写 S 寄存器
  * 会清零 V 高位，按 double 读整个 64 位会得次正规数）。
@@ -420,17 +474,35 @@ static int hsb_corner_enabled(void) {
 static int hsb_corner_gate(uintptr_t self, double dx, double dy, uintptr_t rv,
                            int force, uintptr_t *io_rv) {
     if (rv != 1u) return 0;                     /* 系统都没判成底部区，无需收窄 */
+    __atomic_add_fetch(&g_cs.eval, 1u, __ATOMIC_RELAXED);
     const volatile int *b = (const volatile int *) self;
     int w = b[0x260 / 4];
     int h = b[0x244 / 4];
-    if (w <= 0 || w >= 100000 || h <= 0 || h >= 100000) return 0;
+    if (w <= 0 || w >= 100000 || h <= 0 || h >= 100000) {
+        __atomic_add_fetch(&g_cs.miss, 1u, __ATOMIC_RELAXED);
+        return 0;
+    }
     float x = hsb_lo32_float(dx);
     float y = hsb_lo32_float(dy);
     float edge = (float) w / (float) HSB_CORNER_EDGE_DIV;
     float yband = (float) h * HSB_CORNER_Y_RATIO;
     int hit = (x < edge || x > (float) w - edge) && (y > yband);
-    if (hit && force) *io_rv = 0u;
+    if (hit) {
+        __atomic_add_fetch(&g_cs.hit, 1u, __ATOMIC_RELAXED);
+        if (force) {
+            *io_rv = 0u;
+            __atomic_add_fetch(&g_cs.force, 1u, __ATOMIC_RELAXED);
+        }
+    } else {
+        __atomic_add_fetch(&g_cs.miss, 1u, __ATOMIC_RELAXED);
+    }
     return hit;
+}
+
+/* 把四个累计数拼成日志后缀，挂到 FORCE/WOULD-HIT 和心跳行上 */
+static void hsb_cs_suffix(char *out, size_t cap) {
+    snprintf(out, cap, " [fires=%u eval=%u hit=%u miss=%u force=%u]",
+             g_cs.fires, g_cs.eval, g_cs.hit, g_cs.miss, g_cs.force);
 }
 
 /* 心跳用的单调时钟与上次出声时刻（秒） */
@@ -458,7 +530,7 @@ static uintptr_t hsb_stub(uintptr_t a0, uintptr_t a1, uintptr_t a2, uintptr_t a3
     uint64_t now = hsb_now_s();
     uint64_t last = g_hook.last_log_s ? g_hook.last_log_s : g_hook.installed_at_s;
     int quiet = (now >= last + HSB_HEARTBEAT_S);
-    int first = __atomic_fetch_add(&g_stub_logged, 1u, __ATOMIC_RELAXED) < HSB_LOG_LIMIT;
+    int first = __atomic_fetch_add(&g_stub_logged, 1u, __ATOMIC_RELAXED) < hsb_log_limit();
     /* 先接住返回值再打日志（原来是尾部调用，返回值直接透传、打不到）。
      * 只给 has_ret 的点打——见 hsb_anchor_has_ret：其余锚点返回值无门控意义
      * （init_gesture_type 甚至被调用方整段丢弃，判定写进对象字段）。 */
@@ -475,18 +547,26 @@ static uintptr_t hsb_stub(uintptr_t a0, uintptr_t a1, uintptr_t a2, uintptr_t a3
      * 只打命中行、不打 pass 行：这个 hook 跑在每个输入事件上，pass 行会把.logcat 冲爆。
      * 强改时把系统原值一起打出来，出了事能一眼回放"系统本来判什么、我们改成了什么"。 */
     int gate_hit = 0;
-    if (g_hook.has_gate && rv == 1u) {
-        int corner_on = hsb_corner_enabled();
-        uintptr_t orig_rv = rv;
-        gate_hit = hsb_corner_gate(a0, d0, d1, rv, corner_on, &rv);
-        if (gate_hit) {
-            if (corner_on) {
-                LOGI("corner gate FORCE x=%.1f y=%.1f sys_ret=0x%lx -> ret=0x%lx",
-                     hsb_lo32_float(d0), hsb_lo32_float(d1),
-                     (unsigned long) orig_rv, (unsigned long) rv);
-            } else {
-                LOGI("corner gate WOULD-HIT x=%.1f y=%.1f ret=0x%lx (corner=0, rv unchanged)",
-                     hsb_lo32_float(d0), hsb_lo32_float(d1), (unsigned long) orig_rv);
+    if (g_hook.has_gate) {
+        __atomic_add_fetch(&g_cs.fires, 1u, __ATOMIC_RELAXED);
+        if (rv == 1u) {
+            int corner_on = hsb_corner_enabled();
+            uintptr_t orig_rv = rv;
+            gate_hit = hsb_corner_gate(a0, d0, d1, rv, corner_on, &rv);
+            if (gate_hit || g_cs.eval % 25u == 0u) {
+                /* 命中必打；另外每 25 次"系统判成底部区"补一条采样，
+                 * 这样 =1 档下也能看到中部 Home 被判定后为什么没收窄（miss 的证据）。 */
+                char sfx[96];
+                hsb_cs_suffix(sfx, sizeof(sfx));
+                if (corner_on) {
+                    LOGI("corner gate FORCE x=%.1f y=%.1f sys_ret=0x%lx -> ret=0x%lx%s",
+                         hsb_lo32_float(d0), hsb_lo32_float(d1),
+                         (unsigned long) orig_rv, (unsigned long) rv, sfx);
+                } else {
+                    LOGI("corner gate WOULD-HIT x=%.1f y=%.1f ret=0x%lx (corner=0, rv unchanged)%s",
+                         hsb_lo32_float(d0), hsb_lo32_float(d1),
+                         (unsigned long) orig_rv, sfx);
+                }
             }
         }
     }
@@ -523,12 +603,20 @@ static uintptr_t hsb_stub(uintptr_t a0, uintptr_t a1, uintptr_t a2, uintptr_t a3
             }
             strncat(detail, t, sizeof(detail) - strlen(detail) - 1);
         }
-        LOGI("%s %s #%u %s d0=%016llx d1=%016llx since_install=%llus%s",
-             first ? "hook HIT" : "hook ALIVE", anchor, n, detail,
-             (unsigned long long) hsb_bits64(d0),
-             (unsigned long long) hsb_bits64(d1),
-             (unsigned long long) (now - g_hook.installed_at_s),
-             quiet ? " (quiet)" : "");
+        if (g_hook.has_gate) {
+            /* 角区门控锚点：HIT 行带累计计数（detail 里的 x/y 已由 FORCE/WOULD-HIT
+             * 行单独打了，这里不重复，只留计数——省 logcat 宽度）。 */
+            char sfx[96];
+            hsb_cs_suffix(sfx, sizeof(sfx));
+            LOGI("%s %s #%u %s", first ? "hook HIT" : "hook ALIVE", anchor, n, sfx);
+        } else {
+            LOGI("%s %s #%u %s d0=%016llx d1=%016llx since_install=%llus%s",
+                 first ? "hook HIT" : "hook ALIVE", anchor, n, detail,
+                 (unsigned long long) hsb_bits64(d0),
+                 (unsigned long long) hsb_bits64(d1),
+                 (unsigned long long) (now - g_hook.installed_at_s),
+                 quiet ? " (quiet)" : "");
+        }
         g_hook.last_log_s = now;
     }
     return rv;
