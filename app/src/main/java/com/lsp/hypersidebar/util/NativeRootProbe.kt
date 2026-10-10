@@ -41,9 +41,14 @@ object NativeRootProbe {
     /**
      * 一次抓多少行 HSBNative。要在"够翻到安装行"与"别把整份 logcat 灌进报告"之间取平衡。
      * 之前用 60 行被 `:ui`/`sys` 每次导出刷的 `live:` 回灌行吃干净，桌面那行
-     * `hook installed` 被挤出视野；800 行对一行约 120B 也算轻。
+     * `hook installed` 被挤出视野；5000 行对一行约 120B 也算轻（过滤在 logcat 服务端做）。
+     *
+     * ⚠ 但**调大窗口治不了根**：ctor/native_init/hook installed 只在桌面进程启动那一拍各打
+     * 一次，而导出永远发生在动作之后。1016 那轮就是这么误判的——窗口里只剩导出瞬间的回灌行，
+     * ctor=0 于是被读成"没有进程加载 .so"，而手动 dump 抓得到（它在重启之后立刻抓）。
+     * 主判据永远是"重启桌面后立刻 adb logcat -d -s HSBNative:*"，本段只在窗口没滚掉时顶用。
      */
-    private const val LOG_TAIL = 800
+    private const val LOG_TAIL = 5000
 
     /** 读目标地址处多少字节做比对（与 ORIGINAL_PROLOGUE 参照长度一致） */
     private const val PROBE_BYTES = 16
@@ -77,13 +82,19 @@ object NativeRootProbe {
                 appendLine("本包编译态：$buildState")
                 appendLine("== HSBNative 窗口为空 ==")
                 appendLine(
-                    "root 抓到的 logcat 里没有一条 HSBNative 行 ⇒ 这台机器上连一个进程都没加载我们的 " +
-                        ".so（不是 prop 问题：ctor/native_init 是无门控打印，prop 关也照打）。"
+                    "root 抓到的 logcat 里没有一条 HSBNative 行 ⇒ **窗口内**没有 C 侧行。"
                 )
                 appendLine(
-                    "先确认注入：adb shell \"su -c 'cat /proc/\$(pidof com.miui.home)/maps | grep -c hypersidebar'\""
+                    "⚠ 不能据此断言\"没有进程加载我们的 .so\"：ctor/native_init/hook installed 只在桌面进程"
                 )
-                appendLine("（映射数不能证明 so 进没进——真正判据是本段有没有 ctor 行）")
+                appendLine(
+                    "启动那一拍各打一次，而导出永远发生在动作之后 ⇒ 稀疏行极可能已被主缓冲轮换掉（1016 实锤）。"
+                )
+                appendLine(
+                    "请改抓：adb shell su -c 'am force-stop com.miui.home' 之后**立刻** " +
+                        "adb shell \"su -c 'logcat -d -s HSBNative:*'\""
+                )
+                appendLine("（映射数同样不能证明 so 进没进——真正判据是窗口里有没有 ctor 行）")
             }.trimEnd()
         }
 
@@ -161,10 +172,16 @@ object NativeRootProbe {
             )
             if (ctor == 0) {
                 appendLine(
-                    "⇒ 这台机器当前没有任何进程加载我们的 .so。先验注入："
+                    "⇒ 窗口内没有 C 侧行。**不能据此下结论**：稀疏行（ctor/native_init/hook installed）"
                 )
                 appendLine(
-                    "   adb shell \"su -c 'cat /proc/\$(pidof com.miui.home)/maps | grep -c hypersidebar'\""
+                    "只在桌面进程启动那一拍打一次，导出又在动作之后 ⇒ 很可能只是滚掉了。"
+                )
+                appendLine(
+                    "先按这个抓一拍（重启后立刻抓，中间别做别的操作）："
+                )
+                appendLine(
+                    "   adb shell su -c 'am force-stop com.miui.home' && adb shell \"su -c 'logcat -d -s HSBNative:*'\""
                 )
             } else if (!hasDesktopSignal) {
                 appendLine(

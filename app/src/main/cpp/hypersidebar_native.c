@@ -370,19 +370,33 @@ static int hsb_anchor_has_args4(const char *name) {
  * 不是"识别→pilfer"主链路 ⇒ 作为角区动作函数是错的，已弃用。
  *
  * 真正的主链路（日志串实锤）：`Home gesture recognized, delay pilfer` →
- * `Home pilfer_pointers`，pilfer 的调用方全在 on_input_event 里。
- * 但直接调 pilfer_pointers(self) 也没用——它让**系统自己的 monitor** 抢流，
- * 正是要阻止的事。所以动作只能落在"分类结果"上：match_region_check 对
- * 不命中任何矩形返回 4，系统对此有设计好路径 `Down event ... outside valid
- * region, redirecting`（重定向给当前窗口、不认领、不 pilfer）。
+ * `Home pilfer_pointers`，pilfer 的调用方全在 on_input_event 里（0x7af870/0x7afd1c/0x7b133c，
+ * 三处 x0 都是 `ldr x0,[x20,#0x1d8]` = impl 里另一个对象，不是 Impl 本体）。
+ * 但直接调 pilfer_pointers 也没用——它让**系统自己的 monitor** 抢流，正是要阻止的事。
+ * 所以动作只能落在"分类结果"上：match_region_check 对不命中任何矩形返回 4，系统对此
+ * 有设计好路径 `Down event ... outside valid region, redirecting`（重定向给当前窗口、
+ * 不认领、不 pilfer）。该串由 hyper_os_ui 的 window 层消费（0x759c44，非桌面 Rust 侧）。
+ *
+ * **2026-10-10 离线补验（把 3.2 的那个风险问号关掉）**：`is_in_bottom_gesture_region`
+ * 的返回值**不是**观测用死值，它就是 on_input_event 的分类决策本身：
+ *     0x7af678  bl is_in_bottom_gesture_region
+ *     0x7af67c  mov  w23, w0              ← 返回值被接住（不是丢弃）
+ *     0x7af6e8  strb w23, [x20,#0xf9]     ← 存进 impl 字段
+ *     0x7afaa4  ldrb w8, [x20,#0xf9]
+ *     0x7afaa8  cmp  w8, #0x1
+ *     0x7afaac  b.ne <give-up 分支>
+ * 而 give-up 分支打的是 `give up: first pointer not in bottom region`（rodata 0x1da0da），
+ * 并把状态置 3。⇒ 把 rv 强改 0 不是"让系统回头去评估边缘区"，而是让它走自己那条
+ * 现成的"不在底部区 ⇒ 放弃这一击"路径——这正是"让路"要的效果，且是本函数内部的分支，
+ * 不牵动边缘/返回判定。19:15 那轮 FORCE 后同一手势在 spy 拿到完整流（k#6 SHOW）也吻合。
  *
  * 屏宽屏高从哪来（三个 lever 的差别）：
  *   is_in_bottom_gesture_region → x0=**Impl self** ⇒ 可从 self+0x244 / self+0x260
  *     读两个 int（is_point_out_of_screen 就是这么用的：fcmp x↔[+0x260]、y↔[+0x244]）
  *   match_region_check         → x0=region 结构，且不同调用点偏移不同
  *     （init_gesture_type 传 impl+0x138、is_in_bottom_* 传 impl+0x238）⇒ 推不出 Impl
- *   pilfer_pointers            → x0=monitor = impl+0x10 ⇒ 要推两跳，未验证
- * ⇒ 先确认 is_in_bottom_gesture_region 这条路的屏宽屏高，再定 lever。
+ *   pilfer_pointers            → x0=[impl+0x1d8]，是另一个对象 ⇒ 拿不到屏宽屏高
+ * ⇒ is_in_bottom_gesture_region 是唯一同时给足"分类决策 + 坐标 + 屏幕尺寸"的点。
  */
 
 /* is_in_bottom_gesture_region 专用：把 self+0x244 / self+0x260 两个 int 打出来。
@@ -408,10 +422,14 @@ static int hsb_anchor_has_dims(const char *name) {
  *   debug.hsb.native.corner = 0（默认）⇒ 只打 `corner gate` 判定日志，不改任何返回值。
  *       目的是拿真实命中分布 + 确认判定阈值，且不承担任何行为风险。
  *   debug.hsb.native.corner = 1 ⇒ 命中时把 rv 强改成 0（"不在底部区"）。
- *       风险已识别：系统此前已由 match_region_check 判成底部区（返回 1），我们事后再把
- *       这个布尔摁成 0，on_input_event 可能转而评估边缘区，而角区的 x 落在左/右边缘区
- *       范围内 ⇒ 有可能把角滑误判成返回手势，比现状更糟。所以必须先跑 =0 看分布。
- *       若真出误判，弃用本 lever，转 pilfer_pointers（monitor = impl+0x10，需另验两跳）。
+ *       ⚠ 2026-10-10 反汇编更正：原先记的风险"系统可能转而评估边缘区、把角滑误判成
+ *       返回手势"**不成立**。rv 就是 on_input_event 的分类决策本身（存 impl+0xf9），
+ *       强改 0 之后它走自己那条现成的 give-up 分支（`give up: first pointer not in
+ *       bottom region`，状态置 3），是本函数内部的分支，不牵动边缘/返回判定。
+ *       19:15 那轮实测也吻合：FORCE 后同一手势 spy 拿到完整流、k#6 SHOW。
+ *       所以 =1 的风险等级从"可能误触返回"降到"系统放弃这一击（可能连它自己的
+ *       Home 上滑也被放弃）"——后者正是本机制的目的，代价只是阈值必须准。
+ *       =0 观测档仍按原计划先跑，用它把阈值钉死，再开 =1。
  *
  * 只对 is_in_bottom_gesture_region 生效：它是唯一 x0=Impl self 的锚点，也是唯一
  * 手里同时有"系统判定 + 坐标 + 屏幕尺寸"的点。 */
