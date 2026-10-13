@@ -1215,7 +1215,12 @@ static int hsb_suppress_swallow(const HsbBackEv *e, uint64_t now_ms) {
                 /* 先按 arrowfix 把状态字节从 started 打成 0：这样原函数的 UP 支会走
                  * `state != 1` 的收尾（收箭头 + 收面板 + **不可能提交 back**，见文件末尾证据）。 */
                 int fixed = hsb_arrow_state_release();
-                g_supp_stream.active = 0;   /* 2026-10-13：recover=1（UP 放行）证明对箭头无效，已删 */
+                g_supp_stream.active = 0;
+                /* ⚠ 这一行是 arrowfix 的另一半，2026-10-13 清理 recover 档时误删过一次
+                 *（症状：FIX 照打、CLEANUP 永不出现 ⇒ 箭头残留）：UP 被我们吞掉，launcher
+                 * 自己那次"收尾调用"根本不会发生，必须由 stub 的吞分支补调一次原函数。
+                 * recover=1（UP 放行）已证明对箭头无效，那档已删。 */
+                if (fixed) g_arrow_due = 1;
             }
             g_supp.swallow_ev++;
             return 1;
