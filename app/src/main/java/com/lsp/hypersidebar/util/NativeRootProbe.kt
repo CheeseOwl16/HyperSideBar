@@ -57,14 +57,29 @@ object NativeRootProbe {
     private const val RAW_TAIL = 20
 
     /**
-     * 原始 prologue 前 16 字节 = `app/src/main/cpp/launcher_profiles.h` 的**人工镜像**，
-     * 键与 `debug.hsb.native.anchor` 白名单一致。
+     * 原始 prologue 前 16 字节 = `app/src/main/cpp/launcher_profiles.h` 的镜像
+     * （由该头文件机械提取，键与 `debug.hsb.native.anchor` 白名单一致）。
      * ⚠ C 侧 profile 若变更必须同步这里，否则会把"hook 还在"误报成"被打回"。
+     * 同步关系由 `NativePrologueMirrorTest` 守着——别再靠注释提醒。
+     *
+     * 2026-10-11 补齐：原来只有 3 个锚点（第 1 步那批），而当前门控挂的是
+     * `is_in_bottom_gesture_region` ⇒ 最该被盯活性的那个锚点**没有参照值**，
+     * 报告只会打"该锚点无 prologue 参照"，等于门控锚点的存活无从判断。现在 11 个全在表内。
      */
-    private val ORIGINAL_PROLOGUE = mapOf(
+    internal val ORIGINAL_PROLOGUE = mapOf(
         "try_delegate_back_to_sidebar" to "ff8301d1fd7b03a9f52300f9f44f05a9",
-        "on_back_cancelled" to "ffc302d1fd7b08a9f65709a9f44f0aa9",
+        "on_swipe_start" to "ff4303d1e84300fdfd7b09a9f85f0aa9",
+        "on_swipe_process" to "ff8304d1eb2b0a6de9230b6dfd7b0ca9",
         "on_back_invoke" to "ff8304d1fd7b0ca9fc6f0da9fa670ea9",
+        "on_back_cancelled" to "ffc302d1fd7b08a9f65709a9f44f0aa9",
+        "handle_back_gesture" to "eb2bb86de923016dfd7b02a9fc6f03a9",
+        "init_gesture_type" to "ff0303d1e83300fdfd7b07a9fa6708a9",
+        "is_in_bottom_gesture_region" to "ffc300d1fd7b01a9f31300f9fd430091",
+        "match_region_check" to "0800381e01020036093040b93f01086b",
+        "pilfer_pointers" to "400400b4ff8301d1fd7b04a9f32b00f9",
+        "cancel_home_gesture_to_engine" to "ff8303d1fd7b0ba9f6570ca9f44f0da9",
+        // 2026-10-12：手势终态路径入口（"取消"的第二半：箭头收尾 + 取消/提交分叉都在它下游）
+        "on_swipe_stop_direct" to "ffc301d1e82300fdfdfb04a9f52f00f9",
     )
 
     /** 导出用的一段文本（诊断页 / 日志页 / 使用数据页三条路径都收口在 `SelfCheck.export`） */
@@ -229,7 +244,8 @@ object NativeRootProbe {
             return "读到的字节不足（hex=$hex）⇒ 该地址在此进程已不可映射（进程换了新生命周期，旧 target 过期）"
         }
         val ref = anchor?.let { ORIGINAL_PROLOGUE[it] }
-            ?: return "字节=$hex（该锚点无 prologue 参照，人工比对 launcher_profiles.h）"
+            ?: return "字节=$hex（锚点 ${anchor ?: "?"} 无 prologue 参照 ⇒ 存活无法判定；" +
+                "把 launcher_profiles.h 里该锚点的前 16B 补进 ORIGINAL_PROLOGUE）"
         return if (hex.startsWith(ref))
             "⚠ 字节=$hex == 原始 prologue ⇒ hook 已被打回文件映射（madvise/remap 坐实：第 2 步之前必须上归档守卫）"
         else "✓ 字节=$hex ≠ 原始 prologue ⇒ trampoline 仍在位（抽样此刻 hook 活着）"

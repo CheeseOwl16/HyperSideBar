@@ -201,6 +201,28 @@ object ConfigSync {
      * 带令牌的广播一旦离开定向范围即等于把 root 代发防伪令牌送人。
      */
     fun sendSync(context: Context, prefs: SharedPreferences, changedKey: String? = null) {
+        // 顺带把底角几何推给 native（CornerGeomBridge）：native 门控跑在 com.miui.home，
+        // 而 OS4 上该进程没有模块 Java 半侧 ⇒ 配置同步广播到不了它，只能走系统属性。
+        // 幂等（值没变则跳过），异步不阻塞；无 root 时静默失败（native 用兜底值）。
+        runCatching { CornerGeomBridge.push(context, prefs) }
+            .onFailure { HLog.w(TAG, "corner geom push failed: ${it.message}") }
+        // 同一条通道推侧滑触发带（native 侧滑线 S3 抑制档判"带内起手"用）。
+        // 与角区那条独立：角区送比例、这条送 px，理由见 CornerGeomBridge 类注释。
+        runCatching { CornerGeomBridge.pushBand(prefs) }
+            .onFailure { HLog.w(TAG, "band geom push failed: ${it.message}") }
+        // 横竖切换后必须重推一次带（方向位在属性里，屏尺寸是竖屏归一静态值）：在这里顺手
+        // 挂上旋转监听（幂等）。不挂的话，转屏后 native 会一直按旧朝向判定（2026-10-13 修）。
+        runCatching { CornerGeomBridge.ensureRotationWatch(context, prefs) }
+            .onFailure { HLog.w(TAG, "rotation watch failed: ${it.message}") }
+        // native 桌面 hook 总闸（2026-10-14「默认化」；当晚收敛为**只写关断**）：模块开关
+        // 与"本机是不是 OS4 纯 native 桌面"合起来只决定一件事——要不要写那个免 root 的
+        // 关断 marker（`Android/media/<applicationId>/hsb_native_gate`，内容 "0"）。
+        // "开"= 删掉残留 marker（native 侧 fail-open：属性/marker 都不表态即开），
+        // 所以这里既不写属性也不用 su（真机两条属性写路都被 SELinux 拒）。
+        // ⚠ 只写通道值，**不重启任何宿主**（用户 m02478 明令）：值变化等下次桌面启动生效，
+        // 要立刻生效由用户自己重启桌面/点设置页的「重启 hook 宿主」。
+        runCatching { NativeGateBridge.push(prefs) }
+            .onFailure { HLog.w(TAG, "native gate push failed: ${it.message}") }
         runCatching {
             val map = HashMap<String, Any>()
             for ((k, v) in prefs.all) {

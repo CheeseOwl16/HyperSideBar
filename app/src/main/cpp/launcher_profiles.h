@@ -58,6 +58,21 @@ static const HsbLauncherAnchor kHsbAnchors[] = {
     {"cancel_home_gesture_to_engine", 0x78fac8, 532,
      {0xff, 0x83, 0x03, 0xd1, 0xfd, 0x7b, 0x0b, 0xa9, 0xf6, 0x57, 0x0c, 0xa9, 0xf4, 0x4f, 0x0d, 0xa9, 0xfd, 0xc3, 0x02, 0x91, 0x09, 0xf4, 0x45, 0x39, 0xe8, 0x03, 0x80, 0x52, 0xe1, 0x23, 0x00, 0xa9},
      "_RNvMNtNtCs5erksEADHS4_12app_launcher7recents7gesture21gesture_input_monitorNtB5_19GestureInputMonitor29cancel_home_gesture_to_engine"},
+    /* ---- 手势**终态路径入口**（"取消"的第二半；可作备选主锚点做观测）----
+     * 偏移/大小/prologue 取自**设备那份** libapp_launcher.so（MiuiHome.apk!lib/arm64-v8a/）的
+     * `.gnu_debugdata` 迷你调试 ELF 符号 + 实测 prologue；与 .ota-extract 那份逐字节相同。
+     * （曾经给它配过一个 hsb_stub_swipe_stop 观测桩；2026-10-13 随"判死档清理"一起删了。） */
+    {"on_swipe_stop_direct", 0x701e28, 276,
+     {0xff, 0xc3, 0x01, 0xd1, 0xe8, 0x23, 0x00, 0xfd, 0xfd, 0xfb, 0x04, 0xa9, 0xf5, 0x2f, 0x00, 0xf9, 0xf4, 0x4f, 0x06, 0xa9, 0xfd, 0x23, 0x01, 0x91, 0x08, 0x40, 0x20, 0x1e, 0x28, 0x41, 0x00, 0xd0},
+     "_RNvMs0_NtNtNtCs5erksEADHS4_12app_launcher7recents7gesture25gesture_input_back_helperNtB5_22GestureInputBackHelper20on_swipe_stop_direct"},
+    /* ---- 2026-10-13：附锚点（aux）整块删除 ----------------------------------------
+     * showSidebar(0x989c48) / SidebarEvokeHelper::is_hold_gesture_enabled(0x6bec5c) /
+     * is_sidebar_showing(0x6be304) / GestureBackArrowView::is_hold_gesture_enabled(0x784210) /
+     * SideSlideHoldAction::fallback_duration_ms(0x6bf360) 这五条只剩"官方停顿呼出侧栏"的
+     * 观测价值，而真机 `SideSlideHoldAction::read_from_settings` 读出 **None**（本机官方停顿
+     * 呼出压根没开）⇒ 观测对象不存在，判死。真机偏移与定位方法（.gnu_debugdata 抽符号 +
+     * 序言掩码比对）留档在 docs/adaptation/os4-native-hold-route-plan.md，不再占 profile。
+     * 角区（底角斜滑）那条线的锚点照旧保留，见上。 */
 };
-#define HSB_ANCHOR_COUNT 11u
+#define HSB_ANCHOR_COUNT 12u
 #define HSB_PROFILE_PROLOGUE_BYTES 32u

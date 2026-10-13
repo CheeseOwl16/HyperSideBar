@@ -72,6 +72,16 @@ static const char *const kReplayLibs[] = {
 #define HSB_LOGLIMIT_PROP "debug.hsb.native.loglimit"
 #define HSB_LOGLIMIT_MAX 50000u
 
+/*
+ * 总闸（发布档）属性名：模块 App 用同一条 su/root 属性通道推（与 `persist.hsb.band.*` /
+ * `persist.hsb.strip.*` 同款）。launcher 进程没有模块 Java 半侧、读不到模块开关，
+ * 所以"模块启用 + 本机是 OS4 native 桌面"这个结论必须由模块 App 写进属性。
+ * `debug.hsb.native.hook` 仍可覆盖它（排障/压测用，重启即清）。
+ * 真机上 property 的两条免-su 写路都被 SELinux 拒（见 plan §17），所以另有一条**免 root
+ * 文件 marker** 关断通道与它**并联**（任一显式 "0" 即关）。
+ */
+#define HSB_ENABLE_PROP "persist.hsb.native.hook"
+
 static uint64_t hsb_now_s(void);   /* 定义在下方（心率/缓存都用它），此处前向声明 */
 
 static uint32_t g_log_limit = HSB_LOG_LIMIT;
@@ -125,6 +135,8 @@ static void note_process(void) {
 
 static void hsb_try_install_hooks(void);
 static int hsb_prop_enabled(void);
+/* 段查询与坐标小工具（定义在扫描段，但附锚点的日志要用它算 `lib+0x…`） */
+static int hsb_in_exec(uintptr_t addr, size_t len);
 
 static int hsb_leaf_is_target(const char *name) {
     if (!name) return 0;
@@ -135,15 +147,14 @@ static int hsb_leaf_is_target(const char *name) {
     return strcmp(leaf, kTargetLib) == 0;
 }
 
-static uint32_t g_cb_logged;
-
 static void on_module_loaded(const char *name, void *handle) {
     g_report.callback_calls++;
     (void)handle;
     /* 总闸/prop 关=与冻结线完全一致：只计数，不打日志、不比对名字、不装 hook */
     if (!hsb_prop_enabled()) return;
-    /* 回调名取证（限量）：框架是否把桌面的原生库加载也报给我们 = 之后每拍重试的钩子 */
-    if (g_cb_logged++ < HSB_LOG_LIMIT) LOGI("dlopen cb: %s", name ? name : "(null)");
+    /* ⚠ 不逐库打日志：注入了模块的所有进程每次 dlopen 都会回调到这里（真机一轮几百行
+     * `dlopen cb:` 把 logcat 冲爆）。框架有没有把桌面原生库的加载报给我们，看
+     * `launcher_cb=` 计数与 `hook installed …` 行即可。 */
     if (hsb_leaf_is_target(name)) {
         g_report.launcher_cb_hits++;
         hsb_try_install_hooks();
@@ -174,11 +185,12 @@ static void probe_dtor(void) {
  * 开法：`adb shell su -c 'setprop debug.hsb.native.hook 1'` 后重启桌面。关=完全不做任何事
  * （连 maps/phdr 都不扫），所以冻结线/发版包带这段代码也无风险。
  *
- * 本步只证明四件事：地址解析对、inline hook 装得上且不掉、日志能出、桌面不崩。
- * 故只挂 profile 里最小的那一个锚点（try_delegate_back_to_sidebar，188B、非热路径），
- * 并刻意**先不做 madvise 守卫**——那正是本步要验的风险（参考工程认为缺它会被 HYOS 的
- * madvise 把 hook 页打回文件映射而"神秘失效"）。判据含"30 分钟后 hits 仍在增长"；
- * 若停滞则照抄参考实现补守卫。
+ * 本步当时只证明四件事：地址解析对、inline hook 装得上且不掉、日志能出、桌面不崩；
+ * 那时刻意**不做 madvise 守卫**，因为那正是本步要验的风险（参考工程认为缺它会被 HYOS 的
+ * madvise 把 hook 页打回文件映射而"神秘失效"）。**2026-10-14 更新**：主锚点已固定为
+ * `handle_back_gesture`（见下方"主锚点编译期默认值"一段），探路期只挂
+ * try_delegate_back_to_sidebar 的做法已废弃；madvise 守卫仍未加，但真机连续跑满整轮手势
+ * （每次停顿都命中 HIT/SUPPRESS/FIX）未见掉钩，故暂不补。
  *
  * 门控复盘（2026-10-08 实机首轮）：原来把安装条件写成 `replay_mask & 1`，日志给出
  * `replay: libapp_launcher.so absent` + `runs=0` ⇒ 安装代码从未跑过。裸 soname 的
@@ -192,13 +204,32 @@ static void probe_dtor(void) {
  * hook_func 返回 0 且 backup 非空。任一不满足 ⇒ 换下一个候选或拒绝安装并记原因（桌面 OTA
  * remap 后表现为"不 hook"而不是崩桌面）。
  */
-#define HSB_ONLY_ANCHOR "try_delegate_back_to_sidebar"
+/*
+ * 主锚点**编译期默认值**（2026-10-14 晚改，真机 logcat 实证的必要修正）：
+ * 只能是侧滑停顿线的生产挂点 handle_back_gesture（side-only 物理流边界），不能是
+ * 第 1 步的探路点 try_delegate_back_to_sidebar —— 后者只在"back 走到委托分叉"时才被调用，
+ * 停顿手势根本走不到那里 ⇒ 主桩（计数 + 停顿抑制 + arrowfix）一次都不会被调用。
+ * 为什么必须是**编译期默认**而不是属性：`debug.hsb.native.anchor` 是易失属性，
+ * 重启即清（真机日志 `debug=-`），而写侧收敛后模块已不再推任何属性 ⇒ 若默认仍是探路点，
+ * 每次重启功能都静默失效（用户要看的是"装上就能用"）。属性仍可覆盖（调试用）。
+ *
+ * 历史：本常量原名 HSB_ONLY_ANCHOR = 白名单里"唯一敢装"的那个点；现已扩容为白名单 + 默认点。
+ */
+#define HSB_ONLY_ANCHOR "handle_back_gesture"
 #define HSB_MAX_SEGS 16u
 #define HSB_MAX_CANDS 8u
 #define HSB_MAX_ATTEMPTS 12u
 #define HSB_HEARTBEAT_S 60ull
 #define HSB_PROLOGUE_BYTES HSB_PROFILE_PROLOGUE_BYTES
 #define HSB_ANCHOR_PROP "debug.hsb.native.anchor"
+/*
+ * 第二锚点（2026-10-11 角区双锚点方案）：动作锚点 pilfer_pointers（0x78d2d4，140B，
+ * 唯一有效调用是 AOSP `InputMonitor.pilferPointers()`）**只吃 self（InputMonitor）、
+ * 没有坐标**；坐标必须由主锚点 init_gesture_type（DOWN 拍，(x,y)∈s0/s1）锁存 ⇒ 同时装两个。
+ * `debug.hsb.native.anchor2 pilfer_pointers` 装上动作桩；缺省空 = 不装第二锚点（回现状）。
+ * 名单只认 pilfer_pointers（见 hsb_chosen_anchor2）——它没有返回值语义，桩只做拦截。
+ */
+#define HSB_ANCHOR2_PROP "debug.hsb.native.anchor2"
 
 /*
  * 可换的挂点白名单（2026-10-08 加，2026-10-09 第 2 步扩容）：装机轮稀缺，
@@ -226,6 +257,18 @@ static const char *const kHsbAnchorWhitelist[] = {
     /* --- 第 3 步 3.1：动作函数签名验证（log-only，不调用）--- */
     "cancel_home_gesture_to_engine",  /* 532B，反汇编定签名 (x0=self+0x10, x1=rodata 串, x2, x3) */
     "pilfer_pointers",                /* 140B，1 参 (x0=self)，null 即返回 */
+    /* --- 2026-10-12：侧滑停顿线（GestureInputBackHelper 家族）---
+     * 之前只在 launcher_profiles.h（profile）里、白名单没有 ⇒ 选它会被静默忽略、
+     * 回落默认锚点。侧滑线 S1/S2 需要这两个点：handle_back_gesture 是参考实现
+     * （MiuiBackGestureHook/4371）实证的 **side-only 边界**（底部 Home 不经过它）；
+     * on_swipe_process 用于后链路抑制。两者 prologue 均在 profile，fail-closed 兜底。 */
+    "handle_back_gesture",            /* 8364B，side-only 完整物理流边界（参考实证） */
+    "on_swipe_process",               /* 3380B，手势进度（后链路抑制用） */
+    /* --- 2026-10-12：手势**终态路径入口**（"取消"的第二半）---
+     * pilfer 的 CANCEL 到达 launcher 后真正干活的就是它：本函数 → GesturesBackCallback::
+     * on_swipe_stop_direct → GestureBackArrowView::on_swipe_stop → cancel_arrow_animator（箭头退出），
+     * 再接 try_delegate_back_to_sidebar（取消/提交分叉）。调 on_back_cancelled 只做了第一半。 */
+    "on_swipe_stop_direct",           /* 276B，终态路径入口（观测/将来的"取消"落点） */
     NULL,
 };
 
@@ -236,6 +279,17 @@ static const char *hsb_chosen_anchor(void) {
         if (strcmp(v, kHsbAnchorWhitelist[i]) == 0) return kHsbAnchorWhitelist[i];
     }
     return HSB_ONLY_ANCHOR;   /* 名单外的值=忽略，仍用默认点（不猜） */
+}
+
+/* 第二锚点 = **只支持** `pilfer_pointers`（底角斜滑的角区动作位；2026-10-13 清理后
+ * on_back_cancelled / try_delegate_back_to_sidebar / on_swipe_stop_direct 三个观测/门控位
+ * 已全部删除——真机已判死，留着只会让人误以为还有开关）。
+ * 空/其它值 = 不装第二锚点（不猜）。 */
+static const char *hsb_chosen_anchor2(void) {
+    char v[64] = {0};
+    if (__system_property_get(HSB_ANCHOR2_PROP, v) <= 0 || !v[0]) return NULL;
+    if (strcmp(v, "pilfer_pointers") == 0) return "pilfer_pointers";
+    return NULL;
 }
 
 typedef uintptr_t (*HsbFn16)(uintptr_t a0, uintptr_t a1, uintptr_t a2, uintptr_t a3,
@@ -262,6 +316,7 @@ static struct {
     uint32_t matches_maps;    /* maps 里目标库可执行段条数 */
     uint32_t prologue_checked;
     uint32_t prologue_mismatch;
+    uint32_t prologue_masked;     /* 靠「PC 相对字段掩码」才通过的锚点数（>0=跨版本漂移，属正常） */
     uint32_t sig_scans;           /* 走特征扫描兜底的次数（偏移路全崩才走） */
     uint32_t sig_hits;            /* 最近一次特征扫描的命中数（≠1 一律不用） */
     uint32_t hook_installed;
@@ -280,10 +335,19 @@ static struct {
     int has_args4;            /* 签名验证轮 ⇒ 日志打全 a0-a3（见 hsb_anchor_has_args4） */
     int has_dims;             /* 日志打 self+0x244/+0x260 两个 int（见 hsb_anchor_has_dims） */
     int has_gate;             /* 跑角区门控（见 hsb_anchor_has_gate） */
+    int has_latch;            /* DOWN 锁存角区（见 hsb_anchor_has_latch） */
+    int has_back_event;       /* 以 event(x1) 传 MotionEvent，读权威坐标（见 hsb_anchor_has_back_event） */
 } g_hook;
 
 static HsbFn16 g_orig;
 static volatile uint32_t g_stub_logged;
+/* 第二锚点（动作位 pilfer_pointers）：独立的 backup 与存活标志 */
+static HsbFn16 g_orig_pilfer;
+static uint32_t g_hook2_installed;
+static char g_hook2_name[40];
+/* rv != 1 采样行的限流计数（独立于 g_stub_logged/g_cs.eval：那两者在 rv 恒 0 时都不涨，
+ * 用它做限流会变成"永远只打第 1 条"或"一条都不打"）。 */
+static volatile uint32_t g_rv_logged;
 
 /* 该锚点是否以 s0/s1 传坐标（决定日志要不要打 x/y；见 HsbFn16 的注释） */
 static int hsb_anchor_has_xy(const char *name) {
@@ -412,11 +476,11 @@ static int hsb_anchor_has_dims(const char *name) {
  * 与 is_point_out_of_screen 的用法一致。所以三个输入（is_in_bottom_gesture_region 的
  * 返回值、坐标 s0/s1、屏幕尺寸）全在同一个 hook 里，不需要跨进程也不需要额外挂点。
  *
- * 门控判据：
- *     命中 = (rv == 1) && (x < w/5 || x > 4*w/5) && (y > h*0.90)
+ * 门控判据（几何见下方 hsb_corner_geom，与 :ui 同源；下式为属性缺失时的兜底）：
+ *     命中 = (rv == 1) && (x < cornerW || x > w - cornerW) && (y > h - hotH)
  *   - rv==1     系统判定"在底部手势区"（12 次角区实测全 1，中部 6 次全 0）
  *   - x 收窄    12 次角区 x 落在 39-131 与 1029-1061；中部 Home 的 x 是 446-755
- *   - y 冗余    实测角区 y 2355-2400，取 h*0.90 = 2160，留 240px 余量（防横屏定义变化）
+ *   - y 收窄    实测角区 y 2355-2400 ⇒ 底部带；兜底取 h*0.90 = 2160，留 240px 余量
  *
  * **分档**（用户拍板：先观测再动作）：
  *   debug.hsb.native.corner = 0（默认）⇒ 只打 `corner gate` 判定日志，不改任何返回值。
@@ -434,9 +498,26 @@ static int hsb_anchor_has_dims(const char *name) {
  * 只对 is_in_bottom_gesture_region 生效：它是唯一 x0=Impl self 的锚点，也是唯一
  * 手里同时有"系统判定 + 坐标 + 屏幕尺寸"的点。 */
 #define HSB_CORNER_PROP "debug.hsb.native.corner"
+/* 双锚点方案开关（2026-10-11）：=1 启用"init_gesture_type 锁存 + pilfer_pointers 拦截"。
+ * 与 HSB_CORNER_PROP（旧 FORCE 档）独立：旧档降级为纯观测，新档才是动作。 */
+#define HSB_CORNER2_PROP "debug.hsb.native.corner2"
 
 static int hsb_anchor_has_gate(const char *name) {
     return strcmp(name, "is_in_bottom_gesture_region") == 0 ? 1 : 0;
+}
+
+/* init_gesture_type：DOWN 拍、(x,y)∈s0/s1（`fmov s8,s0`+`stp s0,s1`，2026-10-11 反汇编坐实）
+ * ⇒ 角区锁存点（见 hsb_latch_down）。它同时是 match_region_check 的调用者，self 即 monitor impl，
+ * +0x244/+0x260 就是屏高/宽。 */
+static int hsb_anchor_has_latch(const char *name) {
+    return strcmp(name, "init_gesture_type") == 0 ? 1 : 0;
+}
+
+/* handle_back_gesture(self=x0, event=x1)：x1 是可读 MotionEvent（对 x1 调
+ * `input_MotionEvent_getActionMasked@plt`，2026-10-12 反汇编坐实）⇒ 用同族 getter 读**权威坐标**。
+ * 侧滑线（GestureInputBackHelper 家族）的确认层要用它，见 hsb_back_event_log。 */
+static int hsb_anchor_has_back_event(const char *name) {
+    return strcmp(name, "handle_back_gesture") == 0 ? 1 : 0;
 }
 
 /* 属性读取按 1 秒粒度缓存：__system_property_get 不是免费的，
@@ -456,28 +537,134 @@ static int hsb_corner_enabled(void) {
     return g_corner_on;
 }
 
-#define HSB_CORNER_EDGE_DIV 5        /* x < w/5 或 x > 4*w/5 ⇒ 角区 */
-#define HSB_CORNER_Y_RATIO 0.90f     /* y > h*0.90 ⇒ 底部带 */
+/*
+ * 角区几何**不再写死**（2026-10-11）：原先 native 用 `W/5`、:ui 的 CornerTrigger 用
+ * `W×cornerWidthRatio`（默认 0.12），两边各自一份常量 ⇒ 左角 x∈(129.6, 216) 这段
+ * native 判"是角区"并让系统放弃这一击、:ui 却因 `x > cornerWidth` 不 claim，
+ * 手势被吞（扇形和 Home 都没有）。而且用户拖角区宽度滑条会让这段死带实时变宽。
+ *
+ * 现在由 Java 侧把**与 CornerTrigger 同一份值**写进属性（传比例，像素在这里算），
+ * native 用它自己从 Impl self 读到的 w/h 换算：
+ *   persist.hsb.corner.w_ratio  角区宽 / 屏宽（浮点）；判定用 `x <= w*ratio` 或其右镜像
+ *   persist.hsb.corner.hot_pct  底部热区高 / 屏高的百分比（浮点）；判定用 `y >= h - h*pct/100`
+ * 属性缺失/非法 ⇒ 回落兜底值。兜底取**合法配置里最窄的一侧**（宽 10% 屏宽、
+ * 热区 3% 屏高 = :ui 两个滑条的下限）：属性没送达时 native 只会少覆盖一点
+ * （少让路一次，扇形照旧），**绝不会**出现"native 吞了、:ui 不认"的死带；
+ * 反过来若兜底取宽值，用户把 :ui 滑条拉到最窄时立刻产生死带。
+ * 死带不可完全消除：:ui 改滑条到 native 缓存刷新之间有一拍差异（属性 1 秒粒度），
+ * 但稳态下两侧同源。 */
+/* 用 persist. 前缀而不是 debug.：debug.* 每次重启被清空，而 Java 侧只在"用户改设置"
+ * 时推一次 ⇒ 用 debug. 的话重启后这里永远只能读到兜底值，用户设的角区宽度静默失效。
+ * persist. 由 init 落盘并在开机回灌，写一次长期有效。
+ *
+ * ⚠ 传**比例**而不是像素（2026-10-11 实机踩坑）：先前 Java 侧自己按 WindowManager
+ * 算像素，结果把 max/min 用反了（写出 2400×0.18=432 而非 1080×0.18=194），而屏宽
+ * 在横竖屏/折叠/多窗下本来就不该由另一个进程代算。这里读 w/h 的来源是 Impl self
+ * （+0x260/+0x244），与手势引擎同源，权威。 */
+#define HSB_CORNER_W_PROP "persist.hsb.corner.w_ratio"    /* 浮点：角区宽 / 屏宽 */
+#define HSB_CORNER_HOT_PROP "persist.hsb.corner.hot_pct"  /* 浮点：底部热区高 / 屏高的百分比 */
 
+#define HSB_CORNER_W_FALLBACK_RATIO 0.10f   /* = CORNER_WIDTH_RATIO_MIN */
+#define HSB_CORNER_HOT_FALLBACK_PCT 3.0f    /* = CORNER_HOT_PERCENT_MIN */
+
+/* 属性读取按 1 秒粒度缓存：__system_property_get 不是免费的，
+ * 而这个 hook 在每个输入事件上都会跑（on_input_event 的两处调用）。 */
+static float g_corner_w_px;
+static float g_corner_hot_px;
+static uint64_t g_geom_checked_s;
+
+/* 读一个 [lo, hi] 内的浮点属性；缺失/非法/越界/NaN 一律返回 dflt（不猜） */
+static float hsb_prop_float(const char *key, float lo, float hi, float dflt) {
+    char v[16] = {0};
+    if (__system_property_get(key, v) <= 0 || !v[0]) return dflt;
+    char *end = NULL;
+    float f = strtof(v, &end);
+    if (end == v) return dflt;
+    if (!(f >= lo && f <= hi)) return dflt;   /* NaN 也会落进这里 */
+    return f;
+}
+
+/*
+ * 刷新角区几何（属性驱动）并打一行。返回 0 = self 的 w/h 读不出来。
+ *
+ * ⚠ 必须**无条件调用**（每次 hook 命中都调，独立于 rv）：原来它只在 rv==1 分支里跑，
+ * 而实测出现过整轮 rv 恒 0 ⇒ 连"属性到底写没写进去"都看不到，只能靠猜。
+ * 内部按 1 秒粒度缓存属性读取，热路径成本只有两次 int 读。
+ */
+static int g_geom_w_off = -1;
+static int g_geom_h_off = -1;
+
+/* 屏宽/高在 self 上的偏移**随锚点结构而变**（2026-10-11 真机实锤）：
+ *  - is_in_bottom_gesture_region 的 self = GestureInputMonitorImpl 本体 ⇒ w/h 在 +0x260/+0x244
+ *    （◪ 22:23 那轮已坐实 2400/1080）；
+ *  - init_gesture_type 的 self = GestureInputMonitor，它是 Impl 的**子对象**：
+ *    dispatch_to_inner_monitor 里 `x2=0 ⇒ x21 = Impl+0x100`、`x0 = x21+0x10 = Impl+0x110`
+ *    ⇒ Monitor = Impl + 0x110 ⇒ w/h 在 +0x150/+0x134。
+ * 首轮真机就是这么挂的：latch 用 Impl 偏移读 Monitor ⇒ w/h 非法 ⇒ hsb_corner_geom 早期返回
+ * （连 `corner geom` 都不打）⇒ corner 恒 0（日志里 x=82.6 明明是左角却 corner=0）。
+ * 所以偏移必须由调用方给，不能写死。 */
+#define HSB_DIMS_W_IMPL 0x260
+#define HSB_DIMS_H_IMPL 0x244
+#define HSB_DIMS_W_MON  0x150   /* = Impl+0x260 - 0x110 */
+#define HSB_DIMS_H_MON  0x134   /* = Impl+0x244 - 0x110 */
+
+static int hsb_corner_geom(uintptr_t self, int w_off, int h_off) {
+    const volatile int *b = (const volatile int *) self;
+    int w = b[w_off / 4];
+    int h = b[h_off / 4];
+    if (w <= 0 || w >= 100000 || h <= 0 || h >= 100000) return 0;
+    uint64_t now = hsb_now_s();
+    if (g_geom_checked_s == now && g_geom_w_off == w_off && g_geom_h_off == h_off) return 1;
+    g_geom_checked_s = now;
+    g_geom_w_off = w_off;
+    g_geom_h_off = h_off;
+    /* 比例取 [0.02, 0.50] / [1, 50]：越界或非数字一律回落兜底（不猜）。
+     * 上限同时挡住"属性写坏把整个屏幕变成角区"。 */
+    float wr = hsb_prop_float(HSB_CORNER_W_PROP, 0.02f, 0.50f, HSB_CORNER_W_FALLBACK_RATIO);
+    float hp = hsb_prop_float(HSB_CORNER_HOT_PROP, 1.0f, 50.0f, HSB_CORNER_HOT_FALLBACK_PCT);
+    g_corner_w_px = (float) w * wr;
+    g_corner_hot_px = (float) h * hp / 100.0f;
+    /* 几何每次刷新打一行（1 秒粒度，低频）：装错属性/回落兜底都当场可见，
+     * 免得"native 判命中、:ui 不认"这种两侧口径不一致要靠猜。**offsets 也打**——
+     * 首轮真机就是"读不到 w/h 却连一行都没有"，偏移错了完全不可见。 */
+    LOGI("corner geom w=%d h=%d cornerW=%.1f hot=%.1f (off w=+0x%x h=+0x%x prop w_ratio=%.4f hot_pct=%.2f)",
+         w, h, g_corner_w_px, g_corner_hot_px, w_off, h_off, wr, hp);
+    return 1;
+}
 /*
  * 角区链路累计计数（2026-10-10 加）。
  *
- * 为什么必须加：19:15 那轮 15 次角滑只出 1 条 `corner gate FORCE`，而 FORCE 行是
- * **无条件打印**的（不受 HSB_LOG_LIMIT 约束）⇒ 缺行就是真没命中。但"没命中"有三种
- * 完全不同的病，旧日志里长得一模一样，无法归因：
- *   fires 不涨      ⇒ hook 根本没被调用（系统不再走这条路，或让路已生效）
- *   fires 涨 eval=0 ⇒ hook 在跑，但系统不再判底部区
- *   eval 涨 hit=0   ⇒ 判定在跑，但坐标/阈值不对
- *   hit 涨 force 不涨 ⇒ 属性没读到（缓存问题）
- * 四个数分开，一眼定位，不用再烧一轮装机试错。
+ * 为什么必须加：19:15 那轮 15 次角滑只出 1 条 `corner gate FORCE`。命中行本身是**无条件
+ * 打印**的（不受 HSB_LOG_LIMIT 约束，另外第 1 次 eval 与每 25 次 eval 各补一条采样行，
+ * 见下方 gate 日志）。但"没命中"有好几种完全不同的病，旧日志里长得一模一样，无法归因：
+ *   fires 不涨        ⇒ hook 根本没被调用（系统不再走这条路，或让路已生效）
+ *   fires 涨 eval=0   ⇒ hook 在跑，但系统不再判底部区
+ *   eval 涨 hit=0     ⇒ 判定在跑，但坐标不在角区（阈值问题）；若同时 bad 涨，那是 self 的
+ *                        w/h 读不到（偏移/野指针），与阈值无关
+ *   hit 涨 force 不涨 ⇒ 只有 corner=1 档才是"属性没读到"；corner=0 档本来就该如此
+ * 六个数分开，一眼定位，不用再烧一轮装机试错。
  *
- * 计数器只在此函数内累加，返回给调用方拼进日志。 */
+ * ⚠ 计数是**桌面进程生命周期内累计**，全程不复位（含 corner 0→1 切换）。所以 A/B 两档
+ * 必须各自重启桌面后再读；同一进程里换档读到的数是两档的叠加，会把"命中但没 force"
+ * 误读成"属性没读到"。
+ *
+ * fires 在 hsb_stub 里累加（仅 has_gate 的锚点），其余在 hsb_corner_gate 里累加；
+ * 返回给调用方拼进日志。 */
 typedef struct {
-    uint32_t fires;   /* hook 被调用总次数（含没打日志的） */
+    uint32_t fires;   /* hook 被调用总次数（含没打日志的）。⚠ 门控锚点下它与 g_hook.hits
+                       * 恒等（同一个桩、同一个 has_gate 条件）——报告里的 hits= 和这里的
+                       * fires= 是同一个数，别当两个独立读数去对账。分开留着是为了将来
+                       * 门控扩到多锚点时 fires 仍只算门控那部分。 */
     uint32_t eval;    /* 其中 rv==1（系统判成底部区）的次数 */
     uint32_t hit;     /* 其中命中角区的次数 */
     uint32_t miss;    /* eval 了但没命中角区的次数 */
     uint32_t force;   /* 其中真的强改了返回值的次数 */
+    uint32_t bad;     /* eval 了但 self 的 w/h 读不出来（偏移错/野指针）——与"不在角区"分开计 */
+    uint32_t skip;    /* eval 了但横屏 ⇒ 不判（对齐 :ui 只做竖屏）。单独一档，否则横屏的
+                       * eval 落不进 hit/miss/bad 任何一格，六数分区不自洽 */
+    uint32_t latch;          /* init_gesture_type 锁存 DOWN 的次数（双锚点方案，见 hsb_latch_down） */
+    uint32_t pilfer_blocked; /* pilfer_pointers 被拦（锁存=角区）的次数 */
+    uint32_t pilfer_passed;  /* pilfer_pointers 透传的次数 */
 } HsbCornerStats;
 
 static HsbCornerStats g_cs;
@@ -489,22 +676,35 @@ static HsbCornerStats g_cs;
  * w/h 读自 self（已实测 +0x260=宽 / +0x244=高），并做值域校验——野指针会让
  * 这个跑在每个输入事件上的 hook 直接崩桌面，宁可不判也不能崩。
  */
+/* why_out 回填未命中的原因（1=坐标不在角区 2=横屏跳过 3=dims 读不出），仅用于日志标签；
+ * 不参与判定。传 NULL 表示调用方不关心。 */
 static int hsb_corner_gate(uintptr_t self, double dx, double dy, uintptr_t rv,
-                           int force, uintptr_t *io_rv) {
+                           int force, uintptr_t *io_rv, int *why_out) {
     if (rv != 1u) return 0;                     /* 系统都没判成底部区，无需收窄 */
     __atomic_add_fetch(&g_cs.eval, 1u, __ATOMIC_RELAXED);
+    /* 几何已由调用方（hsb_stub）无条件刷新过；这里只为拿 w/h 做横屏与判定。
+     * 再调一次是幂等的（1 秒缓存），保证不依赖调用顺序。 */
+    if (!hsb_corner_geom(self, HSB_DIMS_W_IMPL, HSB_DIMS_H_IMPL)) {
+        __atomic_add_fetch(&g_cs.bad, 1u, __ATOMIC_RELAXED);
+        if (why_out) *why_out = 3;
+        return 0;
+    }
     const volatile int *b = (const volatile int *) self;
-    int w = b[0x260 / 4];
-    int h = b[0x244 / 4];
-    if (w <= 0 || w >= 100000 || h <= 0 || h >= 100000) {
-        __atomic_add_fetch(&g_cs.miss, 1u, __ATOMIC_RELAXED);
+    int w = b[HSB_DIMS_W_IMPL / 4];
+    int h = b[HSB_DIMS_H_IMPL / 4];
+    /* 横屏不门控：:ui 的 CornerTrigger.onDown 对 `screenW >= screenH` 直接返回 false
+     * （横屏触发整体走 B 路线），所以横屏下 native 若照判照让路，就是"吞了系统 Home、
+     * :ui 又不会呼出扇形"的同款死带。这里对齐它的前置条件——只判竖屏。 */
+    if (w >= h) {
+        __atomic_add_fetch(&g_cs.skip, 1u, __ATOMIC_RELAXED);
+        if (why_out) *why_out = 2;
         return 0;
     }
     float x = hsb_lo32_float(dx);
     float y = hsb_lo32_float(dy);
-    float edge = (float) w / (float) HSB_CORNER_EDGE_DIV;
-    float yband = (float) h * HSB_CORNER_Y_RATIO;
-    int hit = (x < edge || x > (float) w - edge) && (y > yband);
+    float edge = g_corner_w_px;
+    float yband = (float) h - g_corner_hot_px;
+    int hit = (x <= edge || x >= (float) w - edge) && (y >= yband);
     if (hit) {
         __atomic_add_fetch(&g_cs.hit, 1u, __ATOMIC_RELAXED);
         if (force) {
@@ -513,14 +713,17 @@ static int hsb_corner_gate(uintptr_t self, double dx, double dy, uintptr_t rv,
         }
     } else {
         __atomic_add_fetch(&g_cs.miss, 1u, __ATOMIC_RELAXED);
+        if (why_out) *why_out = 1;
     }
     return hit;
 }
 
-/* 把四个累计数拼成日志后缀，挂到 FORCE/WOULD-HIT 和心跳行上 */
+/* 把累计数拼成日志后缀，挂到 FORCE / WOULD-HIT / MISS 与心跳行上 */
 static void hsb_cs_suffix(char *out, size_t cap) {
-    snprintf(out, cap, " [fires=%u eval=%u hit=%u miss=%u force=%u]",
-             g_cs.fires, g_cs.eval, g_cs.hit, g_cs.miss, g_cs.force);
+    snprintf(out, cap,
+             " [fires=%u eval=%u hit=%u miss=%u bad=%u skip=%u force=%u latch=%u pblk=%u ppass=%u]",
+             g_cs.fires, g_cs.eval, g_cs.hit, g_cs.miss, g_cs.bad, g_cs.skip, g_cs.force,
+             g_cs.latch, g_cs.pilfer_blocked, g_cs.pilfer_passed);
 }
 
 /* 心跳用的单调时钟与上次出声时刻（秒） */
@@ -529,6 +732,673 @@ static uint64_t hsb_now_s(void) {
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t) ts.tv_sec;
 }
+
+/* 同源毫秒时钟（侧滑线 S3 判"事件间停顿"要用毫秒粒度；秒粒度分辨不出 250ms 停顿） */
+static uint64_t hsb_now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t) ts.tv_sec * 1000ull + (uint64_t) (ts.tv_nsec / 1000000L);
+}
+
+/* ===== 角区 DOWN 锁存 + pilfer 拦截（2026-10-11 双锚点方案）=====
+ *
+ * 为什么这么拆（离线反汇编 + 前几轮实机结论）：
+ *  - 旧方案把动作落在 is_in_bottom_gesture_region（monitor 路的下游分类），
+ *    它是**被别处消费的区域查询**（DOWN 存 self+0xf9，又被 retarget_bottom_region 写同一字段），
+ *    且必须 rv==1（DOWN 落进系统那个底部矩形）才动 ⇒ "多数不触发"；
+ *    而且它每个事件都调、坐标是 live 点 ⇒ "左中右 xy 差不多"。
+ *  - 真正"让系统放手"的执行点是 pilfer_pointers（=AOSP InputMonitor.pilferPointers，
+ *    3 个调用点全走它），但它只吃 self、没坐标 ⇒ 坐标由 init_gesture_type 锁存。
+ *  ⇒ 观测（坐标+角区）与动作（拦抢流）解耦：各锚点改动面最小、互不污染。
+ */
+static int hsb_corner2_enabled(void) {
+    static uint64_t checked_s;
+    static int on;
+    uint64_t now = hsb_now_s();
+    if (checked_s != now) {
+        char v[8] = {0};
+        checked_s = now;
+        on = __system_property_get(HSB_CORNER2_PROP, v) > 0 && v[0] == '1';
+    }
+    return on;
+}
+
+typedef struct {
+    uint64_t at_s;    /* 锁存时刻（CLOCK_MONOTONIC 秒）；过期即失效（防 init_gesture_type 漏调时留脏值） */
+    float x;
+    float y;
+    int corner;       /* 锁存的 DOWN 是否落在角区 */
+    int valid;
+} HsbLatch;
+static HsbLatch g_latch;
+#define HSB_LATCH_TTL_S 2ull
+
+/* 角区判定（与 hsb_corner_gate 同源，只是 self 是 GestureInputMonitor ⇒ 用 Monitor 偏移） */
+static int hsb_latch_corner_at(uintptr_t self, float x, float y) {
+    if (!hsb_corner_geom(self, HSB_DIMS_W_MON, HSB_DIMS_H_MON)) {
+        /* 读不到 w/h（偏移错 / self 结构不符）：**必须出声**。否则 corner 恒 0 且日志里连一行
+         * 都没有——首轮真机就是这么静默失败的（x=82.6 明明是左角却 corner=0，无任何线索）。 */
+        static uint32_t logged;
+        uint32_t n = __atomic_add_fetch(&logged, 1u, __ATOMIC_RELAXED);
+        if (n == 1u || n % 20u == 0u) {
+            LOGI("corner latch NO-DIMS (self+0x%x/+0x%x unreadable) x=%.1f y=%.1f",
+                 HSB_DIMS_W_MON, HSB_DIMS_H_MON, x, y);
+        }
+        return 0;
+    }
+    const volatile int *b = (const volatile int *) self;
+    int w = b[HSB_DIMS_W_MON / 4];
+    int h = b[HSB_DIMS_H_MON / 4];
+    if (w >= h) return 0;                       /* 横屏不接管，与 :ui CornerTrigger 对齐 */
+    float edge = g_corner_w_px;
+    float yband = (float) h - g_corner_hot_px;
+    return (x <= edge || x >= (float) w - edge) && (y >= yband);
+}
+
+/* init_gesture_type 桩调用：DOWN 拍锁存 (x,y) + 角区判定。
+ * type = 系统给这个 DOWN 分类出的手势类型码（x1，2026-10-11 加）：打出来就知道
+ * 系统"认没认"这个角手势——第四轮的关键谜题（角手势为何从不 pilfer）靠它定性。 */
+static void hsb_latch_down(uintptr_t self, uintptr_t type, double d0, double d1) {
+    float x = hsb_lo32_float(d0);
+    float y = hsb_lo32_float(d1);
+    g_latch.x = x;
+    g_latch.y = y;
+    g_latch.corner = hsb_latch_corner_at(self, x, y);
+    g_latch.at_s = hsb_now_s();
+    g_latch.valid = 1;
+    uint32_t n = __atomic_add_fetch(&g_cs.latch, 1u, __ATOMIC_RELAXED);
+    /* 角区锁存**必打**（每个角手势一行）：否则 corner=1 只在 1/20 采样里出现，
+     * 真机日志里根本看不出"角到底判没判中"（22:33 那轮就是这么漏的：7 条 hook HIT
+     * 里 5 条 x 明显在角上，却没有一条 corner latch 行）。非角区仍采样，防中部滑动刷屏。 */
+    if (g_latch.corner || n == 1u || n % 20u == 0u) {
+        char sfx[176];
+        hsb_cs_suffix(sfx, sizeof(sfx));
+        LOGI("corner latch x=%.1f y=%.1f corner=%d type=0x%lx%s",
+             x, y, g_latch.corner, (unsigned long) type, sfx);
+    }
+}
+
+/* pilfer 桩调用：本手势的锁存 DOWN 是否角区（过期视为否） */
+static int hsb_latch_is_corner(void) {
+    if (!g_latch.valid) return 0;
+    if (hsb_now_s() - g_latch.at_s > HSB_LATCH_TTL_S) { g_latch.valid = 0; return 0; }
+    return g_latch.corner;
+}
+
+/* ===== 侧滑线确认层①：handle_back_gesture 读权威坐标（2026-10-12，观察档） =====
+ *
+ * 反汇编坐实：`handle_back_gesture(self=x0, event=x1)` 对 x1 调
+ * `input_MotionEvent_getActionMasked@plt`；这些 getter 是 launcher 的 **UND 动态符号**
+ * （`input_MotionEvent_getRawX/getRawY/getDownTime/getDeviceId`）。用它读到的坐标是
+ * **launcher 权威坐标**（不受 spy 侧 `Resources.getSystem().displayMetrics` 口径影响）。
+ *
+ * ⚠ 首轮真机（2026-10-12 18:22）：`dlsym(RTLD_DEFAULT, …)` **返回 0**（resolve FAILED）——
+ * 定义库不在本 .so 的默认作用域。改为两级解析：先 RTLD_DEFAULT，失败再遍历已加载库、
+ * 逐个 `dlopen(RTLD_NOLOAD|RTLD_NOW)` + `dlsym`（见 hsb_dlsym_all）。
+ *
+ * 本档**只打点、不改行为**：解析失败即 fail-closed（打一行 WARN，之后不再尝试、不调用）。 */
+static int   (*g_me_getActionMasked)(void *);
+static float (*g_me_getRawX)(void *, int);
+static float (*g_me_getRawY)(void *, int);
+static long long (*g_me_getDownTime)(void *);
+static int   (*g_me_getDeviceId)(void *);
+static int g_me_state;   /* 0=未试 1=成功 -1=失败 */
+
+static int g_dlsym_probed;   /* 诊断：遍历时实际 dlopen 到的库数 */
+
+typedef struct { const char *name; void *found; } HsbSymReq;
+
+static int hsb_sym_cb(struct dl_phdr_info *info, size_t size, void *data) {
+    (void) size;
+    HsbSymReq *r = (HsbSymReq *) data;
+    if (r->found) return 1;
+    if (!info->dlpi_name || !info->dlpi_name[0]) return 0;
+    void *h = dlopen(info->dlpi_name, RTLD_NOLOAD | RTLD_NOW);
+    if (!h) return 0;
+    g_dlsym_probed++;
+    void *p = dlsym(h, r->name);
+    dlclose(h);   /* NOLOAD 只借引用；库由 launcher 持有，不会卸载 */
+    if (p) { r->found = p; return 1; }
+    return 0;
+}
+
+/* RTLD_DEFAULT 找不到时遍历已加载库逐个 dlsym。 */
+static void *hsb_dlsym_all(const char *name) {
+    void *p = dlsym(RTLD_DEFAULT, name);
+    if (p) return p;
+    HsbSymReq r = { name, NULL };
+    dl_iterate_phdr(hsb_sym_cb, &r);
+    return r.found;
+}
+
+static int hsb_me_resolve(void) {
+    if (g_me_state) return g_me_state > 0;
+    void *am = hsb_dlsym_all("input_MotionEvent_getActionMasked");
+    void *rx = hsb_dlsym_all("input_MotionEvent_getRawX");
+    void *ry = hsb_dlsym_all("input_MotionEvent_getRawY");
+    void *dt = hsb_dlsym_all("input_MotionEvent_getDownTime");
+    void *dv = hsb_dlsym_all("input_MotionEvent_getDeviceId");
+    g_me_getActionMasked = (int (*)(void *))       am;
+    g_me_getRawX         = (float (*)(void *, int)) rx;
+    g_me_getRawY         = (float (*)(void *, int)) ry;
+    g_me_getDownTime     = (long long (*)(void *)) dt;
+    g_me_getDeviceId     = (int (*)(void *))       dv;
+    int ok = am && rx && ry && dt && dv;
+    g_me_state = ok ? 1 : -1;
+    char amhex[17] = {0}, rxhex[17] = {0}, ryhex[17] = {0}, dthex[17] = {0}, dvhex[17] = {0};
+    snprintf(amhex, sizeof(amhex), "%lx", (unsigned long) am);
+    snprintf(rxhex, sizeof(rxhex), "%lx", (unsigned long) rx);
+    snprintf(ryhex, sizeof(ryhex), "%lx", (unsigned long) ry);
+    snprintf(dthex, sizeof(dthex), "%lx", (unsigned long) dt);
+    snprintf(dvhex, sizeof(dvhex), "%lx", (unsigned long) dv);
+    LOGI("back_event getters resolve: %s (am=0x%s rawx=0x%s rawy=0x%s dt=0x%s dev=0x%s probe=%d)",
+         ok ? "ok" : "FAILED", amhex, rxhex, ryhex, dthex, dvhex, g_dlsym_probed);
+    return ok;
+}
+
+/* ---- 事件的权威坐标快照（一次读全，供"观测"与"抑制"共用） ----
+ * MotionEvent actionMasked 取值（原生定义，不引 android/input.h 只为本文件自洽）。 */
+#define HSB_ACT_DOWN   0
+#define HSB_ACT_UP     1
+#define HSB_ACT_MOVE   2
+#define HSB_ACT_CANCEL 3
+
+typedef struct {
+    int act;          /* actionMasked：0=DOWN 1=UP 2=MOVE 3=CANCEL */
+    float x;          /* 权威 rawX */
+    float y;          /* 权威 rawY */
+    long long dt;     /* downTime —— 与 deviceId 一起当"手势身份"，判是否同一条 */
+    int dev;          /* deviceId */
+} HsbBackEv;
+
+static int hsb_back_event_read(uintptr_t ev, HsbBackEv *o) {
+    if (!ev || !hsb_me_resolve()) return 0;
+    o->act = g_me_getActionMasked((void *) ev);
+    o->x   = g_me_getRawX((void *) ev, 0);
+    o->y   = g_me_getRawY((void *) ev, 0);
+    o->dt  = g_me_getDownTime((void *) ev);
+    o->dev = g_me_getDeviceId((void *) ev);
+    return 1;
+}
+
+/* 观察档：限流打点（第 1 次 + 每 20 次） */
+static volatile uint32_t g_back_logged;
+static void hsb_back_event_log(const HsbBackEv *e) {
+    uint32_t n = __atomic_add_fetch(&g_back_logged, 1u, __ATOMIC_RELAXED);
+    if (n == 1u || n % 200u == 0u) {
+        LOGI("back_event #%u act=%d raw=(%.1f,%.1f) dt=%lld dev=%d",
+             n, e->act, e->x, e->y, e->dt, e->dev);
+    }
+}
+
+/* ===== 侧滑线 S3「抑制（让路）」实验档（2026-10-12）=====
+ *
+ * B 路线（spy→pilfer）的天花板是**抢跑**：launcher 的 Rust 在 DOWN 后 10-30ms 就认领了这条
+ * 侧滑并起 back，而 Java 回程（spy→广播→:ui→dwell→pilfer）慢一拍，于是最脆的一环变成
+ * "pilfer 抢流竞速 + 五要素匹配"（S0 里角滑的 `cur dt=0` 即此）。native 是**唯一能在
+ * "系统认领之前"动手**的位置（同进程、同调用链、零延迟）。
+ *
+ * 本档只做"抑制"、不做判定：命中手势的事件**整个不转发**给原函数（不调 g_orig）
+ * ⇒ Rust 侧看不到 DOWN ⇒ 不认领、不起 back。spy 的 observe 副本走 InputDispatcher 另一条
+ * 道，不受"我们没转发"影响；:ui 照旧判定/呼出（这正是 N3 的假设，由真机 H1/H2/H3 验）。
+ *
+ * ⚠ 这是**实验档、不是终态**：DOWN 处无从得知用户后续是"停顿呼出"还是"快速返回"，所以
+ *   "带内起手的快速 back"本档会一起被吞（计划 §5.5 的已知代价）。是否要为它加"延迟/回放"
+ *   通道，等三绿读数出来再定。
+ *
+ * 分档（对齐角区门控的"先观测再动作"）：
+ *   debug.hsb.native.suppress = 0（默认）⇒ 只观测：带内起手打 `back WOULD-SUPPRESS`，
+ *      **零行为变化**，先用它标定"带内"判定本身对不对。
+ *   debug.hsb.native.suppress = 1 ⇒ 带内起手**立即**吞（整条手势，含 MOVE/UP）。
+ *      ⚠ 已知代价（2026-10-12 真机）：连"带内快滑想返回"一起吞 —— DOWN 那一刻无从得知
+ *      用户会不会停顿，所以"只吃 dwell 意图"这一档做不到。
+ *   debug.hsb.native.suppress = 2 ⇒ **停顿后才吞**（推荐）。带内起手先只是候选、事件照常
+ *      转发（back 预览照走）；只有这条手势真的停顿（≥ dwell 无"在动"）才转为吞 ⇒ 快滑的
+ *      返回不受影响，而"滑出+停顿呼出"的那条不会提交 back。判据与 :ui 的 STALL 定时器同构。
+ *
+ * fail-closed：getter 未解析 / 触发带几何属性缺失或非法 / 非竖屏 ⇒ **不抑制**（走原生）。
+ * 只有确信"这条起手落在触发带内"时才改变行为，任何不确定一律退回原生。 */
+#define HSB_SUPPRESS_PROP "debug.hsb.native.suppress"
+/* 停顿阈值与"还在动"的速度门：**native 里不再抄一份常量**，由 Java 侧按 :ui 同一份配置
+ * 推过来（见 CornerGeomBridge.pushBand）——三处（:ui / spy / native）永远是同一个数，
+ * 且测试期可 setprop 直接调，不必重编重装。
+ *   dwell = TRIGGER_DWELL_MS（用户可配，默认 250ms）
+ *   speed = GestureThresholds.STALL_MAX_SPEED_PX_S（默认 500px/s） */
+#define HSB_STRIP_DWELL_PROP "persist.hsb.strip.dwell_ms"
+#define HSB_STRIP_SPEED_PROP "persist.hsb.strip.stall_speed"
+/* 确认门（**距离 + 角度**，与 :ui/OS2·OS3 的 `swipe confirmed` 同一门）与滑回滞回：
+ *   confirm_px = TRIGGER_MIN_DISTANCE(dp) × density
+ *   reset_px   = confirm_px × GestureThresholds.SWIPE_RESET_RATIO
+ *   max_tan    = tan(GestureThresholds.MAX_SWIPE_ANGLE_DEG)
+ * 送 tan 而不是角度：native 侧据此用一次乘法比完夹角，省掉 math.h/atan2。
+ * 为什么要 mirro 这个门（2026-10-12 真机对账教训）：`:ui` 的 250ms 定时器是**在确认那一刻
+ * 挂上**的，native 若从 DOWN 起算速度窗，两边相位差 150ms+，判"停顿"就总对不齐
+ * （6 次 `:ui` 判定 native 只跟上 1 次）。确认门 + 同相位窗口之后两边才可对账。 */
+#define HSB_STRIP_CONFIRM_PROP "persist.hsb.strip.confirm_px"
+#define HSB_STRIP_RESET_PROP   "persist.hsb.strip.reset_px"
+#define HSB_STRIP_MAXTAN_PROP  "persist.hsb.strip.max_tan"
+#define HSB_STRIP_DWELL_FALLBACK_MS 250.0f
+#define HSB_STRIP_SPEED_FALLBACK 500.0f
+#define HSB_STRIP_CONFIRM_FALLBACK 41.0f    /* 15dp × 2.75（仅属性缺失时兜底） */
+#define HSB_STRIP_RESET_FALLBACK 20.5f
+#define HSB_STRIP_MAXTAN_FALLBACK 1.7321f   /* tan 60° */
+
+/* 「抬手收箭头」（2026-10-14）：把 launcher 的手势状态字节从 started 打成 0，让它的终态支
+ * 走"未启动收尾"（收箭头 + 收面板，**不可能提交 back**）。定义在委托门控区。 */
+static int hsb_arrow_state_release(void);
+static int hsb_arrowfix_value(void);
+/* 本事件是"我们这条流的终态（UP/CANCEL）且已强制清状态" ⇒ 吞掉之后需要在 stub 里补一次
+ * 原函数调用，让 launcher 自己的收尾支真的跑起来。 */
+static int g_arrow_due;
+
+/* 抑制档：0=只观测；1=带内起手立即吞（会连"带内快滑想返回"一起吞，不推荐）；
+ * 2=**停顿成立后才吞**（生产档：快滑不受影响）。
+ *
+ * 2026-10-14 晚：属性缺失时的默认从 0 改成 **2**。理由同 HSB_ONLY_ANCHOR ——
+ * `debug.hsb.native.suppress` 易失，重启即清；默认 0 会让"装上就能用"变成
+ * "装上只能看日志"（真机上表现为：菜单能呼出、但停顿手势没被 native 接管）。
+ * 显式 `setprop debug.hsb.native.suppress 0` 仍然是可靠的总退路。 */
+static int g_suppress_value;
+static uint64_t g_suppress_checked_s;
+
+static int hsb_suppress_value(void) {
+    uint64_t now = hsb_now_s();
+    if (g_suppress_checked_s != now) {
+        char v[8] = {0};
+        g_suppress_checked_s = now;
+        if (__system_property_get(HSB_SUPPRESS_PROP, v) > 0 && v[0]) {
+            int n = atoi(v);
+            g_suppress_value = (n == 1 || n == 2) ? n : 0;
+        } else {
+            g_suppress_value = 2;   /* 缺省=停顿吞（生产档），见上方注释 */
+        }
+    }
+    return g_suppress_value;
+}
+
+/* 停顿阈值 / 速度门（无缓存：每条事件最多读一次，1µs 级；换来运行时可调） */
+static float hsb_strip_dwell_ms(void) {
+    return hsb_prop_float(HSB_STRIP_DWELL_PROP, 50.0f, 2000.0f, HSB_STRIP_DWELL_FALLBACK_MS);
+}
+static float hsb_strip_stall_speed(void) {
+    return hsb_prop_float(HSB_STRIP_SPEED_PROP, 0.0f, 100000.0f, HSB_STRIP_SPEED_FALLBACK);
+}
+/* min 下限取到 0.5px 级：用户把"滑动距离"拉到最小时确认门就该跟着变窄 */
+static float hsb_strip_confirm_px(void) {
+    return hsb_prop_float(HSB_STRIP_CONFIRM_PROP, 0.5f, 2000.0f, HSB_STRIP_CONFIRM_FALLBACK);
+}
+static float hsb_strip_reset_px(void) {
+    return hsb_prop_float(HSB_STRIP_RESET_PROP, 0.0f, 2000.0f, HSB_STRIP_RESET_FALLBACK);
+}
+static float hsb_strip_max_tan(void) {
+    return hsb_prop_float(HSB_STRIP_MAXTAN_PROP, 0.01f, 100.0f, HSB_STRIP_MAXTAN_FALLBACK);
+}
+
+
+/* 侧滑触发带（与 :ui `SystemUiInputSpy.inTriggerBand` 同源、竖屏）：
+ *   nearSide = x <= bandW || x >= screenW - bandW
+ *   bandH    = screenH * bandHeightPercent / 100
+ *   top      = (screenH - bandH) * bandPositionPercent / 100
+ *   inBand   = nearSide && y ∈ [top, top + bandH]
+ *
+ * ⚠ 抑制点 `handle_back_gesture` 的 self **不是** GestureInputMonitorImpl（那是角区锚点的
+ *   布局，w/h 在 +0x260/+0x244），读不到权威屏宽高 ⇒ 几何只能由 Java 侧算了写属性
+ *   （`CornerGeomBridge.pushBand`，与 spy 同一份 prefs + 同一份 getSystem().displayMetrics）。
+ *   也正因如此这里送的是 **px** 而不是比例：native 手里没有 w/h，比例换算无从谈起。
+ *   竖屏判定同样交给属性（screenW < screenH），对齐 spy 横屏不转发。 */
+#define HSB_BAND_W_PX_PROP   "persist.hsb.band.w_px"
+#define HSB_BAND_H_PX_PROP   "persist.hsb.band.h_px"
+#define HSB_BAND_TOP_PX_PROP "persist.hsb.band.top_px"
+#define HSB_BAND_SW_PX_PROP  "persist.hsb.band.screen_w_px"
+#define HSB_BAND_SH_PX_PROP  "persist.hsb.band.screen_h_px"
+/* 活体朝向位（0=竖屏 / 1=横屏，2026-10-13 新增）：上面两个屏尺寸字段按**竖屏归一**
+ * （CornerGeomBridge.bandPx 取 min/max），所以下面那行 sw>=sh 的横屏判据**恒假**——
+ * 横屏时本函数会照样返回 ok，竖屏带被套到横屏坐标系上（左/右边缘底部那段被误吞 + 误发
+ * MAGIC）。朝向只有 Java 侧知道 ⇒ 由属性给真值；属性没送到或停在旧值时，靠
+ * hsb_band_in() 的"坐标越界即拒"兜底（横屏下 x/y 会超出竖屏尺寸，只在横屏成立）。 */
+#define HSB_BAND_LAND_PROP   "persist.hsb.band.landscape"
+
+static float g_band_w_px, g_band_h_px, g_band_top_px, g_band_scr_w, g_band_scr_h;
+static int g_band_ok;
+static uint64_t g_band_checked_s;
+/* 上一次**打点**的取值（只用于"变了才打"，见 hsb_band_geom） */
+static float g_band_last_w, g_band_last_h, g_band_last_t, g_band_last_sw, g_band_last_sh;
+static float g_band_last_land;
+
+/* 刷新触发带几何（属性驱动，1 秒粒度缓存——这个判断在每个输入事件上都会跑）。
+ * 返回 0 = 属性缺失/非法/横屏 ⇒ 抑制一律不做（fail-closed）。 */
+static int hsb_band_geom(void) {
+    uint64_t now = hsb_now_s();
+    if (g_band_checked_s != now) {
+        g_band_checked_s = now;
+        float w  = hsb_prop_float(HSB_BAND_W_PX_PROP,   1.0f,   2000.0f, 0.0f);
+        float h  = hsb_prop_float(HSB_BAND_H_PX_PROP,   1.0f, 100000.0f, 0.0f);
+        /* top 的合法值含 0 ⇒ 用 dflt=-1 区分"属性缺失"与"top=0" */
+        float t  = hsb_prop_float(HSB_BAND_TOP_PX_PROP, 0.0f, 100000.0f, -1.0f);
+        float sw = hsb_prop_float(HSB_BAND_SW_PX_PROP,  1.0f, 100000.0f, 0.0f);
+        float sh = hsb_prop_float(HSB_BAND_SH_PX_PROP,  1.0f, 100000.0f, 0.0f);
+        /* 方向位（dflt=-1 区分"属性缺失"与"竖屏=0"）：缺失时下面仍会按几何比一次，
+         * 但那条恒假（sw/sh 是竖屏归一值）⇒ 缺属性 = 只靠 hsb_band_in 的越界兜底。 */
+        float land = hsb_prop_float(HSB_BAND_LAND_PROP, 0.0f, 1.0f, -1.0f);
+        int landscape_geo = (sw > 0.0f && sh > 0.0f && sw >= sh);
+        int landscape_prop = (land >= 0.5f);
+        int landscape = landscape_geo || landscape_prop;
+        int ok = (w > 0.0f && h > 0.0f && t >= 0.0f && sw > w && sh > 0.0f && !landscape);
+        g_band_w_px = w;
+        g_band_h_px = h;
+        g_band_top_px = t;
+        g_band_scr_w = sw;
+        g_band_scr_h = sh;
+        /* 只在**取值或有效性发生变化**时打一行（原来是每次 1 秒刷新都打 ⇒ 密集手势下 1 行/秒刷屏）。
+         * 首次必然打（初值全 0）⇒ "属性送到没送到、native 实读多少"这两件事始终可判读，
+         * 这也是 pushBand 那条链的唯一验收依据。 */
+        int changed = (ok != g_band_ok) || (w != g_band_last_w) || (h != g_band_last_h) ||
+                      (t != g_band_last_t) || (sw != g_band_last_sw) || (sh != g_band_last_sh) ||
+                      (land != g_band_last_land);
+        g_band_ok = ok;
+        if (changed) {
+            g_band_last_w = w;
+            g_band_last_h = h;
+            g_band_last_t = t;
+            g_band_last_sw = sw;
+            g_band_last_sh = sh;
+            g_band_last_land = land;
+            /* 横屏时把"凭什么判横屏"也打出来：prop=1（活性位）还是 geometry（恒假的旧判据）。 */
+            const char *why = !landscape ? ""
+                            : (landscape_prop ? " (landscape prop=1 ⇒ no suppress)"
+                                              : " (landscape via geometry ⇒ no suppress)");
+            LOGI("band geom %s w_px=%.1f h_px=%.1f top_px=%.1f screen=%.0fx%.0f land=%.0f%s",
+                 ok ? "ok" : "INVALID", w, h, t, sw, sh, land, why);
+        }
+    }
+    return g_band_ok;
+}
+
+/* 起手点是否落在触发带内（只在 hsb_band_geom() 为真时调用）。
+ * 开头那条是**横屏兜底**（2026-10-13）：属性里的方向位可能停在旧值（只有模块 App 进程
+ * 转屏时能重推，它不在就没人推），而横屏坐标会超出"竖屏归一"的屏尺寸——竖屏下 x 不可能
+ * > 屏宽、y 不可能 > 屏高 ⇒ 越界即拒。竖屏恒不触发（零误杀）；漏网的是"横屏**左**缘底部
+ * 静止停顿"那一窄类（它全程坐标都落在竖屏范围内），只能靠方向位属性挡。 */
+static int hsb_band_in(float x, float y) {
+    if (x > g_band_scr_w || y > g_band_scr_h) {
+        LOGI("back SKIP(oob): raw=(%.1f,%.1f) 超出竖屏 scr=%.0fx%.0f ⇒ 疑横屏，拒判",
+             x, y, g_band_scr_w, g_band_scr_h);
+        return 0;
+    }
+    int near_side = (x <= g_band_w_px) || (x >= g_band_scr_w - g_band_w_px);
+    int in_y = (y >= g_band_top_px) && (y <= g_band_top_px + g_band_h_px);
+    return near_side && in_y;
+}
+
+/* 抑制链路的累计计数（报告与日志用；与角区计数同样"进程生命周期内累计、不复位"，
+ * 所以 A/B 两档必须各自重启桌面后再读） */
+static struct {
+    uint32_t seen;        /* 动作是 DOWN 的次数 */
+    uint32_t in_band;     /* 其中起手点在触发带内的次数（= would 的上界） */
+    uint32_t confirmed;   /* 其中过了"距离+角度"确认门的次数（对齐 :ui 的 swipe confirmed） */
+    uint32_t reset;       /* 确认后又滑回条、整条重置的次数（对齐 :ui 的 RESET slide-back） */
+    uint32_t would;       /* 档=0：判定"带内起手"的次数（只观测） */
+    uint32_t dwelled;     /* 档=2：判定"停顿成立"的次数（= 真正转为吞的手势数） */
+    uint32_t swallow;     /* 真吞的手势数 */
+    uint32_t swallow_ev;  /* 真吞的事件数 */
+    uint32_t cancel_pass; /* 吞的过程中**放行**的 CANCEL 数（清理用，见下） */
+    uint32_t arrow_fix;   /* 抬手/取消前把 launcher 状态字节 1/2 → 0 的次数（arrowfix=1） */
+    uint32_t arrow_clean; /* 吞掉终态后**替 launcher 补调一次**原函数（走它的 state!=1 收尾）的次数 */
+    uint32_t geom_bad;    /* 抑制判定没能进行的 DOWN 数（带几何不可用 ⇒ fail-closed） */
+} g_supp;
+
+/* 一条手势的状态（身份 = downTime + deviceId）：
+ *   candidate（档=2）：带内起手、尚未停顿 ⇒ **事件照常转发**（Xiaomi 的 back 预览不受影响）
+ *   active：条件已达成 ⇒ 后续事件不转发，直到终态
+ * 速度窗字段用于判"还在动"：单帧瞬时速度被持指抖动主导（20px/采样 @120Hz ≈ 2500px/s），
+ * 必须取窗口均值才分得出"真在滑"与"停住抖"——与 :ui 的 STALL_SPEED_WINDOW_MS 同款处理。 */
+#define HSB_STRIP_SPEED_WINDOW_MS 150ull
+static struct {
+    int candidate;
+    int confirmed;           /* 已过"距离+角度"确认门（对齐 :ui 的 swipe confirmed） */
+    int dwell_done;          /* 本手势的"停顿"只处理一次（否则后续每个事件都会重复判/重复调） */
+    int active;
+    long long dt;
+    int dev;
+    float down_x, down_y;    /* DOWN 起手点（算 inward / travel / 夹角） */
+    float in_ux;             /* 内滑轴（竖屏条=水平：左边缘 +1 / 右边缘 -1；in_uy 恒 0） */
+    uint64_t last_move_ms;   /* 最近一次判定"还在动"的时刻 */
+    uint64_t win_ms;         /* 速度窗起点时刻 */
+    float win_x, win_y;      /* 速度窗起点坐标 */
+} g_supp_stream;
+
+/* （2026-10-13 删除）这里原有一个「委托给侧栏」门控的待命状态 g_delegate_arm：主锚点判出
+ * 带内停顿后置位，供第二锚点 try_delegate_back_to_sidebar 的桩 flip 返回值。真机证明
+ * "强制委托"对本机无效（官方停顿呼出未启用，见 plan §14/§17），已整段删除。 */
+
+/* 整条重置（对齐 :ui 的 resetGesture：滑回条、或换手势时清干净） */
+static void hsb_supp_frame_reset(void) {
+    g_supp_stream.candidate = 0;
+    g_supp_stream.confirmed = 0;
+    g_supp_stream.dwell_done = 0;
+}
+
+/* 从这一刻起吞这条手势的后续事件（含当前这条）。返回被吞手势的序号（日志用）。 */
+static uint32_t hsb_supp_engage(void) {
+    g_supp_stream.candidate = 0;
+    g_supp_stream.confirmed = 0;
+    g_supp_stream.active = 1;
+    g_supp.swallow_ev++;
+    return __atomic_add_fetch(&g_supp.swallow, 1u, __ATOMIC_RELAXED);
+}
+
+/* 返回 1 = 本事件不转发给原函数（"吞"）。
+ *
+ * 档=1：带内起手的 DOWN 当场吞（上一版行为；已知会把"带内快滑想返回"一起吞掉）。
+ * 档=2（推荐）：带内起手先只是**候选**——事件照常转发（back 预览照走），只有这条手势
+ *   **真的停顿**（连续 ≥ dwell 没有"还在动"）时才转为吞。
+ *   ⇒ 快滑永不停顿 ⇒ 永不吞 ⇒ 带内快滑的返回不受影响（这就是"延迟/放行"）；
+ *     停顿呼出 ⇒ 转为吞 ⇒ UP 不达原函数 ⇒ 不提交 back。
+ *   判据与 :ui 的 STALL 定时器同构（速度窗 + 阈值），阈值/窗口都跟 :ui 同源（属性推过来）。 */
+static int hsb_suppress_swallow(const HsbBackEv *e, uint64_t now_ms) {
+    /* ===== 已在吞：一律吞到终态，**唯一例外是 CANCEL** =====
+     * CANCEL 是输入系统给的"清理"信号（pilfer 后原目标会收到）。放行它只会让 Rust 侧把
+     * 手势收干净，**不可能产生 back**（back 由 UP 提交）；档=2 时 DOWN/MOVE 是转发过的，
+     * 把 CANCEL 也吞掉反而会让那条状态机悬着。 */
+    if (g_supp_stream.active) {
+        if (e->dt == g_supp_stream.dt && e->dev == g_supp_stream.dev) {
+            if (e->act == HSB_ACT_CANCEL) {
+                g_supp_stream.active = 0;
+                /* CANCEL 是输入系统给的"清理"信号：先按 arrowfix 把 launcher 的手势态打回
+                 * "未启动"，它收到 CANCEL 时才会走 state!=1 的收尾支（否则只清状态、箭头留着）。
+                 * CANCEL 本身是放行的（return 0）⇒ 原函数自己会跑那支收尾。 */
+                hsb_arrow_state_release();
+                g_supp.cancel_pass++;
+                return 0;
+            }
+            if (e->act == HSB_ACT_UP) {
+                /* 先按 arrowfix 把状态字节从 started 打成 0：这样原函数的 UP 支会走
+                 * `state != 1` 的收尾（收箭头 + 收面板 + **不可能提交 back**，见文件末尾证据）。 */
+                int fixed = hsb_arrow_state_release();
+                g_supp_stream.active = 0;   /* 2026-10-13：recover=1（UP 放行）证明对箭头无效，已删 */
+            }
+            g_supp.swallow_ev++;
+            return 1;
+        }
+        g_supp_stream.active = 0;   /* 换了手势（上一条终态没经过我们）：清掉重判 */
+    }
+
+    /* ===== 候选期（档=2）：事件照常转发；先过"距离+角度"确认门，再判停顿 =====
+     * 与 :ui 的 `handleStripGestureCore` 逐步对齐：
+     *   未确认 → 只找确认点（travel ≥ confirm 且 inward > 0 且夹角 ≤ max）；
+     *            **确认那一刻**才起速度窗/计时（对齐"确认即挂停顿定时器"）；
+     *   已确认 → 滑回条整条重置；否则速度窗内超速=还在动，重置计时；
+     *            连续 ≥ dwell 没在动 ⇒ 停顿成立 ⇒ 转吞。
+     * 未过确认门就什么都不做——这正是 OS2/3 的语义（距离不到位不可能呼出），
+     * 也顺手消掉"边缘带内长按被吞"（长按没有位移，永远过不了确认门）。 */
+    if (g_supp_stream.candidate && e->dt == g_supp_stream.dt && e->dev == g_supp_stream.dev) {
+        float dx = e->x - g_supp_stream.down_x;
+        float dy = e->y - g_supp_stream.down_y;
+        float inward = dx * g_supp_stream.in_ux;      /* in_uy 恒 0（竖屏条=水平轴） */
+        float perp = (dy < 0.0f) ? -dy : dy;          /* = |dx*0 - dy*in_ux| */
+        if (g_supp_stream.confirmed && inward < hsb_strip_reset_px()) {
+            __atomic_add_fetch(&g_supp.reset, 1u, __ATOMIC_RELAXED);
+            hsb_supp_frame_reset();
+            return 0;
+        }
+        if (!g_supp_stream.confirmed) {
+            float travel2 = dx * dx + dy * dy;
+            float c = hsb_strip_confirm_px();
+            /* 夹角比较用 tan：perp <= inward·tan(max)，省 atan2（inward>0 才可能成立） */
+            if (inward > 0.0f && travel2 >= c * c && perp <= inward * hsb_strip_max_tan()) {
+                g_supp_stream.confirmed = 1;
+                __atomic_add_fetch(&g_supp.confirmed, 1u, __ATOMIC_RELAXED);
+                g_supp_stream.last_move_ms = now_ms;   /* 确认即起计时（对齐 :ui） */
+                g_supp_stream.win_ms = now_ms;
+                g_supp_stream.win_x = e->x;
+                g_supp_stream.win_y = e->y;
+            }
+            return 0;   /* 未确认：什么都不做（没过确认门不可能呼出） */
+        }
+        uint64_t dt_win = now_ms - g_supp_stream.win_ms;
+        if (dt_win >= HSB_STRIP_SPEED_WINDOW_MS) {
+            float wx = e->x - g_supp_stream.win_x;
+            float wy = e->y - g_supp_stream.win_y;
+            float sp = hsb_strip_stall_speed();
+            /* 比较平方，省一次 sqrtf（两者都非负） */
+            float v2 = (wx * wx + wy * wy) * 1000000.0f / ((float) dt_win * (float) dt_win);
+            if (v2 > sp * sp) g_supp_stream.last_move_ms = now_ms;
+            g_supp_stream.win_ms = now_ms;
+            g_supp_stream.win_x = e->x;
+            g_supp_stream.win_y = e->y;
+        }
+        if (!g_supp_stream.dwell_done &&
+            now_ms - g_supp_stream.last_move_ms >= (uint64_t) hsb_strip_dwell_ms()) {
+            g_supp_stream.dwell_done = 1;   /* 一条手势只处理一次 */
+            __atomic_add_fetch(&g_supp.dwelled, 1u, __ATOMIC_RELAXED);
+            /* 停顿成立 ⇒ 转"吞这条流"（生产档 suppress=2）。呼出仍归 :ui 自己的 dwell 定时器
+             * （judge=0 ⇒ :ui 不停），native 只负责让 launcher 看不到终态 ⇒ 不提交 back。 */
+            if (hsb_suppress_value() >= 1) {
+                uint32_t n = hsb_supp_engage();
+                LOGI("back SUPPRESS(dwell) raw=(%.1f,%.1f) 停顿≥%.0fms #%u act=%d dt=%lld dev=%d",
+                     e->x, e->y, hsb_strip_dwell_ms(), n, e->act, e->dt, e->dev);
+                return 1;
+            }
+        }
+        return 0;   /* 未停顿 ⇒ **放行**（正常 back 预览照走） */
+    }
+    hsb_supp_frame_reset();
+
+    if (e->act != HSB_ACT_DOWN) return 0;
+    g_supp.seen++;
+    if (!hsb_band_geom()) {
+        g_supp.geom_bad++;
+        return 0;
+    }
+    if (!hsb_band_in(e->x, e->y)) return 0;
+    g_supp.in_band++;
+
+    int mode = hsb_suppress_value();
+    if (mode <= 0) {
+        /* 观测档：零行为变化。每条带内起手都打一行（每手势最多一行，便于逐条对账）。 */
+        __atomic_add_fetch(&g_supp.would, 1u, __ATOMIC_RELAXED);
+        LOGI("back WOULD-SUPPRESS raw=(%.1f,%.1f) band w=%.1f h=%.1f top=%.1f scr=%.0f dt=%lld dev=%d",
+             e->x, e->y, g_band_w_px, g_band_h_px, g_band_top_px, g_band_scr_w, e->dt, e->dev);
+        return 0;
+    }
+    if (mode == 1) {
+        uint32_t n = hsb_supp_engage();
+        LOGI("back SUPPRESS(now) raw=(%.1f,%.1f) 带内起手立即吞 #%u dt=%lld dev=%d",
+             e->x, e->y, n, e->dt, e->dev);
+        return 1;
+    }
+    /* mode==2（生产档）：先走"候选 → 确认门 → 停顿"，只有真停顿才转为吞。 */
+    g_supp_stream.candidate = 1;
+    g_supp_stream.confirmed = 0;
+    g_supp_stream.dt = e->dt;
+    g_supp_stream.dev = e->dev;
+    g_supp_stream.down_x = e->x;
+    g_supp_stream.down_y = e->y;
+    /* 内滑轴：与 :ui 的 OS4 竖屏条一致 —— 起手在屏幕左半 ⇒ 向内=+x，否则 -x */
+    g_supp_stream.in_ux = (e->x < g_band_scr_w * 0.5f) ? 1.0f : -1.0f;
+    return 0;
+}
+
+
+/* ===== 「主动取消（收尾）」观测：handle_back_gesture 侧的上下文快照（2026-10-12）=====
+ * 现在的抑制是"吞事件"——实测只做到"不提交"，**收不了尾**（launcher 的手势悬着 → 返回箭头
+ * 残留）。OS2/3 的正解是**让 launcher 走它自己的取消分支**（合成 UP + 翻转 shouldBack）。
+ * OS4 上这件事只能由 native 做，落点就是 on_back_cancelled；但它的参数表未验 ⇒ 先只观测。
+ * 这里存主锚点侧的身份，供观测桩对账三件事：x0 是 self 还是 self+0xb8（参考实现报告写的
+ * this+0xb8 = GestureInputBackHelper）、是不是同一条手势、距上一事件多久。 */
+static struct {
+    uintptr_t self;      /* handle_back_gesture 的 self（GestureStubViewWindow） */
+    uintptr_t window;    /* 同上，但**无条件**记录（arrowfix 要用它改状态字节，不能依赖观测档） */
+    long long dt;        /* 该手势 downTime */
+    int dev;             /* deviceId */
+    uint64_t last_ms;    /* 该手势最近一次事件时刻 */
+} g_back_ctx;
+
+
+
+/* ===== 「抬手收箭头」修复（2026-10-14，arrowfix）=====
+ * 真机症状：停顿手势 → 箭头出现、扇形出现 → 松手 → 扇形收、**返回箭头残留**（稳定复现），
+ * 且 `cancel=0/2` × `recover=0/1` 四个组合**都无差异**。
+ *
+ * 反汇编定案（设备 libapp_launcher.so；GestureStubViewWindow::handle_back_gesture = lib+0x6fd3ac）：
+ * 手势状态字节 = self+0xf0（0 idle / 2 armed(DOWN 之后) / 1 started / 4 sidebar 支），
+ * UP 与 CANCEL 共用一块：
+ *   0x6fd580: ldrb w8,[x19,#0xf0]; cmp w8,#1; b.ne 0x6fd5c4
+ *     ├ state==1 → 0x6fd7a0：w21 = (|Δx| > 55dp) || (速度 > 2.0 px/ms)
+ *     │     · 模式标志(self+0xf1) bit0==0 → 0x6fd99c：w21==0 ⇒ **跳 0x6fe624 只把 state 清零**
+ *     │       （箭头/面板/动画一个都不收；我们的停顿手势位移小、速度低 ⇒ w21 恒 0）
+ *     │     · 其它 → 0x6fd800（sidebar 支）/ on_swipe_stop_direct（提交支）
+ *     └ state!=1 → 0x6fd5c4 → 0x6fd688：
+ *          `cancel_back_panel_arrow_scenario([x20+0x78])`                ← **收箭头①**
+ *          … `GestureBackArrowView::on_swipe_stop([x20+0x58]+0x18, 0)`   ← **收箭头②**
+ *          然后直奔 0x6fe61c/0x6fe624（0x6fe614 的 delegate 分支在此**之前**）
+ *          ⇒ 既收干净，又**完全不可能提交 back**。
+ * 结论：残根不在"谁拥有 UP"，而在**抬手那一刻的 state 值** —— 我们要的就是那条 state!=1 收尾支。
+ *
+ * 本档做的事（极小、默认开、可关、写前判值）：
+ *   抬手/取消前，若 `[self+0xf0] ∈ {1,2}` 就写成 0（fail-closed：其它值一律不碰），
+ *   于是原函数的终态支落到 0x6fd5c4 收尾支：
+ *     · recover=1（UP 放行）→ 原函数自己就跑收尾，不需要额外调用；
+ *     · recover=0（UP 被我们吞掉）→ stub 里补调一次原函数（`g_arrow_due`），收尾照跑。
+ * `debug.hsb.native.arrowfix`：1=开（默认）；0=关（只观测、不写、不补调）。 */
+#define HSB_ARROWFIX_PROP   "debug.hsb.native.arrowfix"
+#define HSB_WIN_STATE_OFF   0xf0ull   /* GestureStubViewWindow 手势状态字节（= helper+0x30） */
+#define HSB_WIN_STATE_IDLE  0u
+#define HSB_WIN_STATE_START 1u        /* started：箭头已亮，而终态支"只清状态"的那一档 */
+#define HSB_WIN_STATE_ARMED 2u        /* DOWN 之后：还没 start */
+
+static int g_arrowfix_value;
+static uint64_t g_arrowfix_checked_s;
+
+static int hsb_arrowfix_value(void) {
+    uint64_t now = hsb_now_s();
+    if (g_arrowfix_checked_s != now) {
+        char v[8] = {0};
+        g_arrowfix_checked_s = now;
+        /* 默认开（属性缺失/非 "0" 都算开）；`setprop … 0` 一键回退成旧行为 */
+        g_arrowfix_value = (__system_property_get(HSB_ARROWFIX_PROP, v) > 0 && v[0] == '0') ? 0 : 1;
+    }
+    return g_arrowfix_value;
+}
+
+/* 抬手/取消前把 launcher 的手势状态打回"未启动"。返回 1 = 真改了。 */
+static int hsb_arrow_state_release(void) {
+    if (!hsb_arrowfix_value()) return 0;
+    uintptr_t w = g_back_ctx.window;
+    if (!w) return 0;
+    volatile uint8_t *p = (volatile uint8_t *) (w + HSB_WIN_STATE_OFF);
+    uint8_t cur = *p;
+    if (cur != (uint8_t) HSB_WIN_STATE_START && cur != (uint8_t) HSB_WIN_STATE_ARMED) {
+        return 0;   /* idle / 其它：没有箭头悬着，别乱写（fail-closed） */
+    }
+    *p = (uint8_t) HSB_WIN_STATE_IDLE;
+    uint32_t n = __atomic_add_fetch(&g_supp.arrow_fix, 1u, __ATOMIC_RELAXED);
+    LOGI("arrow FIX #%u state[%p]=%u→0（抬手前强制走 launcher 自己的 state!=1 收尾："
+         "收箭头 + 收面板，不提交 back）", n, (void *) (w + HSB_WIN_STATE_OFF), (unsigned) cur);
+    return 1;
+}
+
+
 
 static uintptr_t hsb_stub(uintptr_t a0, uintptr_t a1, uintptr_t a2, uintptr_t a3,
                           uintptr_t a4, uintptr_t a5, uintptr_t a6, uintptr_t a7,
@@ -549,6 +1419,32 @@ static uintptr_t hsb_stub(uintptr_t a0, uintptr_t a1, uintptr_t a2, uintptr_t a3
     uint64_t last = g_hook.last_log_s ? g_hook.last_log_s : g_hook.installed_at_s;
     int quiet = (now >= last + HSB_HEARTBEAT_S);
     int first = __atomic_fetch_add(&g_stub_logged, 1u, __ATOMIC_RELAXED) < hsb_log_limit();
+    /* ===== 侧滑线 S3：抑制必须赶在调 g_orig **之前**决定 =====
+     * "不转发"就是抑制的全部内容 ⇒ 必须先读 event 权威坐标（getter 是纯函数，读在转发
+     * 前后等价，所以观测档的行为与从前逐位一致）。 */
+    HsbBackEv bev;
+    int bev_ok = g_hook.has_back_event && hsb_back_event_read(a1, &bev);
+    if (bev_ok) {
+        /* 供 arrowfix 记账（窗身份 + 时序）；都是纯 getter / 一次读。 */
+        g_back_ctx.dt = bev.dt;
+        g_back_ctx.dev = bev.dev;
+        g_back_ctx.last_ms = hsb_now_ms();
+        g_back_ctx.window = a0;   /* arrowfix 靠它取 launcher 的状态字节 */
+    }
+    g_arrow_due = 0;
+    if (bev_ok && hsb_suppress_swallow(&bev, hsb_now_ms())) {
+        /* 吞掉的若是"带内停顿"这条流的终态 UP、且已把 launcher 的状态字节打回未启动（arrowfix），
+         * 就补调一次原函数 ⇒ launcher 自己跑 state!=1 的收尾支（收箭头 + 收面板）。
+         * 该支既不调 delegate 也不调 invoke/cancel ⇒ **不可能提交 back**（反汇编见 arrowfix 段）。 */
+        if (g_arrow_due && g_orig) {
+            g_arrow_due = 0;
+            __atomic_add_fetch(&g_supp.arrow_clean, 1u, __ATOMIC_RELAXED);
+            LOGI("arrow CLEANUP：吞掉终态后补调一次原函数跑收尾（self=%p，只为收箭头）",
+                 (void *) a0);
+            g_orig(a0, a1, a2, a3, a4, a5, a6, a7, d0, d1, d2, d3, d4, d5, d6, d7);
+        }
+        return 0u;   /* 本事件不转发：Rust 侧看不到 ⇒ 不认领、不起 back */
+    }
     /* 先接住返回值再打日志（原来是尾部调用，返回值直接透传、打不到）。
      * 只给 has_ret 的点打——见 hsb_anchor_has_ret：其余锚点返回值无门控意义
      * （init_gesture_type 甚至被调用方整段丢弃，判定写进对象字段）。 */
@@ -556,34 +1452,74 @@ static uintptr_t hsb_stub(uintptr_t a0, uintptr_t a1, uintptr_t a2, uintptr_t a3
                        ? g_orig(a0, a1, a2, a3, a4, a5, a6, a7,
                                 d0, d1, d2, d3, d4, d5, d6, d7)
                        : 0u;
+    /* ===== 双锚点方案的观测桩：init_gesture_type 在 DOWN 拍锁存角区 =====
+     * 与返回值无关、无条件跑。锁存的 (x,y) 供第二锚点 pilfer_pointers 判断本手势是否角区。
+     * 这是"左中右 xy 差不多"的根治：锁的是 DOWN 锚点，不是每个事件的 live 点。 */
+    if (g_hook.has_latch) {
+        hsb_latch_down(a0, a1, d0, d1);
+    }
+    /* 侧滑线确认层①：handle_back_gesture 读 event 权威坐标（观察档）。
+     * 抑制命中时上面已 return，不会走到这里。 */
+    if (bev_ok) {
+        hsb_back_event_log(&bev);
+    }
     /* ===== 3.2 角区门控 =====
      * 只在 rv==1（系统已判底部区）时才跑判定——其余情况 hsb_corner_gate 第一行就返回 0，
      * 提前跳过省一次属性查询和两次内存读。
      * corner=0：命中只打 WOULD-HIT，rv 不动。目的是拿判定分布、校准阈值。
      * corner=1：命中即把 rv 强改 0，让 on_input_event 认为"不在底部区"
      *   ⇒ 期望系统走它自己的"区外重定向"路径，不认领、不 pilfer，流留给 spy。
-     * 只打命中行、不打 pass 行：这个 hook 跑在每个输入事件上，pass 行会把.logcat 冲爆。
-     * 强改时把系统原值一起打出来，出了事能一眼回放"系统本来判什么、我们改成了什么"。 */
+     * 只打命中行 + 少量采样行、不打 pass 行：这个 hook 跑在每个输入事件上，pass 行会把
+     * logcat 冲爆（采样规则见下方）。 */
     int gate_hit = 0;
     if (g_hook.has_gate) {
-        __atomic_add_fetch(&g_cs.fires, 1u, __ATOMIC_RELAXED);
+        uint32_t nfire = __atomic_add_fetch(&g_cs.fires, 1u, __ATOMIC_RELAXED);
+        /* 几何刷新**无条件**跑（原来只在 rv==1 里 ⇒ rv 恒 0 时连属性写没写进去都看不到）。 */
+        int dims_ok = hsb_corner_geom(a0, HSB_DIMS_W_IMPL, HSB_DIMS_H_IMPL);
+        if (rv != 1u) {
+            /* ⚠ 这一支是"读数稳定性"的关键（2026-10-11 实机教训）：实测整轮 rv 恒 0，
+             * 而此前所有诊断（geom / MISS / SKIP）都挂在 rv==1 里面 ⇒ 一行证据都没有，
+             * 只剩 `fires=N eval=0`，连"系统到底判了什么值"都读不出来。
+             * 现在 rv 本身无条件出读数：第 1 次 + 每 50 次（一次手势约 5~15 次调用，
+             * 够看分布又不冲爆 logcat）。 */
+            uint32_t ns = __atomic_add_fetch(&g_rv_logged, 1u, __ATOMIC_RELAXED);
+            if (ns == 1u || ns % 50u == 0u) {
+                char sfx[128];
+                hsb_cs_suffix(sfx, sizeof(sfx));
+                LOGI("corner rv x=%.1f y=%.1f rv=0x%lx dims=%d fire#%u%s",
+                     hsb_lo32_float(d0), hsb_lo32_float(d1),
+                     (unsigned long) rv, dims_ok, nfire, sfx);
+            }
+        }
         if (rv == 1u) {
             int corner_on = hsb_corner_enabled();
-            uintptr_t orig_rv = rv;
-            gate_hit = hsb_corner_gate(a0, d0, d1, rv, corner_on, &rv);
-            if (gate_hit || g_cs.eval % 25u == 0u) {
-                /* 命中必打；另外每 25 次"系统判成底部区"补一条采样，
-                 * 这样 =1 档下也能看到中部 Home 被判定后为什么没收窄（miss 的证据）。 */
-                char sfx[96];
+            int why = 0;
+            /* 2026-10-11 双锚点方案：本锚点（is_in_bottom_gesture_region）**降级为纯观测**——
+             * force 恒 0，不再强改 rv（旧 FORCE 污染共享字段 self+0xf9，且要 rv==1 才动）。
+             * 动作改到 pilfer_pointers（见 hsb_stub_pilfer）。corner_on 仅作日志标签。 */
+            gate_hit = hsb_corner_gate(a0, d0, d1, rv, 0, &rv, &why);
+            /* 命中必打；另外"第 1 次 eval"与"每 25 次 eval"各补一条采样——
+             * 前者的用途：一轮手势常常只有个位数次 eval（19:15 那轮 eval=7），
+             * 只按 25 采样等于一行证据都拿不到，而"为什么没命中"恰恰要靠这些行。
+             * 采样行**不套用命中行的标签**：没命中就写 MISS，免得"缺行=真没命中"
+             * 这条推断被采样行证伪。 */
+            uint32_t ev = __atomic_load_n(&g_cs.eval, __ATOMIC_RELAXED);
+            if (gate_hit || ev <= 1u || ev % 25u == 0u) {
+                char sfx[128];
                 hsb_cs_suffix(sfx, sizeof(sfx));
-                if (corner_on) {
-                    LOGI("corner gate FORCE x=%.1f y=%.1f sys_ret=0x%lx -> ret=0x%lx%s",
-                         hsb_lo32_float(d0), hsb_lo32_float(d1),
-                         (unsigned long) orig_rv, (unsigned long) rv, sfx);
+                float lx = hsb_lo32_float(d0);
+                float ly = hsb_lo32_float(d1);
+                if (gate_hit) {
+                    LOGI("corner gate WOULD-HIT x=%.1f y=%.1f (observe-only, rv unchanged)%s",
+                         lx, ly, sfx);
+                } else if (why == 2) {
+                    /* 横屏跳过：不写 MISS——写 MISS 会被读成"竖屏角滑没命中"，
+                     * 而这一档根本没判（:ui 横屏不接管，这是刻意的对齐）。 */
+                    LOGI("corner gate SKIP x=%.1f y=%.1f (landscape w>=h)%s", lx, ly, sfx);
+                } else if (why == 3) {
+                    LOGI("corner gate BADDIMS x=%.1f y=%.1f (w/h unreadable)%s", lx, ly, sfx);
                 } else {
-                    LOGI("corner gate WOULD-HIT x=%.1f y=%.1f ret=0x%lx (corner=0, rv unchanged)%s",
-                         hsb_lo32_float(d0), hsb_lo32_float(d1),
-                         (unsigned long) orig_rv, sfx);
+                    LOGI("corner gate MISS x=%.1f y=%.1f corner=%d%s", lx, ly, corner_on, sfx);
                 }
             }
         }
@@ -622,14 +1558,33 @@ static uintptr_t hsb_stub(uintptr_t a0, uintptr_t a1, uintptr_t a2, uintptr_t a3
             strncat(detail, t, sizeof(detail) - strlen(detail) - 1);
         }
         if (g_hook.has_gate) {
-            /* 角区门控锚点：HIT 行带累计计数（detail 里的 x/y 已由 FORCE/WOULD-HIT
-             * 行单独打了，这里不重复，只留计数——省 logcat 宽度）。 */
-            char sfx[96];
+            /* 角区门控锚点：HIT/ALIVE 行带累计计数 + 存活时长 + 坐标 + 屏幕尺寸。
+             *
+             * ⚠ 坐标**必须留在这条行上**（2026-10-11 实机教训）：我曾以为"x/y 已由
+             * FORCE/WOULD-HIT/MISS 行单独打了"，就把 detail 丢了——结果只要 `rv` 一次都
+             * 不为 1，gate 行一条都不会打（它整个在 `rv==1` 分支里），而那轮的 HIT 行里
+             * 只剩 `fires=N eval=0`，**连"系统到底判了什么"都看不出来**。
+             * 这条行受 loglimit 限制但必打（first/quiet），是 rv 恒 0 时唯一证据；
+             * 它也是 hsb_corner_geom 唯一会被调用的路径——几何有没有生效同样只能看这里。 */
+            char sfx[128];
             hsb_cs_suffix(sfx, sizeof(sfx));
-            LOGI("%s %s #%u %s", first ? "hook HIT" : "hook ALIVE", anchor, n, sfx);
+            LOGI("%s %s #%u %s since_install=%llus%s %s", first ? "hook HIT" : "hook ALIVE",
+                 anchor, n, detail, (unsigned long long) (now - g_hook.installed_at_s),
+                 quiet ? " (quiet)" : "", sfx);
         } else {
-            LOGI("%s %s #%u %s d0=%016llx d1=%016llx since_install=%llus%s",
-                 first ? "hook HIT" : "hook ALIVE", anchor, n, detail,
+            /* 侧滑线（has_back_event）多带一段抑制读数：否则"抑制没生效"与"根本没走抑制
+             * 分支"在日志里长得一样（与角区 fires/eval 同款可观测性教训）。 */
+            char sup[224] = "";
+            if (g_hook.has_back_event) {
+                snprintf(sup, sizeof(sup),
+                         " [supp on=%d seen=%u inband=%u cf=%u rst=%u dw=%u would=%u sw=%u ev=%u cp=%u geomx=%u af=%u ac=%u]",
+                         hsb_suppress_value(), g_supp.seen, g_supp.in_band, g_supp.confirmed,
+                         g_supp.reset, g_supp.dwelled, g_supp.would, g_supp.swallow,
+                         g_supp.swallow_ev, g_supp.cancel_pass, g_supp.geom_bad,
+                         g_supp.arrow_fix, g_supp.arrow_clean);
+            }
+            LOGI("%s %s #%u %s%s d0=%016llx d1=%016llx since_install=%llus%s",
+                 first ? "hook HIT" : "hook ALIVE", anchor, n, detail, sup,
                  (unsigned long long) hsb_bits64(d0),
                  (unsigned long long) hsb_bits64(d1),
                  (unsigned long long) (now - g_hook.installed_at_s),
@@ -638,6 +1593,54 @@ static uintptr_t hsb_stub(uintptr_t a0, uintptr_t a1, uintptr_t a2, uintptr_t a3
         g_hook.last_log_s = now;
     }
     return rv;
+}
+
+/* ===== 第二锚点桩：pilfer_pointers（动作位，2026-10-11 双锚点方案）=====
+ * 只吃 self（InputMonitor），没有返回值语义。角区锁存成立时**不调用原函数**
+ * ⇒ 系统不执行 InputMonitor.pilferPointers() ⇒ 不抢流 ⇒ :ui 拿全流。
+ * 非角区透传，正常 Home 不受影响。
+ *
+ * ⚠ 2026-10-11 真机四轮结论：**系统对底角斜滑从不调本函数**（`pblk` 恒 0、无任何
+ *   pilfer 行）⇒ 本动作位对角滑**无效**，已降级为默认关（`debug.hsb.native.corner2=0`）。
+ *   角滑实为**底部手势**（慢/小→最近任务、大→Home，系统用停顿区分）。保留本代码作
+ *   观测/存档；底角恢复路径见 `docs/adaptation/os4-native-session-*.md` 与计划文件。
+ *   侧滑停顿线（`GestureInputBackHelper` 家族）才是主线。 */
+static uintptr_t hsb_stub_pilfer(uintptr_t a0, uintptr_t a1, uintptr_t a2, uintptr_t a3,
+                                 uintptr_t a4, uintptr_t a5, uintptr_t a6, uintptr_t a7,
+                                 double d0, double d1, double d2, double d3,
+                                 double d4, double d5, double d6, double d7) {
+    (void) a1; (void) a2; (void) a3; (void) a4; (void) a5; (void) a6; (void) a7;
+    (void) d0; (void) d1; (void) d2; (void) d3;
+    (void) d4; (void) d5; (void) d6; (void) d7;
+    int corner = hsb_latch_is_corner();
+    int on = hsb_corner2_enabled();
+    if (on && corner) {
+        uint32_t n = __atomic_add_fetch(&g_cs.pilfer_blocked, 1u, __ATOMIC_RELAXED);
+        if (n == 1u || n % 20u == 0u) {
+            char sfx[176];
+            hsb_cs_suffix(sfx, sizeof(sfx));
+            LOGI("pilfer BLOCKED (corner latch x=%.1f y=%.1f)%s", g_latch.x, g_latch.y, sfx);
+        }
+        return 0u;   /* 不调原函数 */
+    }
+    uint32_t np = __atomic_add_fetch(&g_cs.pilfer_passed, 1u, __ATOMIC_RELAXED);
+    if (corner) {
+        /* 锁存是角区但没拦：只剩"corner2 没开"这一种（否则上面就 return 了）。**必打**——
+         * 否则"拦了没用"和"根本没开"在日志里长得一样（22:33 那轮无法归因的根因）。 */
+        char sfx[176];
+        hsb_cs_suffix(sfx, sizeof(sfx));
+        LOGI("pilfer CORNER-PASS (corner2=%d, NOT blocked) x=%.1f y=%.1f%s",
+             on, g_latch.x, g_latch.y, sfx);
+    } else if (np == 1u || np % 20u == 0u) {
+        /* 透传采样行（第 1 次 + 每 20 次）：否则"正常 Home 没被误伤"只能靠 report 反推。 */
+        char sfx[176];
+        hsb_cs_suffix(sfx, sizeof(sfx));
+        LOGI("pilfer PASSED%s", sfx);
+    }
+    return g_orig_pilfer
+               ? g_orig_pilfer(a0, a1, a2, a3, a4, a5, a6, a7,
+                               d0, d1, d2, d3, d4, d5, d6, d7)
+               : 0u;
 }
 
 /* --- 候选 load bias + 可执行段边界（两条来源共用，先 phdr 后 maps 追加） --- */
@@ -805,11 +1808,113 @@ static uintptr_t hsb_sigscan(const uint8_t *pat, uint32_t *hits_out) {
     return hits == 1u ? found : 0u;
 }
 
+/*
+ * PC 相对指令的「立即数字段掩码」（跨构建指纹用）。
+ * 为什么需要：同一 Rust crate 的同族构建里，函数序言**除 PC 相对位移外逐字节相同**——实测
+ * 镜像 8.01.02.7654 vs 设备 8.01.02.7719：on_swipe_process / on_back_invoke / on_back_cancelled /
+ * handle_back_gesture / is_in_bottom_gesture_region / init_gesture_type / match_region_check
+ * 32/32 全同；try_delegate_back_to_sidebar 只有第 20–23 字节（bl imm）不同；on_swipe_start 与
+ * on_swipe_stop_direct 只有末 4 字节（adrp imm）不同。
+ * 不做掩码会怎样：新锚点拿镜像 prologue 去比设备代码必然 mismatch ⇒ 被 fail-closed 挡在门外
+ * （宁可拒装也不猜是对的，但"整族都拒"就失去兜底意义）。掩码只放开**必然随布局变化**的字段，
+ * 其余位仍逐位比 ⇒ 指纹强度基本不变。
+ */
+static uint32_t hsb_word_mask(uint32_t w) {
+    if ((w & 0xFC000000u) == 0x94000000u) return 0xFC000000u;  /* BL  imm26 */
+    if ((w & 0xFC000000u) == 0x14000000u) return 0xFC000000u;  /* B   imm26 */
+    if ((w & 0xFF000010u) == 0x54000000u) return 0xFF00001Fu;  /* B.cond imm19 */
+    if ((w & 0x7E000000u) == 0x34000000u) return 0x7E00001Fu;  /* CBZ/CBNZ imm19 */
+    if ((w & 0x7E000000u) == 0x36000000u) return 0x7E00001Fu;  /* TBZ/TBNZ imm14 */
+    if ((w & 0x9F000000u) == 0x90000000u) return 0x9F00001Fu;  /* ADRP */
+    if ((w & 0x9F000000u) == 0x10000000u) return 0x9F00001Fu;  /* ADR  */
+    if ((w & 0x3B000000u) == 0x18000000u) return 0xC400001Fu;  /* LDR (literal) */
+    if ((w & 0x3B000000u) == 0x38000000u) return 0xFFC003FFu;  /* load/store 无符号立即数 */
+    return 0xFFFFFFFFu;                                        /* 其它一律全等 */
+}
+
+/* prologue 匹配：先逐字节全等（快路径），失败再按字掩码比；*masked 标出"靠掩码才过"。 */
+static int hsb_pl_match(const volatile uint8_t *p, const uint8_t *pat, uint32_t *bad_out,
+                        int *masked_out) {
+    unsigned b = 0;
+    for (; b < HSB_PROLOGUE_BYTES; b++) {
+        if (p[b] != pat[b]) break;
+    }
+    if (bad_out) *bad_out = b;
+    if (b == HSB_PROLOGUE_BYTES) {
+        if (masked_out) *masked_out = 0;
+        return 1;
+    }
+    for (unsigned w = 0; w + 4u <= HSB_PROLOGUE_BYTES; w += 4u) {
+        uint32_t pw = (uint32_t) p[w] | ((uint32_t) p[w + 1] << 8) |
+                      ((uint32_t) p[w + 2] << 16) | ((uint32_t) p[w + 3] << 24);
+        uint32_t pp;
+        memcpy(&pp, pat + w, 4u);
+        uint32_t m = hsb_word_mask(pp);
+        if ((pw & m) != (pp & m)) return 0;
+    }
+    if (masked_out) *masked_out = 1;
+    return 1;
+}
+
+/* 掩码版特征扫描：与 hsb_sigscan 同一套纪律（步长 4、命中≠1 即弃），只是按字掩码比。
+ * 首字若含 PC 相对字段就不能用"首字节预筛"（立即数变了首字节也变）⇒ 那种情况全量扫。 */
+static uintptr_t hsb_sigscan_mask(const uint8_t *pat, uint32_t *hits_out) {
+    uintptr_t found = 0;
+    uint32_t hits = 0;
+    uint32_t want[HSB_PROLOGUE_BYTES / 4u];
+    uint32_t mask[HSB_PROLOGUE_BYTES / 4u];
+    for (unsigned i = 0; i < HSB_PROLOGUE_BYTES / 4u; i++) {
+        memcpy(&want[i], pat + i * 4u, 4u);
+        mask[i] = hsb_word_mask(want[i]);
+    }
+    for (unsigned s = 0; s < g_xseg_count; s++) {
+        const volatile uint8_t *base = (const volatile uint8_t *) g_xsegs[s].start;
+        size_t span = (size_t) (g_xsegs[s].end - g_xsegs[s].start);
+        if (span < HSB_PROLOGUE_BYTES) continue;
+        size_t n = span - HSB_PROLOGUE_BYTES + 1u;
+        for (size_t k = 0; k < n; k += 4u) {
+            if (mask[0] == 0xFFFFFFFFu && base[k] != pat[0]) continue;
+            unsigned w = 0;
+            for (; w < HSB_PROLOGUE_BYTES / 4u; w++) {
+                const volatile uint8_t *q = base + k + w * 4u;
+                uint32_t qw = (uint32_t) q[0] | ((uint32_t) q[1] << 8) |
+                              ((uint32_t) q[2] << 16) | ((uint32_t) q[3] << 24);
+                if ((qw & mask[w]) != (want[w] & mask[w])) break;
+            }
+            if (w == HSB_PROLOGUE_BYTES / 4u) {
+                hits++;
+                found = (uintptr_t) (base + k);
+                if (hits > 1u) { *hits_out = hits; return 0u; }  /* 歧义：早停，别猜 */
+            }
+        }
+    }
+    *hits_out = hits;
+    return hits == 1u ? found : 0u;
+}
+
+/* （第二锚点只支持 pilfer_pointers：backup 存 g_orig_pilfer，存活标志 g_hook2_installed） */
+
 static void hsb_install_at(const HsbLauncherAnchor *a, uintptr_t at, uintptr_t base,
-                           const char *how) {
+                           const char *how, int secondary) {
     void *backup = NULL;
-    int rc = g_api->hook_func((void *) at, (void *) hsb_stub, &backup);
-    if (rc == 0 && backup != NULL) {
+    void *stub = secondary ? (void *) hsb_stub_pilfer : (void *) hsb_stub;
+    int rc = g_api->hook_func((void *) at, stub, &backup);
+    /* ABI 稳健性（2026-10-14）：LSPosed 的 native `hook_func` **官方头文件我们并不持有**
+     * ——所依赖的三个 artifact（api/interface/service 101.x）里没有任何 .h/.so，本结构体
+     * 是手工 ABI 镜像；真机实测返回 0 表成功（version=2）。但若某版本把它改成"返回原函数
+     * 指针 / null 表失败"（Dobby/shadowhook 两种流派都存在），只认 `rc == 0` 会把**成功
+     * 判成失败**（指针低 32 位通常非 0）。故判据只看 out-param：失败时 backup 保持 NULL
+     * （调用前清零），成功与否与返回值语义解耦；rc 只用于日志。 */
+    if (backup != NULL) {
+        if (secondary) {
+            /* 第二锚点（pilfer_pointers）：只记 backup + 存活标志，不碰主锚点状态。 */
+            g_orig_pilfer = (HsbFn16) (uintptr_t) backup;
+            g_hook2_installed = 1;
+            snprintf(g_hook2_name, sizeof(g_hook2_name), "%s", a->name);
+            LOGI("hook installed(2) %s target=%p backup=%p size=%llu via=%s bias=%p stub=pilfer",
+                 a->name, (void *) at, backup, (unsigned long long) a->size, how, (void *) base);
+            return;
+        }
         g_orig = (HsbFn16) (uintptr_t) backup;
         g_hook.hook_installed++;
         g_hook.bias = base;
@@ -823,11 +1928,13 @@ static void hsb_install_at(const HsbLauncherAnchor *a, uintptr_t at, uintptr_t b
         g_hook.has_args4 = hsb_anchor_has_args4(a->name);
         g_hook.has_dims = hsb_anchor_has_dims(a->name);
         g_hook.has_gate = hsb_anchor_has_gate(a->name);
+        g_hook.has_latch = hsb_anchor_has_latch(a->name);
+        g_hook.has_back_event = hsb_anchor_has_back_event(a->name);
         g_corner_checked_s = 0;   /* 换锚点时强制重读 corner 开关，别用上一个人的缓存 */
-        LOGI("hook installed %s target=%p backup=%p size=%llu via=%s bias=%p lib=%s xy=%d ret=%d args4=%d dims=%d gate=%d",
+        LOGI("hook installed %s target=%p backup=%p size=%llu via=%s bias=%p lib=%s xy=%d ret=%d args4=%d dims=%d gate=%d latch=%d",
              a->name, (void *) at, backup, (unsigned long long) a->size, how,
              (void *) base, g_hook.lib_path, g_hook.has_xy, g_hook.has_ret,
-             g_hook.has_args4, g_hook.has_dims, g_hook.has_gate);
+             g_hook.has_args4, g_hook.has_dims, g_hook.has_gate, g_hook.has_latch);
     } else {
         g_hook.hook_failed++;
         snprintf(g_hook.reason, sizeof(g_hook.reason),
@@ -836,8 +1943,95 @@ static void hsb_install_at(const HsbLauncherAnchor *a, uintptr_t at, uintptr_t b
     }
 }
 
+/* 定位一个锚点（主/副/附共用）。返回 0 = 没找到。
+ * 命中时 *base_out = 采纳的 load bias（sigscan 命中为 0），how = "offset"/"sigscan"。
+ * 两路都 fail-closed：可执行段边界校验（hsb_in_exec）+ 32B prologue 校验（逐字节 → PC 相对掩码）。
+ * 特征扫描命中数≠1 一律不用（歧义=拒，宁可不装也不猜）。 */
+static uintptr_t hsb_locate(const HsbLauncherAnchor *a, uintptr_t *base_out, char *how,
+                            size_t how_sz) {
+    *base_out = 0u;
+
+    /* offset==0 = profile 明确标记"本锚点还没取到偏移"（跨构建）⇒ 跳过偏移路，直接特征扫描。
+     * 否则 base+0 会撞在 ELF 头上，每个候选白打一行 out-of-exec，日志噪音盖住有效读数。 */
+    int have_offset = a->offset != 0u;
+    if (!have_offset) {
+        LOGI("locate %s: profile offset=0 ⇒ 直接特征扫描（真机读到 lib+偏移 后再回填）", a->name);
+    }
+
+    /* 第一路：profile 偏移 + 候选 load bias（同构建设备应直接命中） */
+    for (unsigned c = 0; have_offset && c < g_cand_count; c++) {
+        uintptr_t base = g_cands[c];
+        uintptr_t at = base + (uintptr_t) a->offset;
+        if (!hsb_in_exec(at, HSB_PROLOGUE_BYTES)) {
+            LOGI("cand %p out of exec seg, skip (target=%p)", (void *) base, (void *) at);
+            continue;
+        }
+        g_hook.prologue_checked++;
+        const volatile uint8_t *p = (const volatile uint8_t *) at;
+        uint32_t bad = HSB_PROLOGUE_BYTES;
+        int masked = 0;
+        if (hsb_pl_match(p, a->prologue, &bad, &masked)) {
+            snprintf(how, how_sz, "%s", "offset");
+            if (masked) {
+                g_hook.prologue_masked++;
+                LOGI("cand accepted(masked) %s base=%p 首个差异字节=%u（PC 相对立即数漂移，其余位全等）",
+                     a->name, (void *) base, bad);
+            }
+            *base_out = base;
+            return at;
+        }
+        g_hook.prologue_mismatch++;
+        snprintf(g_hook.reason, sizeof(g_hook.reason), "%s cand=%p prologue[%u]=%02x want %02x",
+                 a->name, (void *) base, bad, p[bad], a->prologue[bad]);
+        LOGI("cand rejected: %s", g_hook.reason);
+    }
+
+    /* 第二路：偏移全崩（构建漂移）⇒ 按 prologue 特征扫地址；全等扫零命中才用掩码版 */
+    g_hook.sig_scans++;
+    uint32_t hits = 0;
+    uintptr_t sig = hsb_sigscan(a->prologue, &hits);
+    int masked = 0;
+    if (!sig && hits == 0u) {
+        sig = hsb_sigscan_mask(a->prologue, &hits);
+        masked = 1;
+    }
+    g_hook.sig_hits = hits;
+    if (sig) {
+        if (masked) g_hook.prologue_masked++;
+        LOGI("sigscan%s found %s at=%p (offsets stale, hits=1)", masked ? "(masked)" : "", a->name,
+             (void *) sig);
+        snprintf(how, how_sz, "%s", "sigscan");
+        return sig;
+    }
+    snprintf(g_hook.reason, sizeof(g_hook.reason),
+             "offset cands=%u mismatch=%u | sigscan hits=%u segs=%u (build drift or codegen diff)",
+             g_cand_count, g_hook.prologue_mismatch, hits, g_xseg_count);
+    LOGI("hook refused: %s", g_hook.reason);
+    return 0u;
+}
+
+/* 解析并安装一个具名锚点（主/副共用）。返回 1 = 装成功。 */
+static int hsb_install_named(const char *want, int secondary) {
+    for (unsigned i = 0; i < HSB_ANCHOR_COUNT; i++) {
+        const HsbLauncherAnchor *a = &kHsbAnchors[i];
+        if (strcmp(a->name, want) != 0) continue;
+        char how[16] = {0};
+        uintptr_t base = 0u;
+        uintptr_t at = hsb_locate(a, &base, how, sizeof(how));
+        if (!at) return 0;
+        hsb_install_at(a, at, base, how, secondary);
+        return 1;
+    }
+    snprintf(g_hook.reason, sizeof(g_hook.reason), "anchor %s not in profile", want);
+    LOGI("hook skipped: %s", g_hook.reason);
+    return 0;
+}
+
 static void hsb_try_install_hooks(void) {
-    if (g_hook.hook_installed) return;
+    const char *want2 = hsb_chosen_anchor2();
+    int need2 = want2 != NULL;
+    /* 全都装好了才停；主已装、副未装时仍要进来补（不重装已装的）。 */
+    if (g_hook.hook_installed && (!need2 || g_hook2_installed)) return;
     if (!g_api || !g_api->hook_func) return;
     if (g_hook.attempts >= HSB_MAX_ATTEMPTS) return;
     g_hook.attempts++;
@@ -860,54 +2054,87 @@ static void hsb_try_install_hooks(void) {
         return;
     }
 
-    const char *want = hsb_chosen_anchor();
-    LOGI("anchor selected: %s (phdr=%u maps_x=%u cands=%u)", want, g_hook.matches_phdr,
-         g_hook.matches_maps, g_cand_count);
-    for (unsigned i = 0; i < HSB_ANCHOR_COUNT; i++) {
-        const HsbLauncherAnchor *a = &kHsbAnchors[i];
-        if (strcmp(a->name, want) != 0) continue;
-
-        /* 第一路：profile 偏移 + 候选 load bias（同构建设备应直接命中） */
-        for (unsigned c = 0; c < g_cand_count; c++) {
-            uintptr_t base = g_cands[c];
-            uintptr_t at = base + (uintptr_t) a->offset;
-            if (!hsb_in_exec(at, HSB_PROLOGUE_BYTES)) {
-                LOGI("cand %p out of exec seg, skip (target=%p)", (void *) base, (void *) at);
-                continue;
-            }
-            g_hook.prologue_checked++;
-            const volatile uint8_t *p = (const volatile uint8_t *) at;
-            unsigned bad = HSB_PROLOGUE_BYTES;
-            for (unsigned b = 0; b < HSB_PROLOGUE_BYTES; b++) {
-                if (p[b] != a->prologue[b]) { bad = b; break; }
-            }
-            if (bad == HSB_PROLOGUE_BYTES) {
-                hsb_install_at(a, at, base, "offset");
-                return;
-            }
-            g_hook.prologue_mismatch++;
-            snprintf(g_hook.reason, sizeof(g_hook.reason),
-                     "%s cand=%p prologue[%u]=%02x want %02x",
-                     a->name, (void *) base, bad, p[bad], a->prologue[bad]);
-            LOGI("cand rejected: %s", g_hook.reason);
-        }
-
-        /* 第二路：偏移全崩（构建漂移）⇒ 按 prologue 特征扫地址 */
-        g_hook.sig_scans++;
-        uintptr_t sig = hsb_sigscan(a->prologue, &g_hook.sig_hits);
-        if (sig) {
-            LOGI("sigscan found %s at=%p (offsets stale, hits=1)", a->name, (void *) sig);
-            hsb_install_at(a, sig, 0u, "sigscan");
-            return;
-        }
-        snprintf(g_hook.reason, sizeof(g_hook.reason),
-                 "offset cands=%u mismatch=%u | sigscan hits=%u segs=%u (build drift or codegen diff)",
-                 g_cand_count, g_hook.prologue_mismatch, g_hook.sig_hits, g_xseg_count);
-        LOGI("hook refused: %s", g_hook.reason);
-        return;
+    if (!g_hook.hook_installed) {
+        const char *want = hsb_chosen_anchor();
+        LOGI("anchor selected: %s (phdr=%u maps_x=%u cands=%u)", want, g_hook.matches_phdr,
+             g_hook.matches_maps, g_cand_count);
+        if (!hsb_install_named(want, 0)) return;
     }
-    snprintf(g_hook.reason, sizeof(g_hook.reason), "anchor %s not in profile", want);
-    LOGI("hook skipped: %s", g_hook.reason);
+    /* 第二锚点（动作位）：角区双锚点方案。缺省不装。 */
+    if (need2 && !g_hook2_installed) {
+        /* 只有"真的在装 pilfer_pointers"时那条锁存警告才有意义（2026-10-14 降噪）：
+         * 之前无论 anchor2 是什么都打，`anchor2=on_swipe_stop_direct` 的正常档也被刷成
+         * "拦截不生效"，真机看日志时是纯噪声。 */
+        if (!g_hook.has_latch && strcmp(want2, "pilfer_pointers") == 0) {
+            /* 静默失效是最坏的：拦截桩在跑，但锁存从不写 ⇒ pblk 永远 0，会被误读成
+             * "拦了没用"。这里显式点名正确配置。 */
+            LOGI("WARN anchor2=pilfer_pointers 但主锚点 %s 不锁存(has_latch=0) ⇒ 拦截不生效；"
+                 "请设 debug.hsb.native.anchor=init_gesture_type", g_hook.anchor);
+        }
+        LOGI("anchor2 selected: %s", want2);
+        if (!hsb_install_named(want2, 1)) LOGI("anchor2 install failed (primary stays)");
+    }
+    /* 安装面汇总：一条可 grep 的"定论行"。真机取证/脚本判词都靠它——Java 侧的
+     * NativeProbe.report 在 launcher 域没人调（OS4 没有模块 Java 半侧），别等它。
+     * 走到这里说明本轮补齐结束；全部装好时上面的早退会拦住后续重复调用，故只打一次。 */
+    if (g_hook.hook_installed) {
+        LOGI("hooks ready: main=%s anchor2=%s masked=%u", g_hook.anchor,
+             (g_hook2_installed && g_hook2_name[0]) ? g_hook2_name : "-", g_hook.prologue_masked);
+    }
+}
+
+/* ── 文件 marker 关断通道（2026-10-13 追加，见 plan §17）─────────────────────────────
+ * 真机已证：property 的两条免-su 写路都被拒——本 .so 里的 `__system_property_set`
+ * 回 `rc=-1 readback=0`，systemui 侧反射抛
+ * `RuntimeException: failed to set system property "persist.hsb.native.hook" to "1"`。
+ * ⇒ 需要一条**完全不需要 root** 的通道：模块 App 能无权限写自己的
+ * `Android/media/<applicationId>/`，这里让 launcher 侧读同一个文件。
+ * 语义：首字符 '0' ⇒ 显式关断（与 `persist.hsb.native.hook == "0"` **并联**，
+ * 任一为 0 即关）；文件不存在 / 读不到 / 空 / 其它值 ⇒ 不表态（fail-open 不变）。
+ * 多候选路径是**自证**用的：真机日志打出哪条路径读到了什么，
+ * "SELinux 挡哪条、/storage 在不在本进程 namespace 里"一眼可见，不用再猜。 */
+#define HSB_GATE_MARKER_NAME "hsb_native_gate"
+static const char *kGateMarkerPaths[] = {
+    "/storage/emulated/0/Android/media/io.github.mikudayoooooooo.hypersidebar/" HSB_GATE_MARKER_NAME,
+    "/sdcard/Android/media/io.github.mikudayoooooooo.hypersidebar/" HSB_GATE_MARKER_NAME,
+    "/data/media/0/Android/media/io.github.mikudayoooooooo.hypersidebar/" HSB_GATE_MARKER_NAME,
+    "/data/local/tmp/" HSB_GATE_MARKER_NAME,
+    NULL,
+};
+static const char *kGateMarkerTags[] = {"emulated0", "sdcard", "dmedia0", "tmp"};
+
+static int g_marker_state = -1; /* -1 未读 / 0 读到但非 "0" / 1 读到 "0" */
+static int g_marker_path = -1;  /* 命中的候选下标；-1 = 一条都没读到 */
+static char g_marker_val[8] = {0};
+
+/* 返回 1 = 有文件明确写着 "0"（关断指令）；0 = 不表态。结果同时记进 g_marker_* 供取证行打印。 */
+static int hsb_gate_marker_probe(void) {
+    g_marker_state = -1;
+    g_marker_path = -1;
+    g_marker_val[0] = '\0';
+    for (int i = 0; kGateMarkerPaths[i]; i++) {
+        FILE *f = fopen(kGateMarkerPaths[i], "rb");
+        if (!f) continue; /* 不存在 / 被 SELinux 挡 / 路径没挂进本进程 namespace：都不表态 */
+        char buf[8] = {0};
+        size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+        fclose(f);
+        if (n == 0) continue;
+        char c = 0;
+        for (size_t k = 0; k < n; k++) {
+            const char ch = buf[k];
+            if (ch != ' ' && ch != '\t' && ch != '\n' && ch != '\r') {
+                c = ch;
+                break;
+            }
+        }
+        if (c == 0) continue;
+        g_marker_path = i;
+        g_marker_val[0] = c;
+        g_marker_val[1] = '\0';
+        g_marker_state = (c == '0') ? 1 : 0;
+        return g_marker_state;
+    }
+    return 0;
 }
 
 static int hsb_prop_enabled(void) {
@@ -918,8 +2145,28 @@ static int hsb_prop_enabled(void) {
      * 主线包里这段代码不是"运行时不执行"，而是"根本不存在"。 */
     return 0;
 #else
-    char v[8] = {0};
-    return __system_property_get("debug.hsb.native.hook", v) > 0 && strcmp(v, "1") == 0;
+    /* 分三档（2026-10-13 **改 fail-open**，见 docs/adaptation/os4-native-hold-route-plan.md §16）：
+     *   ① `debug.hsb.native.hook` 有值 ⇒ 用它（'1'=开、其它=关）：排障/压测的临时覆盖，
+     *      重启即清、不落盘；
+     *   ② 否则**任一通道的显式关断** ⇒ 关：`persist.hsb.native.hook == "0"`（模块 App 用 su 写）
+     *      或文件 marker 首字符 '0'（模块 App **免 root** 写，见 plan §17）；
+     *   ③ 其余（属性缺失 / 读不到 / 值非 "0"，marker 不存在/空/非 "0"）⇒ **开**。
+     * 为什么两路关断**并联**：真机上属性写路全被拒，若只看属性，"用户关开关"这个动作会
+     * 关不掉（属性停在旧的 "1"）——marker 那条不需要 root，是真正能落地的关断通道。
+     * 为什么从 fail-closed 改成 fail-open（2026-10-13）：原语义要求"先有属性=1 才接管"，
+     * 可真机上两条免-su 写路都可能被拒（模块 App 的 `su` 被 EACCES 挡在 execve；systemui 的
+     * `SystemProperties.set` 反射抛异常），属性一旦停在 0，重启后 native 静默不装载 ——
+     * 功能"时灵时不灵"，比误接管糟得多。而**本 .so 是被 LSPosed 按"模块启用 + 作用域"
+     * dlopen 进 launcher 的**，"我现在在这里"本身就是用户授权的最强证据（参考实现 4371
+     * 也是把 Zygisk module enabled state 当成唯一运行 gate，不再依赖运行期属性推送）。
+     * 代价（已写进文档风险栏）：把模块开关关掉、属性与 marker 又都写不进的机型上 native
+     * 仍会接管（停顿手势被吞、无扇形），须靠 LSPosed 禁用模块 / `debug.hsb.native.hook=0` 彻底关。 */
+    char v[PROP_VALUE_MAX] = {0};
+    if (__system_property_get("debug.hsb.native.hook", v) > 0) return strcmp(v, "1") == 0;
+    v[0] = '\0';
+    if (__system_property_get(HSB_ENABLE_PROP, v) > 0 && strcmp(v, "0") == 0) return 0;
+    if (hsb_gate_marker_probe() == 1) return 0;
+    return 1;
 #endif
 }
 
@@ -942,6 +2189,33 @@ NativeOnModuleLoaded native_init(const NativeAPIEntries *entries) {
     g_report.has_hook_func = entries->hook_func ? 1u : 0u;
     g_report.has_unhook_func = entries->unhook_func ? 1u : 0u;
 
+    /* 总闸来源取证：真机排查"为什么没装 hook"第一句就看这行——是 debug 覆盖、是模块 App
+     * 推的 persist/marker 显式关断（"0"）、还是都没表态（⇒ fail-open：被加载即接管）。
+     * marker= 那栏把"哪条候选路径读到了什么"直接打出来（自证，见 plan §17）。 */
+    {
+        char d[PROP_VALUE_MAX] = {0};
+        int hd = __system_property_get("debug.hsb.native.hook", d);
+        char pv[PROP_VALUE_MAX] = {0};
+        int hp = __system_property_get(HSB_ENABLE_PROP, pv);
+        hsb_gate_marker_probe();
+        char mdesc[64];
+        if (g_marker_path >= 0) {
+            snprintf(mdesc, sizeof mdesc, "\"%s\"@%s", g_marker_val, kGateMarkerTags[g_marker_path]);
+        } else {
+            snprintf(mdesc, sizeof mdesc, "none");
+        }
+        const char *src =
+            hd > 0 ? "debug"
+                   : (hp > 0 && strcmp(pv, "0") == 0)
+                         ? "persist-kill"
+                         : (g_marker_state == 1) ? "marker-kill"
+                                                 : (hp > 0) ? "persist-open"
+                                                            : (g_marker_state == 0) ? "marker-open" : "loaded-open";
+        LOGI("gate: debug=%s persist=%s marker=%s src=%s ⇒ enabled=%d"
+             "（优先级 debug 覆盖 > 任一通道显式 0 关断 > 缺失即开 fail-open）",
+             hd > 0 ? d : "-", hp > 0 ? pv : "-", mdesc, src, hsb_prop_enabled());
+    }
+
     /* 已加载库回放（照抄参考实现，但**只作取证**）：裸 soname 的 RTLD_NOLOAD 查询受
      * linker namespace 隔离与加载时机影响，实机给出 absent 而桌面库其实在内存里
      * （见 §门控复盘）。hook 侧现在自己扫 maps+phdr，不再依赖这里的结论。 */
@@ -952,8 +2226,6 @@ NativeOnModuleLoaded native_init(const NativeAPIEntries *entries) {
             LOGI("replay: %s already loaded (handle=%p)", kReplayLibs[i], h);
             on_module_loaded(kReplayLibs[i], h);
             dlclose(h);
-        } else {
-            LOGI("replay: %s absent (取证项，非判据)", kReplayLibs[i]);
         }
     }
 
@@ -986,6 +2258,14 @@ Java_com_lsp_hypersidebar_util_NativeProbe_retry(JNIEnv *env, jclass clazz) {
          g_hook.reason[0] ? g_hook.reason : "-");
 }
 
+/* 2026-10-14 晚删除：`Java_..._NativeProbe_nativeSetProp`（免-su 写属性的 native 写法人）。
+ * 真机 19:24 实测证明它写不进去——`__system_property_set("persist.hsb.native.hook","1")`
+ * 回 `rc=-1 readback=0 ⇒ FAILED`（systemui 里 SystemProperties.set 也抛 RuntimeException）。
+ * 而总闸语义是 fail-open（属性/marker 都不表态即开）⇒ "写 1"本是空操作，唯一需要写的是
+ * 免 root 的**关断** marker（`Android/media/<applicationId>/hsb_native_gate`，Java 侧写）。
+ * 属性通道保留给手工 `adb shell su -c setprop …`；native 侧照旧读它（`hsb_prop_enabled()`）。
+ */
+
 /*
  * Java 取报告口（静态 native，符号进 exports-lsposed.map 的 global 段）。
  * 每行一个事实，Java 侧逐行写 HLog → 运行日志导出/自检报告自动携带。
@@ -996,25 +2276,42 @@ Java_com_lsp_hypersidebar_util_NativeProbe_report(JNIEnv *env, jclass clazz) {
     /* ctor 时刻进程名还是 `<pre-initialized>`（ specialize 未完），那时抓的 cmdline 没用：
      * 报告前重读一次（1008 导出里每段都显示 <pre-initialized> 就是这个原因） */
     if (!g_report.process[0] || strstr(g_report.process, "pre-initialized")) note_process();
-    char buf[1024];
+    /* buf 尺寸按最坏情况算：process 127 + anchor/via/lib/reason 四栏 + 若干指针与满值 %u。
+     * 历史上从 1024 一路抬到 5376（每加一行观测就抬一次；1024 那版会截掉尾部"拒装原因"）。
+     * 2026-10-13 清掉 aux/evoke/sbobs/cancelobs/delegate/recover/swipestop 六行后收紧。 */
+    char buf[4608];
     snprintf(buf, sizeof(buf),
              "magic=HSB1 process=%s\n"
              "ctor=%u native_init=%u api_version=%u hookFunc=%u unhookFunc=%u api_incomplete=%u\n"
              "dlopen_callback_calls=%u launcher_cb=%u replay_mask=0x%x\n"
-             "hook: attempts=%u phdr=%u maps_x=%u checked=%u mismatch=%u sigscan=%u/%u "
+             "hook: attempts=%u phdr=%u maps_x=%u checked=%u mismatch=%u masked=%u sigscan=%u/%u "
              "installed=%u failed=%u hits=%u anchor=%s via=%s bias=%p target=%p alive=%llus\n"
+             "hook2: anchor2=%s installed2=%u (corner2 双锚点方案的 pilfer 动作位)\n"
+             "corner: fires=%u eval=%u hit=%u miss=%u bad=%u skip=%u force=%u "
+             "latch=%u pblk=%u ppass=%u\n"
+             "suppress: on=%d seen=%u inband=%u confirmed=%u reset=%u dwelled=%u would=%u "
+             "swallow=%u ev=%u cancelp=%u geomx=%u (侧滑线 S3 抑制档)\n"
+             "arrowfix: on=%d fixed=%u cleaned=%u (抬手/取消前把 self+0xf0 的 1/2 打成 0 "
+             "⇒ 走 launcher 自己的 state!=1 收尾支：收箭头、不收 back)\n"
              "hook: lib=%s reason=%s",
              g_report.process[0] ? g_report.process : "(unknown)",
              g_report.ctor_ran, g_report.init_fired, g_report.api_version,
              g_report.has_hook_func, g_report.has_unhook_func, g_report.api_incomplete,
              g_report.callback_calls, g_report.launcher_cb_hits, g_report.replay_mask,
              g_hook.attempts, g_hook.matches_phdr, g_hook.matches_maps,
-             g_hook.prologue_checked, g_hook.prologue_mismatch,
+             g_hook.prologue_checked, g_hook.prologue_mismatch, g_hook.prologue_masked,
              g_hook.sig_scans, g_hook.sig_hits, g_hook.hook_installed,
              g_hook.hook_failed, g_hook.hits,
              g_hook.anchor[0] ? g_hook.anchor : "-",
              g_hook.how[0] ? g_hook.how : "-", (void *) g_hook.bias, (void *) g_hook.target,
              g_hook.installed_at_s ? (unsigned long long) (hsb_now_s() - g_hook.installed_at_s) : 0ull,
+             g_hook2_name[0] ? g_hook2_name : "-", g_hook2_installed,
+             g_cs.fires, g_cs.eval, g_cs.hit, g_cs.miss, g_cs.bad, g_cs.skip, g_cs.force,
+             g_cs.latch, g_cs.pilfer_blocked, g_cs.pilfer_passed,
+             hsb_suppress_value(), g_supp.seen, g_supp.in_band, g_supp.confirmed, g_supp.reset,
+             g_supp.dwelled, g_supp.would, g_supp.swallow, g_supp.swallow_ev, g_supp.cancel_pass,
+             g_supp.geom_bad,
+             hsb_arrowfix_value(), g_supp.arrow_fix, g_supp.arrow_clean,
              g_hook.lib_path[0] ? g_hook.lib_path : "-",
              g_hook.reason[0] ? g_hook.reason : "-");
     return (*env)->NewStringUTF(env, buf);

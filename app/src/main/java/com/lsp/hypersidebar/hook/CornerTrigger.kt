@@ -64,6 +64,23 @@ class CornerTrigger {
     private var inConeFrames = 0
     private var verticalFrames = 0
 
+    // ===== 归因诊断（2026-10-11）=====
+    // 只记录、不参与判定。存在的理由：实机出现"claimed=true 但整轮无 SHOW"时，
+    // 旧代码一行日志都不打（UP 行是 vlog，默认关）⇒ 分不出是"没收到 MOVE"、
+    // "MOVE 都太短"还是"角度不在锥内"。这三个数一眼定因。
+    /** 接管后收到的 MOVE 次数（0 = 流被系统拿走，根本没喂进来） */
+    var moves = 0
+        private set
+    /** 内滑分量最大值（px）；< inwardMinPx ⇒ 幅度不足 */
+    var maxInward = 0f
+        private set
+    /** 末次方向角（度）；NaN = 一次 MOVE 都没到 */
+    var lastDeg = Float.NaN
+        private set
+    /** 拒绝原因（枚举名），供日志直接打 */
+    var lastReject = "NO_MOVE"
+        private set
+
     /** 手势结束/新 DOWN 时复位。 */
     fun reset() {
         claimed = false
@@ -74,6 +91,10 @@ class CornerTrigger {
         verticalFrames = 0
         downX = 0f
         downY = 0f
+        moves = 0
+        maxInward = 0f
+        lastDeg = Float.NaN
+        lastReject = "NO_MOVE"
     }
 
     /**
@@ -121,6 +142,7 @@ class CornerTrigger {
         if (!claimed) return Action.PASS
         abandoned = true
         consumedToEnd = true
+        lastReject = "MULTI"
         return Action.CONSUME
     }
 
@@ -131,13 +153,27 @@ class CornerTrigger {
         if (abandoned) return if (consumedToEnd) Action.CONSUME else Action.PASS
         val inward = if (leftCorner) x - downX else downX - x
         val up = downY - y
-        if (hypot(inward, up) < confirmPx) return Action.CONSUME
+        moves++
+        if (inward > maxInward) maxInward = inward
+        if (hypot(inward, up) < confirmPx) {
+            lastReject = "SHORT"      // 位移没过确认线
+            return Action.CONSUME
+        }
         val deg = Math.toDegrees(atan2(up.toDouble(), inward.toDouble())).toFloat()
+        lastDeg = deg
         // 锥内 = 方向在锥内 且 内滑幅度达下限（双条件，锁死"贴边竖直滑"）
         val inCone = deg in minAngleDeg..maxAngleDeg && inward >= inwardMinPx
+        if (!inCone) {
+            lastReject = when {
+                deg < minAngleDeg -> "CONE_LOW"       // 太贴边（方向偏竖）
+                deg > maxAngleDeg -> "CONE_HIGH"      // 太竖（几乎竖直上滑）
+                else -> "INWARD_SHORT"                // 方向对，内滑幅度不够
+            }
+        }
         inConeFrames = if (inCone) inConeFrames + 1 else 0
         if (inConeFrames >= confirmFrames) {
             triggered = true
+            lastReject = "SHOWN"
             return Action.SHOW
         }
         // 明确竖直（超出上限+余量，连续 N 帧）→ 让路：重放给原生
@@ -145,6 +181,7 @@ class CornerTrigger {
             verticalFrames++
             if (verticalFrames >= confirmFrames) {
                 abandoned = true
+                lastReject = "ABANDONED"
                 return Action.ABANDON_REPLAY
             }
         } else {
@@ -152,6 +189,12 @@ class CornerTrigger {
         }
         return Action.CONSUME
     }
+
+    /** 一行归因串（只读；调用方在 UP/CANCEL 打日志用，必须早于 [reset]）。 */
+    fun diag(): String =
+        "moves=$moves maxIn=${maxInward.toInt()} lastDeg=" +
+            (if (lastDeg.isNaN()) "-" else "%.1f".format(lastDeg)) +
+            " reason=$lastReject"
 
     /** UP/CANCEL：接管且未重放则消费；重放后/未接管放行。调用方随后应 [reset]。 */
     fun onEnd(): Action = when {

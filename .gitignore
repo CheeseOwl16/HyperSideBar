@@ -48,3 +48,10 @@ result.json
 
 # 模块级 build 目录（/build 只匹配根级，子模块需显式）
 hidden-api/build/
+
+# 本地临时草稿（2026-10-12）：LP 元数据解析脚本 / VINTF manifest 转储，与模块无关
+/_lpinfo.py
+/vintf-dev/
+
+# 真机联调随手截图（2026-10-13，不入库）
+/tmp-shots/

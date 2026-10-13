@@ -91,6 +91,10 @@ class XposedInit : XposedModule() {
                 // E0/R1-J 前置探针（OS4 适配）：ISidebarOverlay 呼出链路观测，只打日志。
                 // OS2/OS3 无该类=init 内自门控静默退出，三 ROM 通用。
                 if (sidebarOverlayProbe == null) sidebarOverlayProbe = SidebarOverlayProbe()
+                // ⚠ 这里原来还有一条「免 su 总闸写法人（system ui 直接写属性）」的调用，
+                // 2026-10-14 晚随 NativeGateBridge 收敛一并删除：真机上属性两条免-su 写路
+                // 都被 SELinux 拒（`__system_property_set` rc=-1 / 反射 RuntimeException），
+                // 而 fail-open 下"写 1"本来就是空操作 ⇒ 总闸现在只由模块 App 写文件 marker 关断。
                 initHooks(turboLayoutHook!!, freeformRelayHook!!, sidebarOverlayProbe!!)
             }
             param.packageName == HostPackages.HOME && procName == HostPackages.HOME -> {

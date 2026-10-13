@@ -170,6 +170,10 @@ class SystemUiHook(private val prefs: SharedPreferences) : BaseHook() {
                 // 后门控值随设置页改动实时生效，快照陈旧自愈（:ui 同款机制）。
                 runCatching { com.lsp.hypersidebar.util.ConfigSync.registerHookSide(ctx) }
                     .onFailure { HLog.w(TAG, "config sync register failed: ${it.message}") }
+                // 总闸「框架推送」（2026-10-14）已删除：真机证明 system uid 也写不进
+                // `persist.hsb.native.hook`（NativeProbe.nativeSetProp 回 rc=-1/readback=0，
+                // SystemProperties.set 抛 RuntimeException），而 fail-open 下"写 1"是空操作
+                // ⇒ 总闸只有模块 App 写文件 marker 这一条路（NativeGateBridge）。
                 // B1 spy（os4-trigger-final-plan §6）：observe-only 输入观察副本。
                 // 挂在 attach（有 context）而非 init——MiuiBackGestureHook 实锤
                 // monitorGestureInput 须从 context 的 InputManager 服务实例发起

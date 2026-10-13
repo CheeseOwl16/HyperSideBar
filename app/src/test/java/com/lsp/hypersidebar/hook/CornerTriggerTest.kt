@@ -26,6 +26,75 @@ class CornerTriggerTest {
     private fun CornerTrigger.down(x: Float, y: Float): Boolean =
         onDown(x, y, w, h, hot, cornerW, confirm, inwardMin, minDeg, maxDeg, abandonExtra, frames)
 
+    // ===== 归因诊断（2026-10-11）：实机靠这几个数定因，必须有测试锁住语义 =====
+
+    @Test
+    fun diag_noMove_meansStreamNeverArrived() {
+        val t = CornerTrigger()
+        assertTrue(t.down(100f, 2380f))
+        assertEquals(0, t.moves)                 // 一条 MOVE 都没到
+        assertEquals("NO_MOVE", t.lastReject)
+        assertTrue(t.diag().contains("lastDeg=-"))  // 角度未知
+    }
+
+    @Test
+    fun diag_short_whenBelowConfirmDistance() {
+        val t = CornerTrigger()
+        assertTrue(t.down(100f, 2380f))
+        t.onMove(110f, 2375f)                    // hypot≈11 < confirm 40
+        assertEquals(1, t.moves)
+        assertEquals("SHORT", t.lastReject)
+    }
+
+    @Test
+    fun diag_coneHigh_forSteepSwipe() {
+        val t = CornerTrigger()
+        assertTrue(t.down(100f, 2380f))
+        t.onMove(105f, 2300f)                    // 几乎竖直：deg≈88 > max 65
+        assertEquals("CONE_HIGH", t.lastReject)
+        assertTrue("lastDeg 应已记录", !t.lastDeg.isNaN())
+    }
+
+    @Test
+    fun diag_inwardShort_whenDirectionOkButAmplitudeLow() {
+        val t = CornerTrigger()
+        assertTrue(t.down(100f, 2380f))
+        t.onMove(120f, 2340f)                    // deg≈63.4 在锥内，inward=20 < 33
+        assertEquals("INWARD_SHORT", t.lastReject)
+    }
+
+    @Test
+    fun diag_shown_recordsTriggerAndMaxInward() {
+        val t = CornerTrigger()
+        assertTrue(t.down(100f, 2380f))
+        t.onMove(160f, 2320f)
+        assertEquals(CornerTrigger.Action.SHOW, t.onMove(220f, 2260f))
+        assertEquals("SHOWN", t.lastReject)
+        assertEquals(2, t.moves)
+        assertEquals(120f, t.maxInward, 0.5f)
+    }
+
+    @Test
+    fun diag_resetClearsEverything() {
+        val t = CornerTrigger()
+        assertTrue(t.down(100f, 2380f))
+        t.onMove(160f, 2320f)
+        t.onMove(220f, 2260f)
+        t.reset()
+        assertEquals(0, t.moves)
+        assertEquals(0f, t.maxInward, 0.001f)
+        assertEquals("NO_MOVE", t.lastReject)
+        assertTrue(t.lastDeg.isNaN())
+    }
+
+    @Test
+    fun diag_multiPointerRecordsMulti() {
+        val t = CornerTrigger()
+        assertTrue(t.down(100f, 2380f))
+        t.onPointerDown()
+        assertEquals("MULTI", t.lastReject)
+    }
+
     @Test
     fun down_leftCorner_claims() {
         val t = CornerTrigger()

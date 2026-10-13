@@ -226,6 +226,10 @@ class TurboLayout(private val remotePrefs: SharedPreferences) : BaseHook() {
             val m = impl.getDeclaredMethod(entry.name, *entry.parameterTypes)
             m.isAccessible = true
             m.createBeforeHook { param ->
+                // （2026-10-13 清理）这里原有 native「借道 p7」触发：桌面 Rust 侧在停顿成立那一拍调
+                // showSidebar(x, y=MAGIC, dt, dev)，本例用哨兵认出后立刻 postShowStripFan 呼出。
+                // 该通路在本机判死（官方停顿呼出未启用 ⇒ 官方从不调 showSidebar ⇒ proxy 抓不到），
+                // native 侧整段删除，这里的分支随之删除。见 plan doc §14/§22。
                 // B 路线开=p7 放行（原生场景面板回归——游戏 Vtb/普通 Dock 的"不同场景
                 // 活动面板"正是经 p7 唤出的；竖屏带内停顿已被 pilfer 截断不会到 p7，
                 // 能漏出的只有横屏与竖屏带外=恰好是原生行为的领地）。
@@ -559,13 +563,17 @@ class TurboLayout(private val remotePrefs: SharedPreferences) : BaseHook() {
         sStallTimer = null
         if (sStallTimerSeq != sGestureSeq || !sSwipeConfirmed || sStallFired) return
         if (DataDeadState.dead || !moduleEnabled()) return
+        // （2026-10-13 清理）这里原有"判定单源"开关 `debug.hsb.native.judge`：置 1 时本条链只观测，
+        // 呼出与抢占交给 native，由它经 p7 哨兵把起手坐标送回。
+        // native 侧的借道触发（hsb_evoke_try + 全部附锚点）已随"判死档清理"整段删除 ⇒ 置 1 会变成
+        // **谁都不呼出**，故开关与分支一并删除：本条链恒为 :ui 自判（native 只负责抑制与收箭头）。
         sStallFired = true
         StatsRecorder.onStall()
         vlog("s#$sGestureSeq STALL-TIMER fire ${stripDwellMs()}ms anchor=(${sAnchorX.toInt()},${sAnchorY.toInt()})")
         // B2-2 抢占指令先行（广播回程 10~50ms < 600ms 系统判定窗口，稳赢时序竞争）：
         // pilfer 后原目标收 CANCEL，Rust 停顿判定中止，不产生 p7。仅 spy 流——
         // 条上路径事件归条窗口，发抢占只会撞身份过期
-        if (sysInputOwner() && sGestureFromSpy) RelayGestureSink.requestPilfer()
+        if (sysInputOwner() && sGestureFromSpy && pilferEnabled()) RelayGestureSink.requestPilfer()
         postShowStripFan(ctx, landscape)
     }
 
@@ -691,7 +699,15 @@ class TurboLayout(private val remotePrefs: SharedPreferences) : BaseHook() {
                         cancelPendingStripShow()
                     }
                 }
-                vlog("k#$cornerSeq UP engaged=$engaged shown=${fanController.isShowing}")
+                // 常开（每手势一行，低频）：SHOW 是分子，DOWN 是分母，本行是**分母里没成的那批
+                // 的归因**。曾是 vlog 致 verbose 关时这一环完全无日志——实机出现过
+                // "claimed=true 但整轮无 SHOW"，连"有没有收到 MOVE"都判不出来。
+                // diag() 必须在 reset() 之前取。
+                HLog.i(
+                    TAG,
+                    "k#$cornerSeq corner UP engaged=$engaged shown=${fanController.isShowing} " +
+                        cornerTrigger.diag()
+                )
                 cornerTrigger.reset()
             }
         }
@@ -871,6 +887,28 @@ class TurboLayout(private val remotePrefs: SharedPreferences) : BaseHook() {
         Class.forName("android.os.SystemProperties")
             .getMethod("get", String::class.java)
             .invoke(null, "debug.hsb.b0.visible") == "1"
+    }.getOrDefault(false)
+
+    /** SystemProperties.get 的缓存句柄（实验开关用；反射一次，之后只读属性） */
+    private val sysPropGet: java.lang.reflect.Method? by lazy {
+        runCatching {
+            Class.forName("android.os.SystemProperties").getMethod("get", String::class.java)
+        }.getOrNull()
+    }
+
+    /**
+     * 抢占（pilfer）指令开关：**默认关**（2026-10-14 晚改；`adb shell setprop debug.hsb.pilfer 1` 可开）。
+     *
+     * 为什么默认关：pilfer 是 B 路线（`:ui` 自判 + 抢输入）的产物。真机 logcat 实证——
+     * pilfer 一开，`SysInputSpy` 抢走流后 **launcher 的 Rust 侧立刻收 CANCEL**
+     * （`pilfered stream dt=… — Rust 判定将收 CANCEL`），native 的停顿判定链（handle_back_gesture
+     * → 停顿抑制 → arrowfix）根本走不完；而 native 侧现在才是**判定单源**。
+     * 关掉之后流全程留在 launcher 手里由 native 判定，`:ui` 只经 spy 观测 + 画扇形
+     * ——这正是已验证通过的组合（native 抑制 + arrowfix，无原生返回、无箭头残留）。
+     * 与 b0KeepVisible 同款反射读法；重启 `:ui` 生效。
+     */
+    private fun pilferEnabled(): Boolean = runCatching {
+        sysPropGet?.invoke(null, "debug.hsb.pilfer") == "1"
     }.getOrDefault(false)
 
     /**
