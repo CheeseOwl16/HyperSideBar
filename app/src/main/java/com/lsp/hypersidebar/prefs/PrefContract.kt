@@ -35,35 +35,15 @@ object PrefKeys {
      *  是系统手势条自身高度，spy 模型下无此物理约束，热区独立可调。 */
     const val CORNER_HOT_PERCENT = "cornerHotPercent"
 
-    /** B 路线停顿触发带（OS4 spy 竖屏，2026-10-07 参考 MiuiBackGestureHook 双百分比模型）：
-     *  带=[(H−H×height%)×position%, 同值+H×height%)；默认 33/50 精确复刻现役 [H/3,2H/3]。
-     *  sys 进程 prefs=启动快照，改动须重启系统界面。 */
-    const val BAND_HEIGHT_PERCENT = "bandHeightPercent"
-    const val BAND_POSITION_PERCENT = "bandPositionPercent"
-    /** 停顿触发带半宽（dp）：原 BAND_X_DP=32 常量（=官方小白条宽）升滑条 */
-    const val BAND_WIDTH_DP = "bandWidthDp"
-
     /** 常驻扇形（呼出后松手不收起，13.1 同批新增）：开=松手后扇形停留，点图标启动、
      *  点空白收起（吞点击）、10s 无操作看门狗自动收起；关=现状（未预选松手立即收起）。
      *  同时是 OS4 R1-J（securitycenter 侧改道点选模式）的交互地基。 */
     const val FAN_PERSISTENT_ON_RELEASE = "fanPersistentOnRelease"
 
-    /** OS4 边缘停顿借用系统判定开关（默认关）：关（默认）=条上停顿即呼出（无需松手，
-     *  与 OS3 时机一致，范围=小白条带）；开=借用系统边缘停顿判定——边缘任意位置
-     *  停顿、松手后呼出扇形（全边缘，OS4 原生时机）。两态面板均为模块扇形。 */
-    const val EVOKE_BORROW_SYSTEM = "evokeBorrowSystem"
-
-    /** OS4 B 路线总开关（实验，默认关）：SystemUI spy 监视条带外的边缘输入流并转发
-     *  :ui 状态机，恢复全边缘"停顿即呼出+拖选"（OS3 语义）。开=条上 hook 让位为纯吞
-     *  （唯一驱动源=spy 转发，防双喂）；判定命中后由 ：ui 广播抢占指令、SystemUI
-     *  pilferPointers 夺流（Rust 判定收 CANCEL 中止，不产生 p7）。改动后重启系统界面生效
-     *  （sys 进程 prefs=启动快照）。 */
-    const val SYS_INPUT_OWNER = "sysInputOwner"
-
     // ===== B 路线跨进程通道（sys spy ⇄ :ui 状态机，2026-10-05）=====
     /** spy→:ui 带内手势事件转发（每事件一播，MotionEvent 直塞 extra） */
     const val SPY_STREAM_ACTION = "com.lsp.hypersidebar.action.SPY_GESTURE_EVENT"
-    /** :ui→sys 抢占指令（STALL-TIMER fire；五要素匹配后才 pilferPointers） */
+    /** :ui→sys 抢占指令（2026-10-13 起**只服务底角线**：底角 SHOW → 五要素匹配才 pilfer） */
     const val SPY_PILFER_ACTION = "com.lsp.hypersidebar.action.SPY_GESTURE_PILFER"
     /** 转发 extra：MotionEvent 本体（framework Parcelable） */
     const val SPY_EXTRA_EVENT = "ev"
@@ -329,12 +309,6 @@ object LayoutDefaults {
     /** 常驻扇形默认开关：默认关=现状交互（未预选松手立即收起）。 */
     const val FAN_PERSISTENT_ON_RELEASE = false
 
-    /** OS4 边缘停顿借用系统判定默认开关：默认关=条上停顿即呼出（无需松手，OS3 时机）。 */
-    const val EVOKE_BORROW_SYSTEM = false
-
-    /** OS4 B 路线总开关默认值（实验特性）：关=现状（条上状态机饿死+p7 借用兜底）。 */
-    const val SYS_INPUT_OWNER = false
-
     /** 底角斜滑扇形样式默认值：图标沿用竖屏（32dp），半径与数量独立定档（仿 Flyme 大半径
      *  四分之一弧，双环 13 图标不挤在小弧上）。0922 起数量不再跟竖屏联动。
      *  可在底角布局 sheet 独立微调。 */
@@ -363,19 +337,12 @@ object LayoutDefaults {
     const val CORNER_HOT_PERCENT_MAX = 25
     const val CORNER_HOT_PERCENT_STEP = 1
 
-    /** B 路线停顿触发带（百分比模型）：默认 33/50 = 现役 [H/3, 2H/3]；半宽默认 32dp=官方条宽 */
+    /** B 路线停顿触发带（默认参数，2026-10-13 起不再设置项化——用户 m03028 删滑条）：
+     *  带=[(H−H×33%)×50%, 同值+H×33%] = 现役 [H/3, 2H/3]；半宽 32dp=官方条宽。
+     *  消费方=SystemUiInputSpy（spy 命中判定）+ CornerGeomBridge（推 native 几何）——单源。 */
     const val BAND_HEIGHT_PERCENT = 33
-    const val BAND_HEIGHT_PERCENT_MIN = 10
-    const val BAND_HEIGHT_PERCENT_MAX = 100
-    const val BAND_HEIGHT_PERCENT_STEP = 1
     const val BAND_POSITION_PERCENT = 50
-    const val BAND_POSITION_PERCENT_MIN = 0
-    const val BAND_POSITION_PERCENT_MAX = 100
-    const val BAND_POSITION_PERCENT_STEP = 1
     const val BAND_WIDTH_DP = 32
-    const val BAND_WIDTH_DP_MIN = 12
-    const val BAND_WIDTH_DP_MAX = 64
-    const val BAND_WIDTH_DP_STEP = 2
     const val CORNER_ANGLE_STEP = 5
 
     // ===== 滑条量程契约（0913 用户拍板：量程/步进与默认值同源定义，UI 禁止内联数字）=====

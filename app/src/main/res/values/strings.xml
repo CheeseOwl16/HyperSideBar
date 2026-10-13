@@ -65,22 +65,12 @@
     <string name="trigger_dwell_summary">贴边停顿达此时长后展开扇形；改动即时生效</string>
     <string name="fan_persistent_title">呼出后常驻</string>
     <string name="fan_persistent_summary">松手后扇形不自动收起：点图标启动、点空白收起；10 秒无操作自动收起</string>
-    <string name="evoke_borrow_system_title">边缘停顿借用系统判定（松手后呼出）</string>
-    <string name="evoke_borrow_system_summary">开启后，屏幕边缘任意位置的停顿在松手后呼出扇形（判定借用系统，OS4 原生时机）。默认关闭=仅小白条位置停顿即呼出（无需松手，与 OS3 时机一致）；两态下原生侧边栏面板均不出现。开启需系统已启用「侧边停顿呼出」；仅 OS4 生效</string>
-    <string name="sys_input_owner_title">全边缘触发·实验（停顿即呼出+拖选）</string>
-    <string name="sys_input_owner_summary">在系统界面进程观察屏幕边缘输入流，命中停顿判定后接管手势并呼出扇形——恢复 OS3 的全边缘体验（无需松手、可拖选）。开启后小白条触发让位给本通道；返回/底部手势等系统操作不受影响。改动后需重启系统界面生效；异常时关闭开关并重启系统界面即可完全还原。仅 OS4 生效</string>
     <string name="corner_swipe_title">底角斜滑呼出</string>
     <string name="corner_swipe_summary">从屏幕左下/右下角斜向内上滑，直接呼出扇形（仅竖屏）；与停顿呼出并存，默认关闭</string>
     <string name="corner_width_title">底角触发宽度</string>
     <string name="corner_width_summary">左右底角各占屏宽的比例；越窄越不易误触，但起手位置要求越准</string>
     <string name="corner_hot_title">底角热区高度</string>
     <string name="corner_hot_summary">底部起手带占屏高的比例；越低起手位置要求越贴底。竖直上滑（回桌面）任何高度都不会触发。改动后需重启系统界面生效（触发转发在系统界面进程）</string>
-    <string name="band_height_title">触发带高度（全边缘）</string>
-    <string name="band_height_summary">边缘停顿触发带占屏高的比例（全边缘·实验开启后生效，改动重启系统界面）；默认 33% 即小白条中带</string>
-    <string name="band_position_title">触发带位置（全边缘）</string>
-    <string name="band_position_summary">触发带在屏上的垂直位置：0=贴顶，100=贴底；与高度组合出起手范围</string>
-    <string name="band_width_title">触发带宽度（全边缘）</string>
-    <string name="band_width_summary">左右边缘触发带的半宽；默认 32dp=官方小白条宽，越宽越易触发但越易误触</string>
     <string name="corner_min_angle_title">斜滑角度下限</string>
     <string name="corner_min_angle_summary">低于此角度视为水平滑动，不触发</string>
     <string name="corner_max_angle_title">斜滑角度上限</string>

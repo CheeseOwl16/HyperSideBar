@@ -116,14 +116,6 @@ class SettingsRepository(val prefs: SharedPreferences) {
         prefs.getInt(PrefKeys.CORNER_HOT_PERCENT, LayoutDefaults.CORNER_HOT_PERCENT)
     }
 
-    /** B 路线停顿触发带（百分比模型 + 半宽 dp，OS4；sys 侧启动快照须重启 SystemUI）。 */
-    fun bandHeightPercent(): Int =
-        prefs.getInt(PrefKeys.BAND_HEIGHT_PERCENT, LayoutDefaults.BAND_HEIGHT_PERCENT)
-    fun bandPositionPercent(): Int =
-        prefs.getInt(PrefKeys.BAND_POSITION_PERCENT, LayoutDefaults.BAND_POSITION_PERCENT)
-    fun bandWidthDp(): Int =
-        prefs.getInt(PrefKeys.BAND_WIDTH_DP, LayoutDefaults.BAND_WIDTH_DP)
-
     fun fanFogIntensity(): Float =
         prefs.getFloat(PrefKeys.FAN_FOG_INTENSITY, LayoutDefaults.FAN_FOG_INTENSITY)
     fun fanDimEnabled(): Boolean =
@@ -133,13 +125,6 @@ class SettingsRepository(val prefs: SharedPreferences) {
     fun fanPersistentOnRelease(): Boolean =
         prefs.getBoolean(PrefKeys.FAN_PERSISTENT_ON_RELEASE, LayoutDefaults.FAN_PERSISTENT_ON_RELEASE)
 
-    /** OS4 边缘停顿借用系统判定开关（默认关=条上停顿即呼出，无需松手）。 */
-    fun evokeBorrowSystem(): Boolean =
-        prefs.getBoolean(PrefKeys.EVOKE_BORROW_SYSTEM, LayoutDefaults.EVOKE_BORROW_SYSTEM)
-
-    /** OS4 B 路线总开关（实验，默认关）：spy 转发+pilfer 回流，恢复全边缘拖选。 */
-    fun sysInputOwner(): Boolean =
-        prefs.getBoolean(PrefKeys.SYS_INPUT_OWNER, LayoutDefaults.SYS_INPUT_OWNER)
     /** 背景模糊来源（auto / dialog / wallpaper / behind / off）；非法或缺失值一律回 auto */
     fun fanBlurSource(): String =
         prefs.getString(PrefKeys.FAN_BLUR_SOURCE, LayoutDefaults.FAN_BLUR_SOURCE_DEFAULT)
@@ -231,8 +216,6 @@ class SettingsRepository(val prefs: SharedPreferences) {
             putInt(PrefKeys.CORNER_MIN_ANGLE_DEG, LayoutDefaults.CORNER_MIN_ANGLE_DEG)
             putInt(PrefKeys.CORNER_MAX_ANGLE_DEG, LayoutDefaults.CORNER_MAX_ANGLE_DEG)
             putBoolean(PrefKeys.FAN_PERSISTENT_ON_RELEASE, LayoutDefaults.FAN_PERSISTENT_ON_RELEASE)
-            putBoolean(PrefKeys.EVOKE_BORROW_SYSTEM, LayoutDefaults.EVOKE_BORROW_SYSTEM)
-            putBoolean(PrefKeys.SYS_INPUT_OWNER, LayoutDefaults.SYS_INPUT_OWNER)
             putFloat(PrefKeys.FAN_FOG_INTENSITY, LayoutDefaults.FAN_FOG_INTENSITY)
             putBoolean(PrefKeys.FAN_DIM_ENABLED, LayoutDefaults.FAN_DIM_ENABLED)
             putString(PrefKeys.FAN_BLUR_SOURCE, LayoutDefaults.FAN_BLUR_SOURCE_DEFAULT)

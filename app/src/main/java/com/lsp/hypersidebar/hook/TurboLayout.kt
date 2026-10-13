@@ -75,9 +75,9 @@ class TurboLayout(private val remotePrefs: SharedPreferences) : BaseHook() {
     private val whiteBarDrawable: String? get() = AnchorResolver.fqcnOf(AnchorRoles.SIDEBAR_DRAWABLE.role)
     private val handleBarView: String? get() = AnchorResolver.fqcnOf(AnchorRoles.SIDEBAR_HANDLE_BAR.role)
 
-    /** R1-J'：OS4 全局侧边栏 binder 契约（AIDL 名未混淆，跨版本稳定；见 hookSidebarEvoke） */
+    /** OS4 探测常量（AIDL 名未混淆，跨版本稳定）：类存在 = OS4 的全局侧边栏宿主。
+     *  注意：p7 hook 已于 2026-10-13 删除（一律放行给原生），这里只用于 isOs4Sidebar 判定。 */
     private val EVOKE_ITF = "com.miui.sidebar.ISidebarOverlay"
-    private val EVOKE_IMPL = "com.miui.gamebooster.service.DockWindowManagerService\$SidebarOverlayBinder"
 
     /** OS4 判据：ISidebarOverlay 存在即 OS4 系（AIDL 稳定名；OS2/OS3 无此类）。
      *  决定 hookOnTouch 走哪套条上语义（OS4=吞事件不跑状态机，见该函数注释）。 */
@@ -144,15 +144,17 @@ class TurboLayout(private val remotePrefs: SharedPreferences) : BaseHook() {
                 // OS4 分支（1003 晚 v2 拍板：回归模块自有判定）：竖屏+横屏条上触摸
                 // 全部进 B 路线状态机（条=触发器）——系统停顿判定松手才唤出且横屏
                 // 随游戏场景切模式，弃用为主触发（p7 借用降级为 switch，默认关，
-                // 见 hookSidebarEvoke）。不计 onCoverTouchLeak：OS4 条触摸是常态
+                // 一律放行给原生）。不计 onCoverTouchLeak：OS4 条触摸是常态
                 // 而非"穿透失效"信号，误计数会假降级。退路=总开关关/熔断/数据源
                 // 死亡放行原生（条恢复可拖原生面板）。
                 if (isOs4Sidebar) {
                     if (!moduleEnabled() || breaker.open || DataDeadState.dead) return@createBeforeHook
-                    // B 路线开=竖屏条上让位纯吞（spy 转发是竖屏唯一驱动源，防双喂）；
+                    // 竖屏条上让位纯吞：spy 转发是竖屏唯一驱动源，条上不再喂状态机（防双喂）。
                     // 横屏不接管——条上状态机照旧（OS2/3 横屏语义，成熟路径，触发面小）。
                     // 退路不变（总开关关/熔断/数据死亡=整段放行原生）
-                    if (stripSwallowOnly() && !isLandscape(view)) {
+                    // （2026-10-13 清理，用户 m03028）原「全边缘触发·实验」总开关已删除：
+                    // B 路线在 OS4 恒开，竖屏条上恒为纯吞。
+                    if (!isLandscape(view)) {
                         it.result = true
                         return@createBeforeHook
                     }
@@ -191,89 +193,14 @@ class TurboLayout(private val remotePrefs: SharedPreferences) : BaseHook() {
     // 它只服务 getStats() 的 wrapper 计数，而 OS4 上该方法已漂移（j.Q() → p.Q(long)）。
     // 改用 cover 构造器计数（coverCtorCount），三版本等价且不依赖混淆名。
 
-    // ===== R1-J'（OS4 边缘停顿借用系统判定，2026-10-03 测绘定稿，v2 语义修正） =====
-    // 1003 实机测绘：OS4 全局侧边栏把手+面板都在 :ui（DockWindowManagerService 系，
-    // 把手 88x308 DISPLAY_OVERLAY / 面板 FloatingWindow SYSTEM_ALERT 全屏），桌面 Rust
-    // 的"贴边滑+停顿"判定完成后经 binder 调 ISidebarOverlay.p7(x, y, 66, 145, 22)——
-    // 前两参=呼出点屏幕坐标（竖屏右缘 x≈968/1080、横屏左缘 x≈110/2400），后三参恒
-    // 66/145/22（尺寸/类型常量，暂不需要）。呼出编排=客户端 J(canShow) 轮询→
-    // J0(hide)→p7(show)；实测 p7 在松手后才到（OS4 原生时机）。
-    // 本 hook=**p7 常拦**（两态原生面板都不出现，模块独占触发=OS3 化）：开
-    // （EVOKE_BORROW_SYSTEM，默认关）=条外边缘停顿（松手后 p7）改呼扇形——全边缘
-    // 补充触发、恒点选态；关=p7 静默消费（条外停顿无动作）。主触发=条上状态机
-    // （hookOnTouch OS4 分支，无需松手/OS3 时机），不受本开关影响。前置：借用模式
-    // 需系统开启「侧边停顿呼出」。接口名 com.miui.sidebar.ISidebarOverlay 未混淆
-    // （AIDL 稳定），方法按签名形状解析（(IIIII)V 在接口 abstract 里唯一）；
-    // OS2/OS3 无此类=惰性退出。实测消费后客户端无 p7 重试风暴（B1 轮询照常）。
-    private fun hookSidebarEvoke() {
-        val cl = io.github.kyuubiran.ezxhelper.core.ClassLoaderProvider.safeClassLoader
-        val itf = runCatching { Class.forName(EVOKE_ITF, false, cl) }.getOrNull() ?: run {
-            HLog.i(TAG, "hookSidebarEvoke: $EVOKE_ITF not found (OS2/OS3?) — inert")
-            return
-        }
-        val impl = runCatching { Class.forName(EVOKE_IMPL, false, cl) }.getOrNull() ?: run {
-            HLog.w(TAG, "hookSidebarEvoke: impl $EVOKE_IMPL not found — inert")
-            return
-        }
-        val entry = itf.declaredMethods.singleOrNull { m ->
-            java.lang.reflect.Modifier.isAbstract(m.modifiers) && m.returnType == Void.TYPE &&
-                m.parameterTypes.size == 5 && m.parameterTypes.all { it == Int::class.javaPrimitiveType }
-        } ?: run {
-            HLog.w(TAG, "hookSidebarEvoke: (IIIII)V abstract 唯一项不成立 — inert")
-            return
-        }
-        runCatching {
-            val m = impl.getDeclaredMethod(entry.name, *entry.parameterTypes)
-            m.isAccessible = true
-            m.createBeforeHook { param ->
-                // （2026-10-13 清理）这里原有 native「借道 p7」触发：桌面 Rust 侧在停顿成立那一拍调
-                // showSidebar(x, y=MAGIC, dt, dev)，本例用哨兵认出后立刻 postShowStripFan 呼出。
-                // 该通路在本机判死（官方停顿呼出未启用 ⇒ 官方从不调 showSidebar ⇒ proxy 抓不到），
-                // native 侧整段删除，这里的分支随之删除。见 plan doc §14/§22。
-                // B 路线开=p7 放行（原生场景面板回归——游戏 Vtb/普通 Dock 的"不同场景
-                // 活动面板"正是经 p7 唤出的；竖屏带内停顿已被 pilfer 截断不会到 p7，
-                // 能漏出的只有横屏与竖屏带外=恰好是原生行为的领地）。
-                // B 路线关=沿用借用判定开关语义（下）。
-                if (sysInputOwner()) return@createBeforeHook
-                // 借用系统判定开关（默认关；1003 深夜定案：开关=是否借用系统判定，
-                // 非"面板选择"——两态下原生面板都不出现，模块独占触发=OS3 化）：
-                //   开=条外边缘停顿（松手后 p7）改呼扇形（全边缘补充触发，恒点选态）
-                //   关=p7 静默消费（条外边缘停顿无动作；原生面板不出现）
-                // 条上状态机触发（hookOnTouch OS4 分支）不受本开关影响。
-                // 退路：总开关关/熔断/数据源死亡 → p7 放行 → 原生面板回归。
-                val x = param.args[0] as Int
-                val y = param.args[1] as Int
-                if (!moduleEnabled() || breaker.open || DataDeadState.dead) return@createBeforeHook
-                val borrow = remotePrefs.getBoolean(
-                    PrefKeys.EVOKE_BORROW_SYSTEM, LayoutDefaults.EVOKE_BORROW_SYSTEM
-                )
-                if (!borrow || fanController.isShowing) {
-                    // 关（静默消费，防原生面板突现）/开但已在显示（不重弹）
-                    HLog.i(TAG, "evoke consumed: ($x,$y) borrow=$borrow showing=${fanController.isShowing}")
-                    param.result = null
-                    return@createBeforeHook
-                }
-                val ctx = runCatching { EzXposed.appContext }.getOrNull()
-                    ?: return@createBeforeHook // 拿不到 context 不吃——宁可原生也别吞呼出
-                val dm = ctx.resources.displayMetrics
-                val anchorX = if (x < dm.widthPixels / 2f) 0f else dm.widthPixels.toFloat()
-                val anchorY = y.coerceIn(0, dm.heightPixels).toFloat()
-                HLog.i(TAG, "evoke→fan: ($x,$y) anchor=($anchorX,$anchorY)")
-                // 借用模式恒点选态（markReleasedOnArrival→showInternal 落地转 released）：
-                // 手势流在桌面 Rust 手里，拖选物理不可得；released 下点图标直启
-                // （跳过 150ms 预选门——否则停顿呼出后快速点图标会被门误拦）、
-                // 点空白收起、10s 看门狗兜底。官方呼出范围无系数可套（侦察定案），
-                // y 不做带外钳制，几何层不可行带二次钳制兜底。
-                fanController.markReleasedOnArrival()
-                mainHandler.post {
-                    runCatching { fanController.show(ctx, anchorX, anchorY) }
-                        .onFailure { HLog.w(TAG, "evoke→fan show failed: ${it.message}") }
-                }
-                param.result = null
-            }
-            HLog.i(TAG, "hookSidebarEvoke: ${impl.simpleName}.${entry.name}(IIIII)V armed（p7 常拦：开=借用判定全边缘，关=静默消费）")
-        }.onFailure { HLog.w(TAG, "hookSidebarEvoke failed: ${it.message}") }
-    }
+    // ===== R1-J'（OS4 全局侧边栏 binder p7）——2026-10-13 起「一律放行」 =====
+    // 历史：这里曾 hook `com.miui.gamebooster.service.DockWindowManagerService$SidebarOverlayBinder`
+    // 的 p7（`com.miui.sidebar.ISidebarOverlay` 的 (IIIII)V 呼出回调），做「借用系统边缘判定」
+    // （EVOKE_BORROW_SYSTEM=开：条外边缘停顿改呼扇形）或「静默消费原生面板」（关）。
+    // 2026-10-13 清理（用户 m03028「全边缘触发的实验项也不要了」+ 明确选择"一律放行给原生"）：
+    // B 路线在 OS4 恒开、竖屏条上由 spy 驱动，带外/横屏的 p7 交还原生场景面板
+    // ——这正是当年开关=开时的实测行为，**不需要任何 p7 hook** ⇒ 整段删除。
+    // EVOKE_ITF 常量保留（下方 isOs4Sidebar 用它做 OS4 探测）。
 
     // ===== B 路线横屏状态机（1B，PRD §7.1/§7.3.1） =====
     // 移植 EdgeGestureHook 的锚点圆法 v2（生产验证），适配 :ui 条上触摸：
@@ -312,37 +239,25 @@ class TurboLayout(private val remotePrefs: SharedPreferences) : BaseHook() {
     private var sResetPx = GestureThresholds.SWIPE_CONFIRM_PX * GestureThresholds.SWIPE_RESET_RATIO
 
     private fun handleStripGesture(view: View, ev: MotionEvent) {
-        if (ev.actionMasked == MotionEvent.ACTION_DOWN) sGestureFromSpy = false
         handleStripGestureCore(view.context, isLandscape(view), ev)
     }
 
     /**
      * B2 喂流入口（sys spy 转发的带内流；RelayGestureSink 调用）：状态机不再依赖
      * View——横竖屏由转发方判定传入（spy 无 View 可读），上下文=:ui 进程任一 context。
-     * 门控由调用方（sink）负责；本函数只做判定与驱动。
+     * 门控由调用方（sink: b2Enabled）负责；本函数只做判定与驱动。
+     * （2026-10-13 清理）原「是否 spy 流」旗标随 pilfer 一并删除：不再有抢占指令。
      */
     fun feedStripGesture(ctx: Context, landscape: Boolean, ev: MotionEvent) {
-        if (ev.actionMasked == MotionEvent.ACTION_DOWN) sGestureFromSpy = true
         handleStripGestureCore(ctx, landscape, ev)
     }
 
-    /** B 路线总开关（实验）：开=条上 hook 让位纯吞、spy 转发为唯一驱动源（防双喂）。 */
-    private fun sysInputOwner(): Boolean = runCatching {
-        remotePrefs.getBoolean(PrefKeys.SYS_INPUT_OWNER, LayoutDefaults.SYS_INPUT_OWNER)
-    }.getOrDefault(LayoutDefaults.SYS_INPUT_OWNER)
-
-    /** B2 sink 侧总门控（isOs4+开关+退路面三合一）；prefs 供 sink 回传令牌读取。 */
+    /** B2 sink 侧总门控（isOs4 + 退路面）：sink 是竖屏唯一驱动源，恒开（实验开关已删）。 */
     internal fun b2Enabled(): Boolean =
-        isOs4Sidebar && sysInputOwner() && moduleEnabled() && !breaker.open && !DataDeadState.dead
+        isOs4Sidebar && moduleEnabled() && !breaker.open && !DataDeadState.dead
 
+    /** sink 回传令牌读取用（RelayGestureSink.requestPilfer 读 :ui 侧 remotePrefs）。 */
     internal val b2Prefs: SharedPreferences get() = remotePrefs
-
-    /** 条上 hook 侧门禁（OS4 分支用）：B 路线开=纯吞（事件不进状态机，防 spy 双喂）。 */
-    private fun stripSwallowOnly(): Boolean = sysInputOwner()
-
-    /** 当前手势是否来自 spy 转发（DOWN 时定，UP/CANCEL 复位）：抢占指令只对
-     *  spy 流有意义——条上路径事件本就归条窗口，发抢占只会撞身份过期（1005 实锤）。 */
-    @Volatile private var sGestureFromSpy = false
 
     private fun handleStripGestureCore(ctx: Context, landscape: Boolean, ev: MotionEvent) {
         // fan 展示中：转发驱动；手势中途落地先合成 DOWN 起始选择状态（边缘通道同款：
@@ -570,10 +485,10 @@ class TurboLayout(private val remotePrefs: SharedPreferences) : BaseHook() {
         sStallFired = true
         StatsRecorder.onStall()
         vlog("s#$sGestureSeq STALL-TIMER fire ${stripDwellMs()}ms anchor=(${sAnchorX.toInt()},${sAnchorY.toInt()})")
-        // B2-2 抢占指令先行（广播回程 10~50ms < 600ms 系统判定窗口，稳赢时序竞争）：
-        // pilfer 后原目标收 CANCEL，Rust 停顿判定中止，不产生 p7。仅 spy 流——
-        // 条上路径事件归条窗口，发抢占只会撞身份过期
-        if (sysInputOwner() && sGestureFromSpy && pilferEnabled()) RelayGestureSink.requestPilfer()
+        // （2026-10-13 清理，用户 m03028）原 B2-2 抢占指令（pilfer）已整条删除：
+        // 真机实证 pilfer 一开 launcher Rust 立刻收 CANCEL、native 停顿判定链走不完，
+        // 而 native 才是判定单源 ⇒ 冗余兜底去掉，流全程留在 launcher 由 native 判定，
+        // :ui 只经 spy 观测 + 画扇形（即已验收通过的组合）。
         postShowStripFan(ctx, landscape)
     }
 
@@ -838,8 +753,7 @@ class TurboLayout(private val remotePrefs: SharedPreferences) : BaseHook() {
             { hookCoverPassThrough() },
             { hookCoverLifecycleFlags() },
             { hookHideWhiteBar() },
-            { hookHandleBarPixelKill() },
-            { hookSidebarEvoke() }
+            { hookHandleBarPixelKill() }
         ).forEach { step ->
             runCatching { step() }.onFailure { HLog.e(TAG, "init step failed: ${it.message}", it) }
         }
@@ -887,28 +801,6 @@ class TurboLayout(private val remotePrefs: SharedPreferences) : BaseHook() {
         Class.forName("android.os.SystemProperties")
             .getMethod("get", String::class.java)
             .invoke(null, "debug.hsb.b0.visible") == "1"
-    }.getOrDefault(false)
-
-    /** SystemProperties.get 的缓存句柄（实验开关用；反射一次，之后只读属性） */
-    private val sysPropGet: java.lang.reflect.Method? by lazy {
-        runCatching {
-            Class.forName("android.os.SystemProperties").getMethod("get", String::class.java)
-        }.getOrNull()
-    }
-
-    /**
-     * 抢占（pilfer）指令开关：**默认关**（2026-10-14 晚改；`adb shell setprop debug.hsb.pilfer 1` 可开）。
-     *
-     * 为什么默认关：pilfer 是 B 路线（`:ui` 自判 + 抢输入）的产物。真机 logcat 实证——
-     * pilfer 一开，`SysInputSpy` 抢走流后 **launcher 的 Rust 侧立刻收 CANCEL**
-     * （`pilfered stream dt=… — Rust 判定将收 CANCEL`），native 的停顿判定链（handle_back_gesture
-     * → 停顿抑制 → arrowfix）根本走不完；而 native 侧现在才是**判定单源**。
-     * 关掉之后流全程留在 launcher 手里由 native 判定，`:ui` 只经 spy 观测 + 画扇形
-     * ——这正是已验证通过的组合（native 抑制 + arrowfix，无原生返回、无箭头残留）。
-     * 与 b0KeepVisible 同款反射读法；重启 `:ui` 生效。
-     */
-    private fun pilferEnabled(): Boolean = runCatching {
-        sysPropGet?.invoke(null, "debug.hsb.pilfer") == "1"
     }.getOrDefault(false)
 
     /**

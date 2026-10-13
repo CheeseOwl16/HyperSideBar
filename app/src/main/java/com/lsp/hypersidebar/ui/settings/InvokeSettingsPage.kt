@@ -109,97 +109,10 @@ internal fun InvokeSettingsPage(prefs: SharedPreferences, modifier: Modifier = M
                             repo.save(PrefKeys.FAN_PERSISTENT_ON_RELEASE, it)
                         }
                     )
-                    // OS4 边缘停顿时机选择（默认关=条上停顿即呼出，无需松手/OS3 时机；
-                    // 开=借用系统判定，边缘任意位置松手后呼出）。OS2/3 无效果。
-                    var evokeBorrowSystem by remember(effectivePrefs, repo.revision) {
-                        mutableStateOf(repo.evokeBorrowSystem())
-                    }
-                    SwitchPreference(
-                        title = stringResource(R.string.evoke_borrow_system_title),
-                        summary = stringResource(R.string.evoke_borrow_system_summary),
-                        checked = evokeBorrowSystem,
-                        onCheckedChange = {
-                            evokeBorrowSystem = it
-                            repo.save(PrefKeys.EVOKE_BORROW_SYSTEM, it)
-                        }
-                    )
-                    // OS4 B 路线（实验，默认关）：SystemUI spy 转发边缘流+pilfer 回流，
-                    // 恢复全边缘"停顿即呼出+拖选"（OS3 语义）。改动后重启系统界面生效。
-                    var sysInputOwner by remember(effectivePrefs, repo.revision) {
-                        mutableStateOf(repo.sysInputOwner())
-                    }
-                    SwitchPreference(
-                        title = stringResource(R.string.sys_input_owner_title),
-                        summary = stringResource(R.string.sys_input_owner_summary),
-                        checked = sysInputOwner,
-                        onCheckedChange = {
-                            sysInputOwner = it
-                            repo.save(PrefKeys.SYS_INPUT_OWNER, it)
-                        }
-                    )
-                    // B 路线触发带几何（2026-10-07 参考 MiuiBackGestureHook 百分比模型）：
-                    // 带高/带位双百分比（默认 33/50=[H/3,2H/3]）+ 半宽 dp（默认=官方条宽）。
-                    // 仅 OS4 B 路线消费（sys 启动快照，改动须重启系统界面）；OS2/3 无效果。
-                    val bandHMin = LayoutDefaults.BAND_HEIGHT_PERCENT_MIN.toFloat()
-                    val bandHMax = LayoutDefaults.BAND_HEIGHT_PERCENT_MAX.toFloat()
-                    val bandHStep = LayoutDefaults.BAND_HEIGHT_PERCENT_STEP.toFloat()
-                    var bandHeightPct by remember(effectivePrefs, repo.revision) {
-                        mutableStateOf(repo.bandHeightPercent())
-                    }
-                    SliderPreference(
-                        title = stringResource(R.string.band_height_title),
-                        summary = stringResource(R.string.band_height_summary),
-                        valueText = "$bandHeightPct %",
-                        value = bandHeightPct.toFloat(),
-                        valueRange = bandHMin..bandHMax,
-                        steps = sliderSteps(bandHMin, bandHMax, bandHStep),
-                        onValueChange = {
-                            bandHeightPct = quantizeToStep(it, bandHMin, bandHMax, bandHStep).roundToInt()
-                        },
-                        onValueChangeFinished = {
-                            repo.save(PrefKeys.BAND_HEIGHT_PERCENT, bandHeightPct)
-                        }
-                    )
-                    val bandPMin = LayoutDefaults.BAND_POSITION_PERCENT_MIN.toFloat()
-                    val bandPMax = LayoutDefaults.BAND_POSITION_PERCENT_MAX.toFloat()
-                    val bandPStep = LayoutDefaults.BAND_POSITION_PERCENT_STEP.toFloat()
-                    var bandPositionPct by remember(effectivePrefs, repo.revision) {
-                        mutableStateOf(repo.bandPositionPercent())
-                    }
-                    SliderPreference(
-                        title = stringResource(R.string.band_position_title),
-                        summary = stringResource(R.string.band_position_summary),
-                        valueText = "$bandPositionPct %",
-                        value = bandPositionPct.toFloat(),
-                        valueRange = bandPMin..bandPMax,
-                        steps = sliderSteps(bandPMin, bandPMax, bandPStep),
-                        onValueChange = {
-                            bandPositionPct = quantizeToStep(it, bandPMin, bandPMax, bandPStep).roundToInt()
-                        },
-                        onValueChangeFinished = {
-                            repo.save(PrefKeys.BAND_POSITION_PERCENT, bandPositionPct)
-                        }
-                    )
-                    val bandWMin = LayoutDefaults.BAND_WIDTH_DP_MIN.toFloat()
-                    val bandWMax = LayoutDefaults.BAND_WIDTH_DP_MAX.toFloat()
-                    val bandWStep = LayoutDefaults.BAND_WIDTH_DP_STEP.toFloat()
-                    var bandWidthDp by remember(effectivePrefs, repo.revision) {
-                        mutableStateOf(repo.bandWidthDp())
-                    }
-                    SliderPreference(
-                        title = stringResource(R.string.band_width_title),
-                        summary = stringResource(R.string.band_width_summary),
-                        valueText = "$bandWidthDp dp",
-                        value = bandWidthDp.toFloat(),
-                        valueRange = bandWMin..bandWMax,
-                        steps = sliderSteps(bandWMin, bandWMax, bandWStep),
-                        onValueChange = {
-                            bandWidthDp = quantizeToStep(it, bandWMin, bandWMax, bandWStep).roundToInt()
-                        },
-                        onValueChangeFinished = {
-                            repo.save(PrefKeys.BAND_WIDTH_DP, bandWidthDp)
-                        }
-                    )
+                    // （2026-10-13 清理，用户 m03028）本页原有三项已删除：
+                    //   ①「边缘停顿借用系统判定」开关（p7 现一律放行给原生，开关失去意义）
+                    //   ②「全边缘触发·实验」总开关（B 路线在 OS4 恒开，spy 转发是竖屏唯一驱动源）
+                    //   ③ 触发带三滑条（高度/位置/宽度）——几何收敛为 LayoutDefaults 默认参数
                 }
             }
         }

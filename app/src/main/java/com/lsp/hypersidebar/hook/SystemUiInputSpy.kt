@@ -92,8 +92,12 @@ object SystemUiInputSpy {
      *  均存字段；native 侧 Looper 注册持一层引用，双保险） */
     @Volatile private var receiverRef: InputEventReceiver? = null
 
-    fun start(context: android.content.Context? = null) {
+    fun start(
+        context: android.content.Context? = null,
+        modulePrefs: android.content.SharedPreferences? = null,
+    ) {
         if (started || gaveUp) return
+        if (prefs == null) prefs = modulePrefs
         // 存原始 context（attach 传的是 base ContextImpl）：1004 实测 applicationContext
         // 在 Application.attach 时刻仍为 null（LoadedApk 未挂完），存它导致 ctx 路径全程失联
         if (appContext == null) appContext = context
@@ -127,7 +131,7 @@ object SystemUiInputSpy {
                 "${if (deafRebuilds > 0) ", deaf rebuild #$deafRebuilds" else ""})")
             // 门控快照（1007 导出 162021 教训：角落 DOWN 被门静默拒=导出无法判读是哪个门关了）。
             // sys prefs=启动快照，本行即本进程全部转发决策的依据
-            HLog.i(TAG, "forward gates: sysInputOwner=${sysInputOwner()} cornerSwipe=${cornerSwipeEnabled()} " +
+            HLog.i(TAG, "forward gates: cornerSwipe=${cornerSwipeEnabled()} " +
                 "cornerHot=%=${cornerHotPercent()} band=${bandWidthDp()}dp/${bandHeightPercent()}%+${bandPositionPercent()}%")
             // 聋 monitor 观察窗：窗口内零 DOWN ⇒ dispose 重建（时序根因的自愈收口）
             mainHandler.postDelayed({ deafCheck() }, DEAF_CHECK_WINDOW_MS)
@@ -266,22 +270,16 @@ object SystemUiInputSpy {
         }
     }
 
-    // ===== B2-1/B2-2（os4-trigger-final-plan §7）：带内流转发 + 抢占执行 =====
-    // 触发带几何（半宽/y 带高/带位）2026-10-07 起全部设置项化（bandWidthDp/bandHeightPercent/
-    // bandPositionPercent，参考 MiuiBackGestureHook 百分比模型）；历史沿革：首版 130px 过宽
-    // → 32dp（=官方小白条宽）→ 现滑条。密度运行时现算，对屏宽/密度漂移免疫。
+    // ===== B2-1（os4-trigger-final-plan §7）：带内流转发（B2-2 抢占已于 2026-10-13 删除）=====
+    // 触发带几何（半宽/y 带高/带位）：2026-10-07 曾设置项化，2026-10-13（用户 m03028）
+    // 收敛为 LayoutDefaults 常量（33/50/32dp），滑条删除。密度运行时现算，对屏宽/密度漂移免疫。
 
-    /** B 路线开关（sys 进程 prefs=启动快照，改动须重启 SystemUI 生效——设置页已注明） */
+    /** 宿主 prefs（sys 进程=启动快照，改动须重启 SystemUI 生效——设置页已注明）：
+     *  由 [SystemUiHook] 经 [start] 注入，供底角开关/几何读取。
+     *  （2026-10-13 清理）原 B 路线总开关 sysInputOwner 与其 pilfer 身份字段已删除。 */
     @Volatile private var prefs: android.content.SharedPreferences? = null
 
-    private fun sysInputOwner(): Boolean = runCatching {
-        prefs?.getBoolean(
-            com.lsp.hypersidebar.prefs.PrefKeys.SYS_INPUT_OWNER,
-            com.lsp.hypersidebar.prefs.LayoutDefaults.SYS_INPUT_OWNER
-        ) ?: false
-    }.getOrDefault(false)
-
-    /** 当前转发中的手势五要素（DOWN 时快照，供抢占指令匹配） */
+    /** 当前转发中的手势（DOWN 时快照、UP/CANCEL 清）：条上流跟踪 + 底角抢占身份匹配 */
     @Volatile private var fwdDownTime = 0L
     @Volatile private var fwdDeviceId = -1
     @Volatile private var fwdSource = 0
@@ -296,17 +294,19 @@ object SystemUiInputSpy {
     private var pendingMove: MotionEvent? = null
     private var lastMoveFwdEventTime = 0L
 
-    /** 注册抢占指令接收器（:ui STALL-TIMER fire → 五要素全匹配才 pilferPointers）。
-     *  Token 校验同 QS 点击接收器（0912 审查口径：RECEIVER_EXPORTED 必须带令牌）。 */
+    /** 注册抢占指令接收器（**只服务底角线**，2026-10-13）：:ui 底角锥内确认（SHOW）→
+     *  五要素全匹配才 pilferPointers，系统收到 CANCEL 便不弹 recents/home。
+     *  条上（竖屏触发带）的抢占已删除（用户 m03028：那是给 native 的冗余兜底，会打断
+     *  native 判定）。Token 校验同 QS 点击接收器（0912 审查口径：RECEIVER_EXPORTED
+     *  必须带令牌）。 */
     fun registerPilferReceiver(ctx: android.content.Context, modulePrefs: android.content.SharedPreferences) {
-        prefs = modulePrefs
+        if (prefs == null) prefs = modulePrefs
         runCatching {
             // 直接用传入的原始 ctx 注册：attach 时刻 applicationContext=null
             //（1005 三犯——start/sink 同款教训，全部收敛为原始 ctx）
             ctx.registerReceiver(
                 object : android.content.BroadcastReceiver() {
                     override fun onReceive(c: android.content.Context, intent: android.content.Intent) {
-                        if (!sysInputOwner()) return
                         // 全链留痕（低频，不会被 MOVE 刷掉）：token/身份/pilfer 结果都可判读
                         if (!com.lsp.hypersidebar.util.RelayToken.verifyFan(
                                 intent, com.lsp.hypersidebar.util.RelayToken.read(modulePrefs)
@@ -338,7 +338,7 @@ object SystemUiInputSpy {
                 android.content.IntentFilter(com.lsp.hypersidebar.prefs.PrefKeys.SPY_PILFER_ACTION),
                 android.content.Context.RECEIVER_EXPORTED
             )
-            HLog.i(TAG, "pilfer receiver registered")
+            HLog.i(TAG, "pilfer receiver registered (底角线)")
         }.onFailure { HLog.w(TAG, "pilfer register failed: ${it.message}") }
     }
 
@@ -368,26 +368,11 @@ object SystemUiInputSpy {
         return x <= cornerPx || x >= w - cornerPx
     }
 
-    private fun bandWidthDp(): Int = runCatching {
-        prefs?.getInt(
-            com.lsp.hypersidebar.prefs.PrefKeys.BAND_WIDTH_DP,
-            com.lsp.hypersidebar.prefs.LayoutDefaults.BAND_WIDTH_DP
-        ) ?: com.lsp.hypersidebar.prefs.LayoutDefaults.BAND_WIDTH_DP
-    }.getOrDefault(com.lsp.hypersidebar.prefs.LayoutDefaults.BAND_WIDTH_DP)
-
-    private fun bandHeightPercent(): Int = runCatching {
-        prefs?.getInt(
-            com.lsp.hypersidebar.prefs.PrefKeys.BAND_HEIGHT_PERCENT,
-            com.lsp.hypersidebar.prefs.LayoutDefaults.BAND_HEIGHT_PERCENT
-        ) ?: com.lsp.hypersidebar.prefs.LayoutDefaults.BAND_HEIGHT_PERCENT
-    }.getOrDefault(com.lsp.hypersidebar.prefs.LayoutDefaults.BAND_HEIGHT_PERCENT)
-
-    private fun bandPositionPercent(): Int = runCatching {
-        prefs?.getInt(
-            com.lsp.hypersidebar.prefs.PrefKeys.BAND_POSITION_PERCENT,
-            com.lsp.hypersidebar.prefs.LayoutDefaults.BAND_POSITION_PERCENT
-        ) ?: com.lsp.hypersidebar.prefs.LayoutDefaults.BAND_POSITION_PERCENT
-    }.getOrDefault(com.lsp.hypersidebar.prefs.LayoutDefaults.BAND_POSITION_PERCENT)
+    // （2026-10-13 清理，用户 m03028）触发带几何不再设置项化：直接取 LayoutDefaults 默认参数，
+    // 唯一真源=LayoutDefaults.BAND_*（CornerGeomBridge 推给 native 的也是同一组值）。
+    private fun bandWidthDp(): Int = com.lsp.hypersidebar.prefs.LayoutDefaults.BAND_WIDTH_DP
+    private fun bandHeightPercent(): Int = com.lsp.hypersidebar.prefs.LayoutDefaults.BAND_HEIGHT_PERCENT
+    private fun bandPositionPercent(): Int = com.lsp.hypersidebar.prefs.LayoutDefaults.BAND_POSITION_PERCENT
 
     private fun cornerHotPercent(): Int = runCatching {
         prefs?.getInt(
@@ -416,7 +401,6 @@ object SystemUiInputSpy {
      *  UP/CANCEL 前冲刷保序（:ui 侧判定/合流的回放顺序不变）。 */
     private fun forwardIfNeeded(ev: MotionEvent, w: Int, h: Int) {
         val p = prefs ?: return
-        if (!sysInputOwner()) return
         val ctx = appContext ?: return
         val a = ev.actionMasked
         if (a == MotionEvent.ACTION_DOWN) {

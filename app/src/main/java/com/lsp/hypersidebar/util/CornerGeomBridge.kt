@@ -226,9 +226,9 @@ object CornerGeomBridge {
             dm.widthPixels,
             dm.heightPixels,
             dm.density,
-            prefs.getInt(PrefKeys.BAND_WIDTH_DP, LayoutDefaults.BAND_WIDTH_DP),
-            prefs.getInt(PrefKeys.BAND_HEIGHT_PERCENT, LayoutDefaults.BAND_HEIGHT_PERCENT),
-            prefs.getInt(PrefKeys.BAND_POSITION_PERCENT, LayoutDefaults.BAND_POSITION_PERCENT),
+            LayoutDefaults.BAND_WIDTH_DP,
+            LayoutDefaults.BAND_HEIGHT_PERCENT,
+            LayoutDefaults.BAND_POSITION_PERCENT,
         )
         // Locale.US：属性值是纯数字，别让地区设置写出逗号小数点（native strtof 会读成整数部分）
         fun f(v: Float) = String.format(java.util.Locale.US, "%.2f", v)

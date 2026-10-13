@@ -18,13 +18,15 @@ import io.github.kyuubiran.ezxhelper.xposed.dsl.HookFactory.`-Static`.createAfte
  * 触发带内手势流，喂给 TurboLayout 条上状态机——判定逻辑单源（计划 §7 铁律），
  * SystemUI 只是哑管道。
  *
- * 门控与退路（与条上 hook 同款）：sink 侧 sysInputOwner 开 + isOs4Sidebar + 模块启用
- * + 未熔断 + 数据未死（owner 实例提供）。B 路线开时条上 hook 让位纯吞（防同一触摸
- * 双喂），本 sink 是唯一驱动源；关=收到即丢（开关默认关，常态零成本）。
+ * 门控与退路（与条上 hook 同款）：isOs4Sidebar + 模块启用 + 未熔断 + 数据未死
+ *（owner 实例提供，见 TurboLayout.b2Enabled）。条上 hook 让位纯吞（防同一触摸双喂），
+ * 本 sink 是竖屏唯一驱动源（全边缘触发恒开，2026-10-13 起无实验开关）。
  *
- * 抢占指令（B2-2）：TurboLayout STALL-TIMER fire 后经 [requestPilfer] 广播回
- * SystemUI，带手势五要素；SystemUI 全匹配才 pilferPointers。身份在 DOWN 事件到达时
- * 快照（MOVE/UP 期间不变，单指假设与条上状态机一致）。
+ *（2026-10-13 清理，用户 m03028）「抢占指令」只保留**底角线**用途：
+ * 条上（竖屏触发带）STALL 后的抢占已删除——那条是给 native 的冗余兜底，真机实证
+ * pilfer 一开 launcher Rust 立刻收 CANCEL、native 停顿判定链走不完，而 native 才是
+ * 判定单源。底角线仍用 [requestPilfer] 夺流（反向接管模型：系统收到 CANCEL 才不弹
+ * recents/home），调用方=TurboLayout.feedCornerGesture 的 SHOW 分支。
  *
  * 注册点：[arm] 由 TurboLayout init 调用（:ui），自挂 Application.attach 注册接收器
  * （与 LogDumpBridge/FreeformRelay 同款生命周期，init 早于 attach 恰好赶上）。
@@ -38,7 +40,7 @@ object RelayGestureSink {
     @Volatile private var appCtx: Context? = null
     @Volatile private var owner: TurboLayout? = null
 
-    /** 当前转发流的手势五要素快照（DOWN 时写入；无活动流=downTime 0） */
+    /** 当前转发流的手势五要素快照（DOWN 时写入；底角线 [requestPilfer] 的身份匹配用） */
     @Volatile private var streamDownTime: Long = 0L
     @Volatile private var streamDeviceId: Int = -1
     @Volatile private var streamSource: Int = 0
@@ -87,7 +89,7 @@ object RelayGestureSink {
                 IntentFilter(PrefKeys.SPY_STREAM_ACTION),
                 Context.RECEIVER_EXPORTED
             )
-            HLog.i(TAG, "spy stream sink registered (sysInputOwner gated)")
+            HLog.i(TAG, "spy stream sink registered (OS4 恒开，b2Enabled 门控)")
         }.onFailure { HLog.w(TAG, "register failed: ${it.message}") }
     }
 
@@ -113,12 +115,14 @@ object RelayGestureSink {
             o.feedStripGesture(c, landscape, ev)
         }
         if (ev.actionMasked == MotionEvent.ACTION_UP || ev.actionMasked == MotionEvent.ACTION_CANCEL) {
-            // 流结束清身份：防 STALL 后置的过期 requestPilfer 撞旧手势（1005 实锤 mismatch）
+            // 流结束清身份：防后置的过期 requestPilfer 撞旧手势（1005 实锤 mismatch）
             streamDownTime = 0L
         }
     }
 
-    /** B2-2 抢占指令：STALL-TIMER fire（TurboLayout 主线程）→ 定向广播回 SystemUI。 */
+    /** 底角线抢占指令：底角锥内确认（TurboLayout feedCornerGesture 的 SHOW）→ 定向广播回
+     *  SystemUI，带手势五要素；SystemUI 全匹配才 pilferPointers。条上（竖屏触发带）路径
+     *  已于 2026-10-13 删除调用（用户 m03028：那是给 native 的冗余兜底）。 */
     fun requestPilfer() {
         val ctx = appCtx ?: return
         if (streamDownTime == 0L) return
