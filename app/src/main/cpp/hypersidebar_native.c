@@ -24,8 +24,10 @@
 #include <stdlib.h>   /* strtoul —— loglimit 属性解析 */
 #include <stdint.h>
 #include <string.h>
+#include <errno.h>   /* chanprobe：文件写失败要看 errno */
 #include <jni.h>
-#include <time.h>   /* clock_gettime(CLOCK_MONOTONIC) —— 心跳的"安装后秒数" */
+#include <time.h>   /* clock_gettime(CLOCK_MONOTONIC) —— 心跳的"安装后秒数"基准 */
+#include <pthread.h> /* 心跳线程（补丁完整性巡检，见 §5.2 G1） */
 #include <sys/system_properties.h>
 #include "launcher_profiles.h"
 
@@ -341,6 +343,18 @@ static struct {
 
 static HsbFn16 g_orig;
 static volatile uint32_t g_stub_logged;
+
+/* ===== 补丁完整性巡检的全局（定义体在文件后段 hsb_heartbeat_thread；见 plan §5.2 G1）=====
+ * 为什么需要（2026-10-14 夜真机 12:27）：每条手势都 `native 未曾握手`、通道里最后一条发布
+ * 老了 42 分钟 ⇒ 桌面侧 native 静默，而旧日志**没有任何一行**能区分"没装上"与"被抹掉"
+ * （原来那条 `hook ALIVE` 只是 HIT 行的限流版，只有事件到达才打印）。
+ *   g_patch_snapshot = 安装成功后**立刻读回**的目标 32B（补丁还在的样子）
+ *   g_patch_orig     = profile 里的原始序言（补丁被抹后应长成的样子） */
+static uint8_t g_patch_snapshot[32];
+static uint8_t g_patch_orig[32];
+static volatile int g_patch_armed;
+static volatile int g_patch_wiped;
+static uint32_t g_hb_started;
 /* 第二锚点（动作位 pilfer_pointers）：独立的 backup 与存活标志 */
 static HsbFn16 g_orig_pilfer;
 static uint32_t g_hook2_installed;
@@ -977,6 +991,20 @@ static void hsb_back_event_log(const HsbBackEv *e) {
 #define HSB_STRIP_CONFIRM_PROP "persist.hsb.strip.confirm_px"
 #define HSB_STRIP_RESET_PROP   "persist.hsb.strip.reset_px"
 #define HSB_STRIP_MAXTAN_PROP  "persist.hsb.strip.max_tan"
+/* 「还在动」的速度**窗长**（2026-10-14 夜，用户 11:20 日志逼出来的可调项）。
+ *
+ * 为什么必须能调、而且默认不能动：`:ui` 的速度窗用事件自带的 eventTime 算，native 只能用
+ * "事件**到达**时刻" —— 而桌面拿到的是**积压回放**（真机实测 12 个事件挤在 57ms 内到达），
+ * 同样一段位移在 native 眼里被压进了更短的 dt_win ⇒ 窗内平均速度被系统性**高估** ⇒
+ * "还在动"被多刷新几次 ⇒ native 的 dwell 比 :ui 晚（11:20:49 的 `s#1`：native 确认在
+ * 49.004，授权却拖到 50.750 = +1746ms，而 :ui 的截止点是 49.638 ⇒ 白丢一次单源）。
+ * 窗长越长，暴涨的瞬时速度被摊平得越多（把窗从 150ms 拉到 ~300ms，慢速内滑的估值就能落回
+ * 500px/s 以下），但太长会把"快滑"也误判成慢。
+ * ⇒ 默认沿用已验证的 150ms（零行为变化），只把旋钮交出来：
+ *     `setprop persist.hsb.strip.window_ms 300` 就能在不重编的情况下 A/B 这一条假设。 */
+#define HSB_STRIP_WINDOW_PROP "persist.hsb.strip.window_ms"
+/* 缺属性时的窗长（ms）：与 :ui 的 GestureThresholds.STALL_SPEED_WINDOW_MS 同值。 */
+#define HSB_STRIP_SPEED_WINDOW_MS 150ull
 #define HSB_STRIP_DWELL_FALLBACK_MS 250.0f
 #define HSB_STRIP_SPEED_FALLBACK 500.0f
 #define HSB_STRIP_CONFIRM_FALLBACK 41.0f    /* 15dp × 2.75（仅属性缺失时兜底） */
@@ -987,6 +1015,8 @@ static void hsb_back_event_log(const HsbBackEv *e) {
  * 走"未启动收尾"（收箭头 + 收面板，**不可能提交 back**）。定义在委托门控区。 */
 static int hsb_arrow_state_release(void);
 static int hsb_arrowfix_value(void);
+static void hsb_publish_evoke(const char *payload);   /* 中间态：native → :ui 授权发布 */
+static void hsb_heartbeat_start(void);               /* 60s 心跳：补丁完整性巡检（定义体在文件后段） */
 /* 本事件是"我们这条流的终态（UP/CANCEL）且已强制清状态" ⇒ 吞掉之后需要在 stub 里补一次
  * 原函数调用，让 launcher 自己的收尾支真的跑起来。 */
 static int g_arrow_due;
@@ -1032,6 +1062,13 @@ static float hsb_strip_reset_px(void) {
 }
 static float hsb_strip_max_tan(void) {
     return hsb_prop_float(HSB_STRIP_MAXTAN_PROP, 0.01f, 100.0f, HSB_STRIP_MAXTAN_FALLBACK);
+}
+/* 速度窗长（ms）：默认 = 已验证的 150ms（与 :ui 的 STALL_SPEED_WINDOW_MS 同值）；
+ * 调大只影响 native 这一侧（:ui 仍按 eventTime 走自己的窗），用于验证"到达时刻压缩 ⇒ 速度高估"
+ * 这条假设，见 HSB_STRIP_WINDOW_PROP 的注释。 */
+static uint64_t hsb_strip_window_ms(void) {
+    float v = hsb_prop_float(HSB_STRIP_WINDOW_PROP, 50.0f, 2000.0f, (float) HSB_STRIP_SPEED_WINDOW_MS);
+    return (uint64_t) v;
 }
 
 
@@ -1151,8 +1188,7 @@ static struct {
  *   candidate（档=2）：带内起手、尚未停顿 ⇒ **事件照常转发**（Xiaomi 的 back 预览不受影响）
  *   active：条件已达成 ⇒ 后续事件不转发，直到终态
  * 速度窗字段用于判"还在动"：单帧瞬时速度被持指抖动主导（20px/采样 @120Hz ≈ 2500px/s），
- * 必须取窗口均值才分得出"真在滑"与"停住抖"——与 :ui 的 STALL_SPEED_WINDOW_MS 同款处理。 */
-#define HSB_STRIP_SPEED_WINDOW_MS 150ull
+ * 必须取窗口均值才分得出"真在滑"与"停住抖"——窗长定义见 HSB_STRIP_WINDOW_PROP（可属性覆盖）。 */
 static struct {
     int candidate;
     int confirmed;           /* 已过"距离+角度"确认门（对齐 :ui 的 swipe confirmed） */
@@ -1261,7 +1297,7 @@ static int hsb_suppress_swallow(const HsbBackEv *e, uint64_t now_ms) {
             return 0;   /* 未确认：什么都不做（没过确认门不可能呼出） */
         }
         uint64_t dt_win = now_ms - g_supp_stream.win_ms;
-        if (dt_win >= HSB_STRIP_SPEED_WINDOW_MS) {
+        if (dt_win >= hsb_strip_window_ms()) {
             float wx = e->x - g_supp_stream.win_x;
             float wy = e->y - g_supp_stream.win_y;
             float sp = hsb_strip_stall_speed();
@@ -1275,9 +1311,17 @@ static int hsb_suppress_swallow(const HsbBackEv *e, uint64_t now_ms) {
         if (!g_supp_stream.dwell_done &&
             now_ms - g_supp_stream.last_move_ms >= (uint64_t) hsb_strip_dwell_ms()) {
             g_supp_stream.dwell_done = 1;   /* 一条手势只处理一次 */
-            __atomic_add_fetch(&g_supp.dwelled, 1u, __ATOMIC_RELAXED);
-            /* 停顿成立 ⇒ 转"吞这条流"（生产档 suppress=2）。呼出仍归 :ui 自己的 dwell 定时器
-             * （judge=0 ⇒ :ui 不停），native 只负责让 launcher 看不到终态 ⇒ 不提交 back。 */
+            uint32_t seq = __atomic_add_fetch(&g_supp.dwelled, 1u, __ATOMIC_RELAXED);
+            /* 中间态（2026-10-13，用户 m03327）：把「native 已判定停顿」发布出去，
+             * :ui 侧 strict=1 时只认这条授权才呼出。每手势一次 ⇒ 不进热路径 I/O。 */
+            {
+                char payload[64];
+                snprintf(payload, sizeof(payload), "%u:%lld:%.1f:%.1f",
+                         (unsigned) seq, e->dt, e->x, e->y);
+                hsb_publish_evoke(payload);
+            }
+            /* 停顿成立 ⇒ 转"吞这条流"（生产档 suppress=2）。呼出：strict=0（默认）仍归
+             * :ui 自己的 dwell 定时器；strict=1 时 :ui 只认上面那次发布。 */
             if (hsb_suppress_value() >= 1) {
                 uint32_t n = hsb_supp_engage();
                 LOGI("back SUPPRESS(dwell) raw=(%.1f,%.1f) 停顿≥%.0fms #%u act=%d dt=%lld dev=%d",
@@ -1321,6 +1365,29 @@ static int hsb_suppress_swallow(const HsbBackEv *e, uint64_t now_ms) {
     g_supp_stream.down_y = e->y;
     /* 内滑轴：与 :ui 的 OS4 竖屏条一致 —— 起手在屏幕左半 ⇒ 向内=+x，否则 -x */
     g_supp_stream.in_ux = (e->x < g_band_scr_w * 0.5f) ? 1.0f : -1.0f;
+    /*
+     * 「我看到了这条流」握手（2026-10-14 夜，用户 m0xxxxx 的真机时序逼出来的）——
+     * payload 首段用 **seq=0**（判定成立的授权用 seq≥1），走同一条通道、同一个属性。
+     *
+     * 为什么必须有这一枪（真机 10:54:52.916 / 10:54:53.830，逐条时间戳见 plan §26.7）：
+     *   spy（:ui 视角）DOWN t=52.916 → :ui 确认 ≈53.147 → 回退点 53.597
+     *   而 native 的**首个**事件 `back_event #1 act=0 dt=34728177` 落在 **53.830**（晚 914ms），
+     *   它的确认/dwell 都以"事件到达时刻"起算 ⇒ 授权 54.081（native 确认 +246ms）。
+     *   即：native 不是"判定慢"，而是**桌面手势窗口开始收这条流本身就晚**
+     *   （桌面只拿到 DOWN 之后的积压事件，原始事件时刻已经过去）。实测三条手势的入场滞后
+     *   在 290~914ms 之间浮动 ⇒ :ui 侧任何**固定**宽限都追不上（200ms 追不上 914ms，
+     *   而放宽到 1s 又会让"native 真的看不到这条流"的覆盖差距重新变成长延迟）。
+     *   ⇒ 改成事件驱动的握手：native 一进流就发 seq=0；:ui 收到后把回退截止点从
+     *     "确认+宽限" 推到 "**native 见到我** + dwell + 宽限" —— 此后 native 的授权
+     *     必然落在同一把尺子的 +dwell 处，宽限只需覆盖"发布→25ms 轮询命中"（实测 1–12ms）。
+     * 零成本：每条带内手势只多一次属性写（不是每事件），且 seq=0 让 `getprop debug.hsb.evoke`
+     * 多出一条判据 —— "native 见到这条流了吗"（这是此前只能靠猜的那件事）。
+     */
+    {
+        char payload[64];
+        snprintf(payload, sizeof(payload), "0:%lld:%.1f:%.1f", e->dt, e->x, e->y);
+        hsb_publish_evoke(payload);
+    }
     return 0;
 }
 
@@ -1924,6 +1991,12 @@ static void hsb_install_at(const HsbLauncherAnchor *a, uintptr_t at, uintptr_t b
         g_hook.hook_installed++;
         g_hook.bias = base;
         g_hook.target = at;
+        /* 补丁快照（供 60s 心跳比对，见 g_patch_snapshot 注释）：安装后**立刻**读回 32B，
+         * 它就是"补丁还在"的基准；被抹时会变回 a->prologue（原始序言）。 */
+        memcpy(g_patch_orig, a->prologue, sizeof(g_patch_orig));
+        memcpy(g_patch_snapshot, (const void *) at, sizeof(g_patch_snapshot));
+        g_patch_armed = 1;
+        g_patch_wiped = 0;
         g_hook.installed_at_s = hsb_now_s();
         g_hook.last_log_s = g_hook.installed_at_s;
         snprintf(g_hook.anchor, sizeof(g_hook.anchor), "%s", a->name);
@@ -2085,6 +2158,8 @@ static void hsb_try_install_hooks(void) {
     if (g_hook.hook_installed) {
         LOGI("hooks ready: main=%s anchor2=%s masked=%u", g_hook.anchor,
              (g_hook2_installed && g_hook2_name[0]) ? g_hook2_name : "-", g_hook.prologue_masked);
+        /* 装上之后起心跳：从此"native 还活着吗/补丁还在吗"不用做手势也能看（见 hsb_heartbeat_thread） */
+        hsb_heartbeat_start();
     }
 }
 
@@ -2140,6 +2215,343 @@ static int hsb_gate_marker_probe(void) {
         return g_marker_state;
     }
     return 0;
+}
+
+
+/*
+ * ── 通道测量（2026-10-13，用户 m03291）──────────────────────────────────────
+ * 需求原话：不复用 SidebarEvokeHelper（那是参考资料，不是拿来直接用的组件）；要的是
+ * "native 判定之后再呼出"。而 native 活在 `com.miui.home` 里——那是被 hyos_spawner
+ * fork 出来的**无 ART 进程**，没有模块 Java 半侧，所以"告诉 :ui 一声"必须先有一条
+ * 通道。这条通道只能由 OS 级机制提供，候选就三类：**属性 / 文件 / binder**。
+ *
+ * 本探针一次把前两类（成本最低的）全试掉：只写、只回读、只打日志，不改任何行为。
+ * 判词 `chanprop:` / `chanfile:` 每行都自带 ⇒ OK / FAILED，并带 errno。
+ * 开关：`setprop debug.hsb.native.chanprobe 1`（默认关；native_init 读一次，需重启宿主）。
+ *
+ * 为什么属性要试 5 个名字：`property_contexts` 里没有 `hsb` 条目 ⇒ 名字落在哪个"已有前缀"
+ * 决定它的 SELinux 类型，而**只有特定类型**才允许 app 域 set（default_prop 只有 init/shell
+ * 能写）。之前 `persist.hsb.native.hook` 从 systemui 与模块 App 都写失败，很可能就是名字/
+ * 类型问题，而不是"域不允许写属性"。
+ * 为什么文件要试 5 个路径：既要过 SELinux（域对文件类型），又要过 storage 挂载
+ * （scoped storage / FUSE 的跨 uid 写判定）——两个都是本机无法离线查证的，只能实测。
+ */
+#define HSB_CHANPROBE_PROP "debug.hsb.native.chanprobe"
+
+static int hsb_chanprobe_on(void) {
+    char v[PROP_VALUE_MAX] = {0};
+    if (__system_property_get(HSB_CHANPROBE_PROP, v) > 0) return v[0] == '1';
+    return 0;
+}
+
+static void hsb_chan_probe(void) {
+    static const char *kProps[] = {
+        "debug.hsb.probe", "sys.hsb.probe", "vendor.hsb.probe",
+        "persist.sys.hsb.probe", "persist.hsb.probe", NULL,
+    };
+    for (int i = 0; kProps[i]; i++) {
+        errno = 0;
+        int rc = __system_property_set(kProps[i], "1");
+        char back[PROP_VALUE_MAX + 1] = {0};
+        int n = __system_property_get(kProps[i], back);
+        int ok = (n > 0 && strcmp(back, "1") == 0);
+        LOGI("chanprop: set %s=1 rc=%d readback=%s ⇒ %s（errno=%d）",
+             kProps[i], rc, n > 0 ? back : "-", ok ? "OK" : "FAILED", errno);
+    }
+
+    static const char *kFiles[] = {
+        "/data/local/tmp/hsb_chan_probe",
+        "/sdcard/hsb_chan_probe",
+        "/storage/emulated/0/hsb_chan_probe",
+        "/storage/emulated/0/Android/media/io.github.mikudayoooooooo.hypersidebar/hsb_chan_probe",
+        "/data/user_de/0/com.miui.home/hsb_chan_probe",
+        NULL,
+    };
+    for (int i = 0; kFiles[i]; i++) {
+        errno = 0;
+        FILE *f = fopen(kFiles[i], "wb");
+        if (!f) {
+            LOGI("chanfile: %s ⇒ 写 FAILED（errno=%d）", kFiles[i], errno);
+            continue;
+        }
+        fputs("1", f);
+        fclose(f);
+        char b[4] = {0};
+        int ok = 0;
+        errno = 0;
+        FILE *g = fopen(kFiles[i], "rb");
+        if (g) {
+            ok = (fread(b, 1, 1, g) == 1 && b[0] == '1');
+            fclose(g);
+        }
+        LOGI("chanfile: %s ⇒ 写 OK / 回读 %s（errno=%d）", kFiles[i], ok ? "OK" : "FAILED", errno);
+    }
+}
+
+/*
+ * ── native → :ui 的「授权呼出」发布通道（2026-10-13，用户 m03327 选中间态）────────
+ * 语义：native 判定"停顿成立"的那一刻，把「这条手势由我接管、:ui 可以出扇形」写到一个
+ *       :ui 读得到的地方。**每手势只写一次**（不是每事件）⇒ 不进输入热路径。
+ * 写哪：先按序试属性，再按序试文件；第一个"写成功且回读一致"的记为 winner 并缓存，
+ *       之后只用它（失败才重新全扫，例如属性被清掉）。候选顺序与 :ui 侧
+ *       TurboLayout.AUTH_PROPS 一致。
+ * 读哪：:ui 侧读同一批名字，按 downTime 匹配（payload 第 2 段 = 物理 downTime）。
+ * 开关：发布本身无副作用（写失败只打日志）；真正的行为开关在 :ui 侧
+ *       `debug.hsb.native.strict`（默认 0 ⇒ 仍由 :ui 自判，中间态不生效）。
+ * 判据：日志 `chanpublish:` —— 出现 `winner=prop|file …` 即通道打通。
+ */
+static const char *kPubProps[] = {
+    "debug.hsb.evoke", "sys.hsb.evoke", "vendor.hsb.evoke",
+    "persist.sys.hsb.evoke", "persist.hsb.evoke", NULL,
+};
+static const char *kPubFiles[] = {
+    "/data/user_de/0/com.miui.home/hsb_evoke",
+    "/data/local/tmp/hsb_evoke",
+    "/storage/emulated/0/Android/media/io.github.mikudayoooooooo.hypersidebar/hsb_evoke",
+    "/sdcard/hsb_evoke",
+    NULL,
+};
+static volatile uint32_t g_pub_ok;
+static volatile uint32_t g_pub_fail;
+static int g_pub_kind = -1;   /* 0=prop winner, 1=file winner, -1=未定 */
+static int g_pub_idx = -1;
+
+static int hsb_pub_try_prop(const char *name, const char *payload) {
+    errno = 0;
+    int rc = __system_property_set(name, payload);
+    char back[PROP_VALUE_MAX + 1] = {0};
+    int n = __system_property_get(name, back);
+    int ok = (n > 0 && strcmp(back, payload) == 0);
+    LOGI("chanpublish: prop %s=%s rc=%d readback=%s ⇒ %s（errno=%d）ok=%u fail=%u",
+         name, payload, rc, n > 0 ? back : "-", ok ? "OK" : "FAILED", errno,
+         g_pub_ok, g_pub_fail);
+    return ok;
+}
+
+static int hsb_pub_try_file(const char *path, const char *payload) {
+    errno = 0;
+    FILE *f = fopen(path, "wb");
+    if (!f) {
+        LOGI("chanpublish: file %s ⇒ 写 FAILED（errno=%d）", path, errno);
+        return 0;
+    }
+    fputs(payload, f);
+    fclose(f);
+    char b[80] = {0};
+    int ok = 0;
+    errno = 0;
+    FILE *g = fopen(path, "rb");
+    if (g) {
+        ok = (fgets(b, (int) sizeof(b), g) != NULL && strcmp(b, payload) == 0);
+        fclose(g);
+    }
+    LOGI("chanpublish: file %s=%s ⇒ 写 OK / 回读 %s（errno=%d）ok=%u fail=%u",
+         path, payload, ok ? "OK" : "FAILED", errno, g_pub_ok, g_pub_fail);
+    return ok;
+}
+
+static void hsb_publish_evoke(const char *payload) {
+    if (g_pub_kind == 0 && g_pub_idx >= 0 && hsb_pub_try_prop(kPubProps[g_pub_idx], payload)) {
+        g_pub_ok++;
+        return;
+    }
+    if (g_pub_kind == 1 && g_pub_idx >= 0 && hsb_pub_try_file(kPubFiles[g_pub_idx], payload)) {
+        g_pub_ok++;
+        return;
+    }
+    g_pub_kind = -1;
+    g_pub_idx = -1;
+    for (int i = 0; kPubProps[i]; i++) {
+        if (hsb_pub_try_prop(kPubProps[i], payload)) {
+            g_pub_kind = 0;
+            g_pub_idx = i;
+            g_pub_ok++;
+            LOGI("chanpublish: winner=prop %s（后续只走它）", kPubProps[i]);
+            return;
+        }
+    }
+    for (int i = 0; kPubFiles[i]; i++) {
+        if (hsb_pub_try_file(kPubFiles[i], payload)) {
+            g_pub_kind = 1;
+            g_pub_idx = i;
+            g_pub_ok++;
+            LOGI("chanpublish: winner=file %s（后续只走它）", kPubFiles[i]);
+            return;
+        }
+    }
+    g_pub_fail++;
+    LOGI("chanpublish: 全部候选失败 ⇒ native 无法通知 :ui（ok=%u fail=%u）", g_pub_ok, g_pub_fail);
+}
+
+/* ── 心跳线程：补丁完整性巡检（G1 检测者）+ 被抹即自愈（G3）────────────────────
+ *
+ * 真机证据（本机，hook 装上约 3.5 分钟后被抹）：
+ *   - libapp_launcher.so 的 .text 是**从 MiuiHome.apk 直接映射**（/proc/<pid>/maps 里是 apk
+ *     路径 + 文件偏移，没有独立 .so 行）⇒ plan §5.1 的归档镜像形态坐实；
+ *   - 被抹同一刻系统打 `LowMemDetector: Memory pressure level: 3 (ai)` +
+ *     `ScenarioStub:AI MEMORY PRESSURE POLICY` ⇒ ROM 的内存压力策略在抹页；
+ *   - 进程内 tracefs 被 MIUI bpf 占用、kprobe 挂不上 ⇒ 抓不到确切系统调用；
+ *   - `libapp_launcher.so` 的 .dynsym **不含 madvise**（只有 mmap/munmap）⇒ plan §5.2 的
+ *     G2（挂 libapp_launcher 自己的 madvise PLT）在这个构建上**没有槽位可挂**；且抹页方是
+ *     进程外的 LowMemDetector（process_madvise 一类），进程内 hook 也拦不到 ⇒ 只剩 G3 自愈。
+ *
+ * 做法（用框架自己的姿势，不自己写 .text）：`unhook_func(target)` → 校验目标已回到原始序言
+ * → `hook_func(target, stub, &backup)` 重装 → 校验读回与新快照一致。
+ *   · 为什么不 memcpy 快照回去：hook 是框架 hook_func 装的，trampoline/备份都归它管；
+ *     自己写字节要额外处理 mprotect，以及"入口 br 之前 x17 还没被 adrp/add 初始化"的
+ *     指令序撕裂（并发线程踩到就是崩桌面）。
+ *   · 为什么不直接再调一次 hook_func：若某版框架是链式 hook，backup 会指回我们自己的桩
+ *     ⇒ 每次事件递归爆栈。先 unhook 摘掉旧注册就没有这个歧义。
+ * 封顶：最多 HSB_PATCH_HEAL_MAX 次，超过只报警不再自愈（fail-closed，等用户重启桌面）。
+ * 只由心跳线程调用（单线程），不碰任何流状态。 */
+#define HSB_PATCH_HEAL_MAX 5u
+static uint32_t g_patch_heals;      /* 自愈成功次数 */
+static uint32_t g_patch_heal_fail;  /* 自愈失败/中止次数 */
+static int      g_patch_heal_stop;  /* 封顶后置 1：不再自愈 */
+
+static int hsb_patch_heal(void) {
+    if (!g_patch_armed || !g_hook.target) return 0;
+    if (!g_api || !g_api->hook_func || !g_api->unhook_func) return 0;
+    if (g_patch_heal_stop) return 0;
+    if (g_patch_heals + g_patch_heal_fail >= HSB_PATCH_HEAL_MAX) {
+        g_patch_heal_stop = 1;
+        LOGI("hook HB patch 自愈封顶（已试 %u 次）⇒ 停止自愈、只报警；恢复=重启桌面重装 hook",
+             g_patch_heals + g_patch_heal_fail);
+        return 0;
+    }
+
+    /* ① 摘掉旧注册（把目标页还原成原始字节；被抹时这步等于"本来就已是原始"） */
+    g_api->unhook_func((void *) g_hook.target);
+
+    /* ② 校验：目标必须已回到 profile 原始序言（G3「成组一致校验」的单锚点版）。
+     *    不满足 = 第三种扰动，不重装。 */
+    uint8_t now[32];
+    memcpy(now, (const void *) g_hook.target, sizeof(now));
+    if (memcmp(now, g_patch_orig, sizeof(now)) != 0) {
+        g_patch_heal_fail++;
+        LOGI("hook HB patch 自愈中止：unhook 后仍未回到原始序言 now=%02x%02x%02x%02x…"
+             "（第三种扰动，不重装）", now[0], now[1], now[2], now[3]);
+        return 0;
+    }
+
+    /* ③ 重装：与首次安装同一条路径（新 trampoline + 新 backup） */
+    void *backup = NULL;
+    (void) g_api->hook_func((void *) g_hook.target, (void *) hsb_stub, &backup);
+    if (backup == NULL) {
+        g_patch_heal_fail++;
+        LOGI("hook HB patch 自愈失败：hook_func 未给 backup ⇒ 补丁仍是被抹状态");
+        return 0;
+    }
+    g_orig = (HsbFn16) (uintptr_t) backup;
+
+    /* ④ 校验：读回必须既不是原始序言、也要与刚落的快照一致，否则这次自愈不算数 */
+    uint8_t chk[32];
+    memcpy(chk, (const void *) g_hook.target, sizeof(chk));
+    memcpy(g_patch_snapshot, chk, sizeof(g_patch_snapshot));
+    if (memcmp(chk, g_patch_orig, sizeof(chk)) == 0) {
+        g_patch_heal_fail++;
+        LOGI("hook HB patch 自愈失败：hook_func 后目标仍是原始序言 ⇒ 补丁没写进去");
+        return 0;
+    }
+    g_patch_wiped = 0;
+    g_patch_heals++;
+    LOGI("hook HB patch RE-ARMED (G3) #%u：装上后 %llus 被抹、本轮重装成功 target=%p backup=%p；"
+         "下一事件起重新走本桩（命中/发布/抑制/arrowfix 恢复）%s",
+         g_patch_heals,
+         (unsigned long long) (hsb_now_s() >= g_hook.installed_at_s
+                                  ? hsb_now_s() - g_hook.installed_at_s : 0),
+         (void *) g_hook.target, backup,
+         g_hook2_installed
+             ? "⚠ anchor2 也在同一轮被抹且未存 target ⇒ 本轮不自愈它，需要重启桌面（anchor2 默认关，见 debug.hsb.native.anchor2）"
+             : "");
+    return 1;
+}
+
+/* ── 心跳线程：补丁完整性巡检（G1 检测者）+ 被抹即自愈（G3）────────────────────
+ *
+ * 为什么必须是一条**定时**线：本文件里原来那条 `hook ALIVE …` 其实是 `hook HIT` 的限流版
+ * （`hsb_stub` 里 `first ? "hook HIT" : "hook ALIVE"`）——**只有事件到达才会打印**。
+ * 于是"hook 被抹掉"与"hook 从没装上"在 logcat 里长得一模一样：彻底安静。
+ * 真机 12:27 那轮（用户 m0xxxx）：每条手势都是 `native 未曾握手`、通道里最后一条发布老了
+ * **42 分钟** ⇒ 桌面侧 native 一整段时间没干活，却拿不出任何一行证据说明是哪一种。
+ *
+ * 判词（读目标处 32B 与两个基准比）：
+ *   patch=ok       与我们安装后立刻读回的快照**逐字节相同** ⇒ 补丁在位
+ *   patch=WIPED    与 profile 里的**原始序言**逐字节相同 ⇒ 补丁被 ROM 内存压力策略抹掉
+ *                  ⇒ 直接进 G3 自愈；自愈不成功才另打 `ARCHIVE REMAP DETECTED`
+ *   patch=CHANGED  两者都不是（第三种扰动）⇒ 带出实读字节，**不重装**
+ *
+ * 节奏（2026-10-14 实测后改）：巡检 5s 一拍，摘要行仍 60s 一行。
+ * 理由：真机看到"装上约 3.5 分钟被抹"，60s 一拍意味着最长 1 分钟手势链路不可用；5s 一拍
+ * 读 32B + memcmp 的成本可以忽略，自愈晚了用户已经在骂。 */
+static void *hsb_heartbeat_thread(void *arg) {
+    (void) arg;
+    uint8_t live[32];
+    const char *last_state = "ok";
+    unsigned ticks = 0;
+    for (;;) {
+        struct timespec ts;
+        ts.tv_sec = 5;
+        ts.tv_nsec = 0;
+        nanosleep(&ts, NULL);
+        if (!g_patch_armed || !g_hook.target) continue;
+        ticks++;
+        const char *state;
+        memcpy(live, (const void *) g_hook.target, sizeof(live));
+        if (memcmp(live, g_patch_snapshot, sizeof(live)) == 0) {
+            state = "ok";
+            g_patch_wiped = 0;
+        } else if (memcmp(live, g_patch_orig, sizeof(live)) == 0) {
+            /* WIPED ⇒ 先自愈；自愈成功这一拍就当 ok（下一拍自然会读到新快照） */
+            if (hsb_patch_heal()) {
+                memcpy(live, (const void *) g_hook.target, sizeof(live));
+                state = (memcmp(live, g_patch_snapshot, sizeof(live)) == 0) ? "ok" : "WIPED";
+            } else {
+                state = "WIPED";
+                g_patch_wiped = 1;
+            }
+        } else {
+            state = "CHANGED";
+        }
+        if (state != last_state) {   /* 指针比较：全部是字符串字面量 */
+            if (state[0] == 'W') {
+                LOGI("ARCHIVE REMAP DETECTED %s：目标页 32B 已还原成原始序言 ⇒ 手势链路静默失效"
+                     "（此后不会再出现 hook HIT / chanpublish / back SUPPRESS）；"
+                     "G3 自愈未成功（heal=%u fail=%u stop=%d），恢复=重启桌面重装 hook",
+                     g_hook.anchor, g_patch_heals, g_patch_heal_fail, g_patch_heal_stop);
+            } else if (state[0] == 'C') {
+                LOGI("hook HB patch CHANGED live=%02x%02x%02x%02x… snap=%02x%02x%02x%02x…"
+                     " orig=%02x%02x%02x%02x…（第三种扰动，只报不重装）",
+                     live[0], live[1], live[2], live[3],
+                     g_patch_snapshot[0], g_patch_snapshot[1], g_patch_snapshot[2], g_patch_snapshot[3],
+                     g_patch_orig[0], g_patch_orig[1], g_patch_orig[2], g_patch_orig[3]);
+            }
+            last_state = state;
+        }
+        if (ticks % 12u == 0u) {   /* 每 60s 一条摘要（含计数，给判词表用） */
+            LOGI("hook HB main=%s alive=%llus patch=%s hits=%u seen=%u inband=%u dw=%u sw=%u af=%u ac=%u pub=%u/%u heal=%u/%u",
+                 g_hook.anchor[0] ? g_hook.anchor : "-",
+                 (unsigned long long) (hsb_now_s() >= g_hook.installed_at_s
+                                           ? hsb_now_s() - g_hook.installed_at_s : 0),
+                 state, g_hook.hits, g_supp.seen, g_supp.in_band, g_supp.dwelled,
+                 g_supp.swallow, g_supp.arrow_fix, g_supp.arrow_clean, g_pub_ok, g_pub_fail,
+                 g_patch_heals, g_patch_heal_fail);
+        }
+    }
+    return NULL;
+}
+
+/* 启动心跳（幂等）：只在主锚点真装上之后调用，见 hooks ready 那一拍。 */
+static void hsb_heartbeat_start(void) {
+    if (g_hb_started) return;
+    g_hb_started = 1;
+    pthread_t th;
+    if (pthread_create(&th, NULL, hsb_heartbeat_thread, NULL) == 0) {
+        pthread_detach(th);
+        LOGI("hook HB thread started（5s 巡检 + 60s 摘要：补丁完整性 / 计数；不打印 = 线程没起来）");
+    } else {
+        LOGI("hook HB thread create FAILED（补丁完整性无法巡检）");
+    }
 }
 
 static int hsb_prop_enabled(void) {
@@ -2221,6 +2633,9 @@ NativeOnModuleLoaded native_init(const NativeAPIEntries *entries) {
              hd > 0 ? d : "-", hp > 0 ? pv : "-", mdesc, src, hsb_prop_enabled());
     }
 
+    /* 通道测量（默认关）：一次性把"launcher 能不能对别的进程序列化一句话"量出来。 */
+    if (hsb_chanprobe_on()) hsb_chan_probe();
+
     /* 已加载库回放（照抄参考实现，但**只作取证**）：裸 soname 的 RTLD_NOLOAD 查询受
      * linker namespace 隔离与加载时机影响，实机给出 absent 而桌面库其实在内存里
      * （见 §门控复盘）。hook 侧现在自己扫 maps+phdr，不再依赖这里的结论。 */
@@ -2261,6 +2676,35 @@ Java_com_lsp_hypersidebar_util_NativeProbe_retry(JNIEnv *env, jclass clazz) {
     LOGI("retry from java: installed=%u hits=%u via=%s reason=%s",
          g_hook.hook_installed, g_hook.hits, g_hook.how[0] ? g_hook.how : "-",
          g_hook.reason[0] ? g_hook.reason : "-");
+}
+
+/*
+ * Java 读系统属性口（2026-10-14，中间态配套）。TurboLayout 在 :ui 里要读 native 发布在
+ * `debug.hsb.evoke` 上的授权值；:ui 若用反射 `android.os.SystemProperties.get`，hidden API
+ * 可能直接拒（静默返回空）——而本 .so 在 :ui 里同样是已装载的模块（`native_init` 打过 gate 行）
+ * ⇒ 直接用它自己的 `__system_property_get`，不经 hidden API。
+ * 返回：非 null 字符串 = 本口可用（属性缺失时返回空串）；null = 参数非法/取串失败 ⇒ Java 回退反射。
+ */
+JNIEXPORT jstring JNICALL
+Java_com_lsp_hypersidebar_util_NativeProbe_nativeGetProp(JNIEnv *env, jclass clazz, jstring jkey) {
+    (void) clazz;
+    if (!jkey) return NULL;
+    jsize klen = (*env)->GetStringUTFLength(env, jkey);
+    if ((*env)->ExceptionCheck(env)) {
+        (*env)->ExceptionClear(env);
+        return NULL;
+    }
+    if (klen <= 0 || klen > PROP_NAME_MAX) return NULL;
+    char key[PROP_NAME_MAX + 1] = {0};
+    (*env)->GetStringUTFRegion(env, jkey, 0, klen, key);
+    if ((*env)->ExceptionCheck(env)) {
+        (*env)->ExceptionClear(env);
+        return NULL;
+    }
+    char val[PROP_VALUE_MAX + 1] = {0};
+    int n = __system_property_get(key, val);
+    if (n <= 0) return (*env)->NewStringUTF(env, "");   /* 本口可用，只是属性为空 */
+    return (*env)->NewStringUTF(env, val);
 }
 
 /* 2026-10-14 晚删除：`Java_..._NativeProbe_nativeSetProp`（免-su 写属性的 native 写法人）。

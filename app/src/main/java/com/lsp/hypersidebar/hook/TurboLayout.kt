@@ -300,6 +300,9 @@ class TurboLayout(private val remotePrefs: SharedPreferences) : BaseHook() {
                 sSwipeConfirmed = false
                 sStallFired = false
                 sFanSeen = false
+                sNativeStrict = nativeStrict()   /* 中间态档位：只在本手势 DOWN 读一次 */
+                sAuthSeen = false
+                sAuthSightDt = null
                 // 内滑轴：横屏条=就近角落的对角线（OS2/3 定稿，60° 锥容纳竖直/水平
                 // 内滑）；OS4 竖屏条=右缘中带，轴改水平向内——对角线轴对水平内滑有
                 // 0.707 投影衰减+锥倾斜（正是实测"横屏响应不如竖屏"的主因），竖屏
@@ -341,7 +344,15 @@ class TurboLayout(private val remotePrefs: SharedPreferences) : BaseHook() {
                 // 滑回条：整体重置（PRD 状态机"滑回边缘→待触发"；滞回=确认距离一半，
                 // 与竖屏通道同款——修零滞回下近阈值悬停微漂整条清零）
                 if (sSwipeConfirmed && inward < sResetPx) {
-                    vlog("s#$sGestureSeq RESET slide-back (inward=${inward.toInt()}px < ${sResetPx.toInt()})")
+                    // 提升为常开日志（2026-10-14 10:43 分诊）：滑回条会把在飞的 AUTH 轮询/回退定时器
+                    // 一起撤掉 ⇒ "按住很久却一行回退都没有、抬手只打一条未出扇形"的另一种成因。
+                    // 一次手势最多一条，噪声可忽略（原为 vlog，被"详细日志"开关挡住 ⇒ 导出里看不见）。
+                    com.lsp.hypersidebar.util.HLog.i(
+                        TAG,
+                        "s#$sGestureSeq RESET slide-back (inward=${inward.toInt()}px < ${sResetPx.toInt()})" +
+                            " strict=$sNativeStrict hadPoll=${sAuthPoll != null} hadTimer=${sStallTimer != null}" +
+                            "（本条流的手势判定清空：native 即使随后授权也不再呼出）"
+                    )
                     resetStripGesture()
                     return
                 }
@@ -363,8 +374,11 @@ class TurboLayout(private val remotePrefs: SharedPreferences) : BaseHook() {
                         sAnchorY = ev.rawY
                         sSpeedWinT = ev.eventTime
                         vlog("s#$sGestureSeq swipe confirmed: travel=${travel.toInt()}px (>= ${sConfirmPx.toInt()}) angle=${angle.toInt()}")
-                        // 13.1：确认即挂停顿定时器（取代旧 sAnchorT 基准+事件内评估）
+                        // 13.1：确认即挂停顿定时器（取代旧 sAnchorT 基准+事件内评估）。
+                        // 中间态（strict=1）：同一只定时器**同时**充当回退支（多等一个宽限），
+                        // 另起 25ms 轮询抢 native 那一枪 ⇒ "停止移动"只有一套语义（速度窗同源）。
                         armStallTimer(ctx, landscape)
+                        if (sNativeStrict) startAuthPoll(ctx, landscape, ev.downTime)
                     }
                 }
 
@@ -384,12 +398,45 @@ class TurboLayout(private val remotePrefs: SharedPreferences) : BaseHook() {
                         sSpeedWinT = ev.eventTime
                         if (speed > GestureThresholds.STALL_MAX_SPEED_PX_S) restartStallTimer(ctx, landscape)
                     }
+                    // 中间态（strict=1）：MOVE 上顺手看一眼通道（轮询仍在跑，这里只为省一次 25ms）。
+                    // ⚠ 这里**不再**顺手刷新"停止移动"时刻：回退截止点只由 armStallTimer 的
+                    // dwell+宽限 定时器负责（速度窗与 native 同源）。旧实现按"任意 MOVE 都刷新"
+                    // 算截止点（§25.10.4），指尖静止时的微抖/缓慢漂移会不断把它推后
+                    // ⇒ 真机症状 = "按住好几秒扇形才出"（2026-10-14 08:49 日志 s#29~s#31）。
+                    if (sNativeStrict && sAuthPoll != null) {
+                        when (pollNativeAuth(ev.downTime)) {
+                            AUTH_OK -> authArrive(ctx, landscape, ev.downTime)
+                            AUTH_SIGHT -> noteNativeSight(ctx, landscape, ev.downTime)
+                        }
+                    }
                     // 达标判定在定时器 fire（fireStall）：手指静止后无 MOVE 也照常触发
                 }
             }
 
             MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                vlog("s#$sGestureSeq UP stallFired=$sStallFired shown=${fanController.isShowing}")
+                // act / dur 是分诊的关键两个字段（2026-10-14 10:43 日志）：
+                //   CANCEL + 很短的 dur = **这条流被别的窗口抢走了**（桌面的手势窗口 pilfer ⇒
+                //   系统给观察副本发 CANCEL），不是用户抬手 ⇒ "抬手太快"那个判词会骗人；
+                //   UP + 长 dur = 用户真按住很久却没出扇形 ⇒ 回退支/定时器问题（本轮修的就是这个）。
+                val act = if (ev.actionMasked == MotionEvent.ACTION_CANCEL) "CANCEL" else "UP"
+                val dur = ev.eventTime - ev.downTime
+                vlog(
+                    "s#$sGestureSeq $act dur=${dur}ms stallFired=$sStallFired shown=${fanController.isShowing} " +
+                        "strict=$sNativeStrict auth=$sAuthSeen"
+                )
+                if (sNativeStrict && !sAuthSeen && !sStallFired) {
+                    // 既没等到授权、也没到回退点：dur 短 = 抬手/被抢太快（dwell 没成立，正常不出扇形）；
+                    // dur 长 = 异常（回退支没落地），见上面的修复说明。
+                    val late = dur >= stripDwellMs() + authGraceMs()
+                    val note = if (late) "；⚠ dur 已超回退点却仍没落地 ⇒ 回退支有问题"
+                    else "；dur 短 ⇒ 正常（dwell 没成立）"
+                    com.lsp.hypersidebar.util.HLog.w(
+                        TAG,
+                        "s#$sGestureSeq AUTH 未出扇形：$act dur=${dur}ms" +
+                            "（既没等到 native 授权、也没到回退点 dwell+${authGraceMs()}ms$note）" +
+                            "（${authChannelHint()}）"
+                    )
+                }
                 cancelStallTimer()
                 if (sStallFired) {
                     if (fanController.isShowing) {
@@ -448,7 +495,216 @@ class TurboLayout(private val remotePrefs: SharedPreferences) : BaseHook() {
         sStallFired = false
         sSpeedWinT = 0L
         sFanSeen = false
+        sAuthSightDt = null
+        sAuthDt = 0L
         cancelStallTimer()
+        cancelAuthPoll()
+    }
+
+    // ===== 中间态：native 判定 → :ui 呼出授权（2026-10-13，用户 m03327）=====
+    // strict=1 时本条链**优先**认 native 通过通道发布的 `<seq>:<downTime>:<x>:<y>`
+    // （native 侧 hsb_publish_evoke，每手势一次）；native 看不到这条流时由**回退支**
+    // 按 :ui 自判呼出。候选名字必须与 native 侧 kPubProps 顺序一致（native 自选 winner
+    // 并缓存）。默认 strict=0 ⇒ 行为与现状完全相同（本段全部路径不生效）。
+    //
+    // 回退支的判据（2026-10-14e 重写，别再改回"最后一次 MOVE"）：与 native **同一条**
+    // 停顿定时器 —— 确认即挂、速度窗内超速（> STALL_MAX_SPEED_PX_S）才重启，
+    // 只是 strict 档多等一个 AUTH_FALLBACK_GRACE_MS。理由：native 的 dwell 是
+    // "最后一次**够快**的移动 + dwell_ms"（速度窗判据，见 native hsb_suppress_swallow），
+    // 而旧实现按"最后一次**事件**"算 ⇒ 指尖静止时的微抖/缓慢漂移（真机实测 4~11px/s）
+    // 会不断刷新截止点，把回退无限推后（08:49 的 s#29 拖到 DOWN 后 6.0s 才出扇形）。
+    // 改用同一条速度窗判据后：回退点 = 最后一次够快的移动 + dwell + 200ms，
+    // 而 native 的发布点在 +dwell 附近 ⇒ **native 永远先到**，回退只在它沉默时落地。
+    private val AUTH_STRICT_PROP = "debug.hsb.native.strict"
+
+    /**
+     * native 未授权时的回退宽限：回退支在 `dwell + 该值` 之后落地（速度窗判据见上）。
+     * 依据（真机 m03522）：左上角 y≈110/162 起手的两条停顿手势 `:ui` 判了、native
+     * **一次都没进** `handle_back_gesture`（系统把状态栏高度以内的边缘流不算返回手势）
+     * ⇒ strict 档下会"手势有效却不出扇形"（能用优先于判定单源，§25.10.5）。
+     * 取 200ms 是给 native 的"发布 → 25ms 轮询命中"留余量（实测延迟 1–12ms）；它同时
+     * 覆盖"native 只在事件到达时才评估 dwell"这一拍（抖动事件间隔约 8ms）。
+     */
+    private val AUTH_FALLBACK_GRACE_MS = 200L
+
+    /**
+     * **握手之后**的宽限（seq=0 到达后启用）。
+     *
+     * 为什么握手后要放宽到 400ms：握手把"起点"对齐了（回退截止点改成从 native 进场起算），
+     * 但两边的 **dwell 时钟仍不完全同源** —— `:ui` 用事件自带的 eventTime 走速度窗，
+     * native 只能用"事件**到达**时刻"，而桌面拿到的是积压回放（时间被压缩 ⇒ 窗内平均速度偏高
+     * ⇒ 它认为"还在动"的时间更久）。真机 11:09 实测：`s#6` 握手在 08.796、native 授权 09.412
+     * （= sight+616ms，而不是 sight+250ms），比 :ui 的 sight+450ms 截止点晚 **15ms** ⇒ 白丢一次单源。
+     * 握手已经证明 native 就在这条流上（不是覆盖差距），所以这里多等不会伤到覆盖差距那条路：
+     * 覆盖差距的流根本收不到 seq=0，走的仍是 [AUTH_FALLBACK_GRACE_MS]=200ms。
+     */
+    private val AUTH_HANDSHAKE_GRACE_MS = 400L
+    /** 本文件代码版本标记：只用来回答"现在跑的 :ui 是哪一版 Kotlin"（装机后重编时手工递增）。 */
+    private val BUILD_TAG = "midstate-2026-10-14j"
+    private val AUTH_PROPS = arrayOf(
+        "debug.hsb.evoke", "sys.hsb.evoke", "vendor.hsb.evoke",
+        "persist.sys.hsb.evoke", "persist.hsb.evoke",
+    )
+    /** [pollNativeAuth] 的三种结果（见该函数注释）。 */
+    private val AUTH_NONE = 0
+    /** native 发了 seq=0 握手：它已看到本条流（但停顿还没成立）。 */
+    private val AUTH_SIGHT = 1
+    /** native 判出停顿并授权呼出（seq≥1）。 */
+    private val AUTH_OK = 2
+    private var sNativeStrict = false
+    private var sAuthProp: String? = null
+    private var sAuthSeen = false
+    private var sAuthPoll: Runnable? = null
+    /** 本手势是否已收到 native 的"我看到了"握手（收到则回退截止点从此刻重算） */
+    private var sAuthSightDt: Long? = null
+    /** 本手势 downTime（判词里带上，便于与 HSBNative 的 `chanpublish/back SUPPRESS` 对账） */
+    private var sAuthDt = 0L
+    /** 取证：轮询里见过的**任意**发布（不筛 dt），回退日志用它区分"通道静默"与"覆盖差距"。 */
+    private var sAuthLastAny: String? = null
+    private var sPropJniOk = false
+    private var sPropJniWarned = false
+    private var sStrictLogged = false
+
+    /**
+     * 读系统属性：**首选模块自己的 .so**（`__system_property_get`，绕开 :ui 里的 hidden API
+     * 限制），失败才回退反射 `android.os.SystemProperties.get`。
+     * 2026-10-14：真机上 `setprop debug.hsb.native.strict 1` 后 :ui 一行 `AUTH` 都没有，
+     * 而"反射被拒"会静默成空串 ⇒ 改成本口优先 + 一次性取证日志。
+     */
+    private fun sysPropGet(key: String): String {
+        val viaJni = runCatching {
+            com.lsp.hypersidebar.util.NativeProbe.nativeGetProp(key)
+        }.onFailure { t ->
+            if (!sPropJniWarned) {
+                sPropJniWarned = true
+                HLog.w(TAG, "nativeGetProp 不可用（本进程未载模块 so）：${t.javaClass.simpleName} ⇒ 属性读取回退反射")
+            }
+        }.getOrNull()
+        if (viaJni != null) {
+            if (!sPropJniOk) {
+                sPropJniOk = true
+                HLog.i(TAG, "属性读取走 nativeGetProp（__system_property_get，绕开 hidden API）")
+            }
+            return viaJni
+        }
+        return try {
+            val m = Class.forName("android.os.SystemProperties")
+                .getMethod("get", String::class.java, String::class.java)
+            (m.invoke(null, key, "") as? String) ?: ""
+        } catch (_: Throwable) {
+            ""
+        }
+    }
+
+    /** strict 档：只在本手势 DOWN 时读一次（属性读取极廉价，但没必要每事件读）。 */
+    private fun nativeStrict(): Boolean {
+        val v = sysPropGet(AUTH_STRICT_PROP)
+        val on = v.trim().startsWith("1")
+        if (!sStrictLogged) {
+            sStrictLogged = true
+            HLog.i(TAG, "strict 档读取：$AUTH_STRICT_PROP=\"$v\" ⇒ strict=$on")
+        }
+        return on
+    }
+
+    /**
+     * 读通道（strict=1 的唯一判据源）。命中本手势（downTime 匹配）分两种，见 [AUTH_*]：
+     * payload = `<seq>:<downTime>:<x>:<y>`；**seq=0 = native 刚看到这条流**（握手，native
+     * 侧 `hsb_suppress_swallow` 候选建立那一拍发），seq≥1 = 停顿成立、授权呼出。
+     */
+    private fun pollNativeAuth(dt: Long): Int {
+        val used = sAuthProp
+        val cands = if (used != null) arrayOf(used) else AUTH_PROPS
+        for (k in cands) {
+            val v = sysPropGet(k).trim()
+            if (v.isEmpty()) continue
+            val p = v.split(':')
+            if (p.size < 2) continue
+            // 取证：任何一条发布都记一份（不筛 dt）——回退日志靠它区分
+            // "通道整段静默（native 没装/没判过任何手势）" 与 "有发布但不含本条 ⇒ 覆盖差距"。
+            sAuthLastAny = "$k=$v"
+            if (p[1].toLongOrNull() != dt) continue
+            sAuthProp = k
+            return if ((p[0].toIntOrNull() ?: -1) == 0) AUTH_SIGHT else AUTH_OK
+        }
+        return AUTH_NONE
+    }
+
+    /**
+     * native 的"我看到了这条流"握手（seq=0）。
+     *
+     * 真机 10:54 的三条手势证明：native 的首个事件比 spy 的 DOWN 晚 **290~914ms**
+     * （桌面手势窗口开始收流本身就晚，拿到的是积压事件），而它的确认/dwell 全以"事件到达
+     * 时刻"起算 ⇒ 任何**固定**宽限都不可能既追得上这个滞后、又不把"native 真看不到"的
+     * 覆盖差距拖成长延迟。握手的语义就是把这把尺子交给 native：它在 T_sight 进场，
+     * 授权必然落在 T_sight + dwell 附近 ⇒ 截止点从"确认+宽限"推到"见到我 + dwell + 宽限"。
+     * 每条手势只发生一次（native 每手势只写一次 seq=0）。
+     */
+    private fun noteNativeSight(ctx: Context, landscape: Boolean, dt: Long) {
+        if (sAuthSightDt == dt) return
+        sAuthSightDt = dt
+        // 重新挂回退定时器（等价于"从 native 进场时刻起算 dwell+宽限"）
+        armStallTimer(ctx, landscape)
+        HLog.i(
+            TAG,
+            "s#$sGestureSeq AUTH native 已见到本条流（seq=0，dt=$dt）⇒ 回退截止点顺延到" +
+                "「native 进场 + ${stripDwellMs()}ms + ${AUTH_HANDSHAKE_GRACE_MS}ms」"
+        )
+    }
+
+    /** 当前生效的回退宽限：握手前 200ms（覆盖差距不许拖慢）/ 握手后 400ms（native 确实在线上）。 */
+    private fun authGraceMs(): Long =
+        if (sNativeStrict && sAuthSightDt != null) AUTH_HANDSHAKE_GRACE_MS else AUTH_FALLBACK_GRACE_MS
+
+    /** 回退日志的通道判词（objective 判据，别再用"常见于屏幕顶部 inset 内起手"那种猜测）。 */    private fun authChannelHint(): String = when {
+        sAuthSightDt != null -> "native 已见到本条流（seq=0）却仍未授权 ⇒ 它的确认门/停顿没成立（对照 HSBNative 的 cf/dw 计数）"
+        sAuthLastAny != null -> "通道有发布但不含本条 dt（last=$sAuthLastAny）⇒ native 没把这条流当返回手势（覆盖差距）"
+        else -> "通道整段静默（本进程一条 native 发布都没读到）⇒ 查 HSBNative 的 hooks ready / band geom"
+    }
+
+    /**
+     * native 授权轮询（strict=1）：25ms 一次读通道；命中授权即 [authArrive]，只命中握手
+     * 即 [noteNativeSight]（顺延回退截止点）。**本函数不做超时/回退**：回退由
+     * [armStallTimer]（dwell + [AUTH_FALLBACK_GRACE_MS]）统一落地 ⇒ "什么时候不再等 native"
+     * 只有一处判据，且与 native 的速度窗语义同源。
+     */
+    private fun startAuthPoll(ctx: Context, landscape: Boolean, dt: Long) {
+        cancelAuthPoll()
+        sAuthDt = dt
+        val r = object : Runnable {
+            override fun run() {
+                if (sStallFired) { sAuthPoll = null; return }
+                when (pollNativeAuth(dt)) {
+                    AUTH_OK -> { authArrive(ctx, landscape, dt); return }
+                    AUTH_SIGHT -> noteNativeSight(ctx, landscape, dt)
+                }
+                sAuthPoll = this
+                mainHandler.postDelayed(this, 25L)
+            }
+        }
+        sAuthPoll = r
+        mainHandler.postDelayed(r, 25L)
+        vlog(
+            "s#$sGestureSeq AUTH strict=1：native 授权优先（未到时由 dwell+" +
+                "${AUTH_FALLBACK_GRACE_MS}ms 的停顿定时器回退自判；native 一发 seq=0 握手就顺延，dt=$dt）"
+        )
+    }
+
+    private fun authArrive(ctx: Context, landscape: Boolean, dt: Long) {
+        cancelAuthPoll()
+        if (sStallFired) return
+        // native 先到 ⇒ 把回退支整条撤掉（否则 200ms 后还会再落一枪"自判呼出"）
+        cancelStallTimer()
+        sAuthSeen = true
+        sStallFired = true
+        StatsRecorder.onStall()
+        vlog("s#$sGestureSeq AUTH native 授权到达（dt=$dt，prop=$sAuthProp）⇒ showFan")
+        postShowStripFan(ctx, landscape)
+    }
+
+    private fun cancelAuthPoll() {
+        sAuthPoll?.let { mainHandler.removeCallbacks(it) }
+        sAuthPoll = null
     }
 
     // ===== 停顿定时器（13.1，与 EdgeGestureHook 对称；:ui 条上触摸在主线程）=====
@@ -456,16 +712,24 @@ class TurboLayout(private val remotePrefs: SharedPreferences) : BaseHook() {
     private fun armStallTimer(ctx: Context, landscape: Boolean) {
         cancelStallTimer()
         sStallTimerSeq = sGestureSeq
-        val dwell = stripDwellMs()
+        // 中间态（strict=1）：本定时器 = **回退支**（native 授权优先，见上面的 AUTH 段）。
+        // 宽限分两档：native 已握手（它确实在这条流上）⇒ 400ms；否则 200ms（覆盖差距不许拖慢）。
+        val dwell = stripDwellMs() + if (sNativeStrict) authGraceMs() else 0L
         val r = Runnable { fireStall(ctx, landscape) }
         sStallTimer = r
         mainHandler.postDelayed(r, dwell)
     }
 
-    /** 速度窗内超速=手指仍在主动移动：dwell 全额重启（语义同旧 sAnchorT=eventTime 重置）。 */
+    /** 速度窗内超速=手指仍在主动移动：dwell 全额重启（语义同旧 sAnchorT=eventTime 重置）。
+     *  strict 档同样重启（重启的是"回退截止点"）——否则指尖缓慢漂移时回退点会一直停在
+     *  确认那一刻，等于又一次把"停止移动"算错。 */
     private fun restartStallTimer(ctx: Context, landscape: Boolean) {
         armStallTimer(ctx, landscape)
-        vlog("s#$sGestureSeq STALL-TIMER restart ${stripDwellMs()}ms (speed > ${GestureThresholds.STALL_MAX_SPEED_PX_S.toInt()}px/s)")
+        vlog(
+            "s#$sGestureSeq STALL-TIMER restart ${stripDwellMs()}ms" +
+                (if (sNativeStrict) "+${authGraceMs()}ms(回退支,握手=${sAuthSightDt != null})" else "") +
+                " (speed > ${GestureThresholds.STALL_MAX_SPEED_PX_S.toInt()}px/s)"
+        )
     }
 
     private fun cancelStallTimer() {
@@ -484,6 +748,20 @@ class TurboLayout(private val remotePrefs: SharedPreferences) : BaseHook() {
         // **谁都不呼出**，故开关与分支一并删除：本条链恒为 :ui 自判（native 只负责抑制与收箭头）。
         sStallFired = true
         StatsRecorder.onStall()
+        if (sNativeStrict) {
+            // strict 档：native 的 dwell 点已过 + 宽限 200ms 仍无授权 ⇒ 视作"native 没把这条流
+            // 当返回手势"，按 :ui 自判呼出（能用优先于判定单源）。判词带上通道证据，见 authChannelHint()。
+            cancelAuthPoll()   // 已落地，别再多打 25ms 一轮的通道读
+            com.lsp.hypersidebar.util.HLog.w(
+                TAG,
+                "s#$sGestureSeq AUTH 未等到 native 授权（停止移动 ${stripDwellMs()}ms+" +
+                    "${authGraceMs()}ms，dt=$sAuthDt" +
+                    (if (sAuthSightDt == null) "，native 未曾握手" else "，native 已握手后仍无授权") +
+                    "）⇒ 回退 :ui 自判呼出（${authChannelHint()}）"
+            )
+            postShowStripFan(ctx, landscape)
+            return
+        }
         vlog("s#$sGestureSeq STALL-TIMER fire ${stripDwellMs()}ms anchor=(${sAnchorX.toInt()},${sAnchorY.toInt()})")
         // （2026-10-13 清理，用户 m03028）原 B2-2 抢占指令（pilfer）已整条删除：
         // 真机实证 pilfer 一开 launcher Rust 立刻收 CANCEL、native 停顿判定链走不完，
@@ -693,7 +971,7 @@ class TurboLayout(private val remotePrefs: SharedPreferences) : BaseHook() {
     }
 
     override fun init() {
-        HLog.i(TAG, "=== TurboLayout init ===")
+        HLog.i(TAG, "=== TurboLayout init === build=$BUILD_TAG")
         // B2-1：spy 转发流的回流终点（:ui；自挂 Application.attach 注册，init 早于 attach）
         RelayGestureSink.arm(this)
         // 结构化锚点解析（每宿主进程一次）：必须早于所有依赖锚点的 hook 安装。

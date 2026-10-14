@@ -179,6 +179,18 @@ object CornerGeomBridge {
     const val PROP_STRIP_RESET_PX = "persist.hsb.strip.reset_px"
     const val PROP_STRIP_MAX_TAN = "persist.hsb.strip.max_tan"
 
+    /**
+     * 「还在动」的速度窗长（ms，2026-10-14 夜新增）。
+     *
+     * 为什么需要：`:ui` 的速度窗用事件自带的 `eventTime`，native 只能用"事件**到达**时刻"，
+     * 而桌面拿到的是**积压回放**（真机 11:20 实测 12 个事件挤在 57ms 内到达）⇒ 同样位移被压进
+     * 更短的窗 ⇒ native 的窗内平均速度被系统性高估 ⇒ 它的 dwell 比 `:ui` 晚（`s#1`：确认在
+     * 49.004、授权拖到 50.750）⇒ 白丢一次"判定单源"。把窗拉长能摊平这种暴涨。
+     * 默认仍推 `GestureThresholds.STALL_SPEED_WINDOW_MS`（150ms，零行为变化）；
+     * 验证期可直接 `setprop persist.hsb.strip.window_ms 300` 覆盖（下次 App 推配置会被写回默认）。
+     */
+    const val PROP_STRIP_WINDOW_MS = "persist.hsb.strip.window_ms"
+
     /** 触发带几何（px）。`screenW/H` 永远是**竖屏**口径（min/max 归一）。 */
     internal data class BandPx(
         val screenW: Int,
@@ -252,6 +264,7 @@ object CornerGeomBridge {
             PROP_STRIP_CONFIRM_PX to f(confirmPx),
             PROP_STRIP_RESET_PX to f(resetPx),
             PROP_STRIP_MAX_TAN to f(maxTan),
+            PROP_STRIP_WINDOW_MS to GestureThresholds.STALL_SPEED_WINDOW_MS.toString(),
         )
         val key = values.joinToString("|") { it.second }
         if (key == lastBand) return
