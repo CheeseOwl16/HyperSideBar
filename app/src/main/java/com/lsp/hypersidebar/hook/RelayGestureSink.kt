@@ -110,7 +110,12 @@ object RelayGestureSink {
                 if (streamCorner) " zone=corner" else "")
         }
         if (streamCorner) {
-            o.feedCornerGesture(c, ev)
+            o.feedCornerGesture(
+                c, ev,
+                sysPilfered = intent.getBooleanExtra(
+                    com.lsp.hypersidebar.prefs.PrefKeys.SPY_EXTRA_SYS_PILFERED, false
+                ),
+            )
         } else {
             o.feedStripGesture(c, landscape, ev)
         }

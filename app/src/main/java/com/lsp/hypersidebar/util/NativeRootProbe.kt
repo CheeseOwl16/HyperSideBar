@@ -64,7 +64,8 @@ object NativeRootProbe {
      *
      * 2026-10-11 补齐：原来只有 3 个锚点（第 1 步那批），而当前门控挂的是
      * `is_in_bottom_gesture_region` ⇒ 最该被盯活性的那个锚点**没有参照值**，
-     * 报告只会打"该锚点无 prologue 参照"，等于门控锚点的存活无从判断。现在 11 个全在表内。
+     * 报告只会打"该锚点无 prologue 参照"，等于门控锚点的存活无从判断。现在 12 个全在表内
+     * （2026-10-14 加第 12 个 `nav_hot_zone`：只读观测锚点，见 launcher_profiles.h）。
      */
     internal val ORIGINAL_PROLOGUE = mapOf(
         "try_delegate_back_to_sidebar" to "ff8301d1fd7b03a9f52300f9f44f05a9",
@@ -80,6 +81,14 @@ object NativeRootProbe {
         "cancel_home_gesture_to_engine" to "ff8303d1fd7b0ba9f6570ca9f44f0da9",
         // 2026-10-12：手势终态路径入口（"取消"的第二半：箭头收尾 + 取消/提交分叉都在它下游）
         "on_swipe_stop_direct" to "ffc301d1e82300fdfdfb04a9f52f00f9",
+        // 2026-10-14：系统导航热区谓词（只读观测锚点，prop debug.hsb.native.anchor3 nav_hot_zone）
+        "nav_hot_zone" to "ffc303d1ed33096deb2b0a6de9230b6d",
+        // 2026-10-15：Home 判据本体 trigger_gesture_judge（只读观测锚点，prop anchor3 judge_probe）
+        "judge_probe" to "ff8304d1ec5300fdeb2b0b6de9230c6d",
+        // 2026-10-15：pilfer 动作本体 do_pilfer（只读观测锚点，prop anchor3 pilfer_probe）
+        "pilfer_probe" to "ffc301d1fd7b04a9f52b00f9f44f06a9",
+        // 2026-10-16：系统"是否处理事件"总闸 should_handle_event（只读观测锚点，prop anchor3 action_probe）
+        "action_probe" to "ffc304d1fd7b0da9fc6f0ea9fa670fa9",
     )
 
     /** 导出用的一段文本（诊断页 / 日志页 / 使用数据页三条路径都收口在 `SelfCheck.export`） */

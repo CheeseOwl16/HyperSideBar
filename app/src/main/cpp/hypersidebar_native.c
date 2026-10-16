@@ -233,6 +233,19 @@ static void probe_dtor(void) {
  */
 #define HSB_ANCHOR2_PROP "debug.hsb.native.anchor2"
 
+/* 第三锚点（2026-10-14 加，2026-10-15 扩到三个）：**只读观测**探针位。
+ *   - `nav_hot_zone`  = GestureInputHomeHelper::is_in_navigation_bar_hot_zone(x,y)
+ *   - `judge_probe`   = GestureInputHomeHelper::trigger_gesture_judge（Home 判据本体，
+ *     w2 接过热区 verdict；**2026-10-15 实测 0 调用，已判不在我们的观测路径上**）
+ *   - `pilfer_probe`  = GestureInputHomeHelper::do_pilfer（pilfer 动作本体：自旋锁后
+ *     `bl input_InputMonitor_pilferPointers@plt`；调用点仅 78e90c/78ef30 两处，均在
+ *     GestureInputMonitorImpl 内，入参 x0 = self+0xc8）
+ * `debug.hsb.native.anchor3 <名字>` 装上只读桩；缺省空 = 不装第三锚点（回现状）。
+ * 桩只透传 + 打参数，绝不改返回值：改返回值就等于改掉系统的 Home/pilfer 判据。
+ * 已证数据（2026-10-15，36 个真人采样点）：系统热区只在横向中段 x∈[400,760] y≈2380，
+ * 与我们角窗（x≤130 或 x≥950、y≥2328）**0 重叠** ⇒ 角区内压制热区是空操作。 */
+#define HSB_ANCHOR3_PROP "debug.hsb.native.anchor3"
+
 /*
  * 可换的挂点白名单（2026-10-08 加，2026-10-09 第 2 步扩容）：装机轮稀缺，
  * "installed=1 但 hits 恒 0"这种**选点**问题不该再烧一次 APK，
@@ -291,6 +304,19 @@ static const char *hsb_chosen_anchor2(void) {
     char v[64] = {0};
     if (__system_property_get(HSB_ANCHOR2_PROP, v) <= 0 || !v[0]) return NULL;
     if (strcmp(v, "pilfer_pointers") == 0) return "pilfer_pointers";
+    return NULL;
+}
+
+/* 第三锚点 = **只支持** 4 个只读观测件：`nav_hot_zone` / `judge_probe` / `pilfer_probe` /
+ * `action_probe`（后者是系统"是否处理该事件"总闸，静勘确认是角区 pilfer 的放行闸）。
+ * 空/其它值 = 不装第三锚点（不猜）。 */
+static const char *hsb_chosen_anchor3(void) {
+    char v[64] = {0};
+    if (__system_property_get(HSB_ANCHOR3_PROP, v) <= 0 || !v[0]) return NULL;
+    if (strcmp(v, "nav_hot_zone") == 0) return "nav_hot_zone";
+    if (strcmp(v, "judge_probe") == 0) return "judge_probe";
+    if (strcmp(v, "pilfer_probe") == 0) return "pilfer_probe";
+    if (strcmp(v, "action_probe") == 0) return "action_probe";
     return NULL;
 }
 
@@ -359,6 +385,20 @@ static uint32_t g_hb_started;
 static HsbFn16 g_orig_pilfer;
 static uint32_t g_hook2_installed;
 static char g_hook2_name[40];
+/* 第三锚点（只读观测 nav_hot_zone）：g_orig_navprobe / g_navprobe_logged /
+ * g_navprobe_last_rv 与桩一起定义在下方（hsb_stub_navprobe 之上），这里只留存活标志。
+ * 2026-10-16 起附锚点也纳入 G3 自愈（原先只自愈主锚点 ⇒ 实测附锚点装上 235s 被抹后
+ * 静默失效，action_probe 白装一轮）。target/snap/prol 三个字段就是为巡检准备的：
+ *   g_hook3_target = 安装时的绝对地址（抹除后地址不变，ROM 是还原字节不是搬家）
+ *   g_hook3_snap   = 安装后立刻读回的 32B（补丁在位的样子）
+ *   g_hook3_prol   = profile 原始序言（补丁被抹后应长成的样子） */
+static uint32_t g_hook3_installed;
+static char g_hook3_name[40];
+static uintptr_t g_hook3_target;
+static uint8_t g_hook3_snap[32];
+static uint8_t g_hook3_prol[32];
+static uint32_t g_hook3_heals;
+static uint32_t g_hook3_heal_fail;
 /* rv != 1 采样行的限流计数（独立于 g_stub_logged/g_cs.eval：那两者在 rv 恒 0 时都不涨，
  * 用它做限流会变成"永远只打第 1 条"或"一条都不打"）。 */
 static volatile uint32_t g_rv_logged;
@@ -520,6 +560,18 @@ static int hsb_anchor_has_gate(const char *name) {
     return strcmp(name, "is_in_bottom_gesture_region") == 0 ? 1 : 0;
 }
 
+/* nav_hot_zone / judge_probe / pilfer_probe / action_probe：都是**只读观测件**（透传 + 打
+ * 日志），不参与任何判定。坐标来源见各自锚点注释；action_probe 的入参是 launcher 自己的
+ * UND getter 读出来的（hsb_back_event_read），不是我们 spy 侧口径。
+ * 这个 flag 存在的意义只有一个：把"只读观测"从"有门控要改"里分出来，免得后人顺手把它并进
+ * has_gate / has_ret 那两个会改系统判定的集合里。 */
+static int hsb_anchor_has_navprobe(const char *name) {
+    return strcmp(name, "nav_hot_zone") == 0 || strcmp(name, "judge_probe") == 0 ||
+           strcmp(name, "pilfer_probe") == 0 || strcmp(name, "action_probe") == 0
+               ? 1
+               : 0;
+}
+
 /* init_gesture_type：DOWN 拍、(x,y)∈s0/s1（`fmov s8,s0`+`stp s0,s1`，2026-10-11 反汇编坐实）
  * ⇒ 角区锁存点（见 hsb_latch_down）。它同时是 match_region_check 的调用者，self 即 monitor impl，
  * +0x244/+0x260 就是屏高/宽。 */
@@ -610,7 +662,7 @@ static int g_geom_h_off = -1;
 
 /* 屏宽/高在 self 上的偏移**随锚点结构而变**（2026-10-11 真机实锤）：
  *  - is_in_bottom_gesture_region 的 self = GestureInputMonitorImpl 本体 ⇒ w/h 在 +0x260/+0x244
- *    （◪ 22:23 那轮已坐实 2400/1080）；
+ *    （22:23 那轮已坐实 2400/1080）；
  *  - init_gesture_type 的 self = GestureInputMonitor，它是 Impl 的**子对象**：
  *    dispatch_to_inner_monitor 里 `x2=0 ⇒ x21 = Impl+0x100`、`x0 = x21+0x10 = Impl+0x110`
  *    ⇒ Monitor = Impl + 0x110 ⇒ w/h 在 +0x150/+0x134。
@@ -622,6 +674,41 @@ static int g_geom_h_off = -1;
 #define HSB_DIMS_W_MON  0x150   /* = Impl+0x260 - 0x110 */
 #define HSB_DIMS_H_MON  0x134   /* = Impl+0x244 - 0x110 */
 
+/* 角区比例的单一来源（1 秒缓存）。抽出来给两处用：`hsb_corner_geom`（Impl self 口径）
+ * 和 action 桩（手里只有 MotionEvent、屏尺寸走 band 属性口径）。
+ * 2026-10-11 的死带事故就是"native 与 :ui 各一份常量"造成的，这里不要再造第三份。 */
+static float g_crn_ratio, g_crn_hot_pct;
+static uint64_t g_crn_ratio_s;
+
+static void hsb_corner_ratio(float *wr, float *hp) {
+    uint64_t now = hsb_now_s();
+    if (g_crn_ratio_s != now) {
+        g_crn_ratio_s = now;
+        /* 比例取 [0.02, 0.50] / [1, 50]：越界或非数字一律回落兜底（不猜）。
+         * 上限同时挡住"属性写坏把整个屏幕变成角区"。 */
+        g_crn_ratio = hsb_prop_float(HSB_CORNER_W_PROP, 0.02f, 0.50f, HSB_CORNER_W_FALLBACK_RATIO);
+        g_crn_hot_pct = hsb_prop_float(HSB_CORNER_HOT_PROP, 1.0f, 50.0f, HSB_CORNER_HOT_FALLBACK_PCT);
+    }
+    *wr = g_crn_ratio;
+    *hp = g_crn_hot_pct;
+}
+
+/* 角区判定（纯几何，无 I/O、无指针解引用）——`hsb_corner_gate` 与 action 桩共用。
+ * why_out：0=命中，1=坐标不在角区，2=横屏，3=尺寸非法。传 NULL 表示调用方不关心。
+ *
+ * 与 :ui `SystemUiInputSpy.inCornerTriangle` 逐行对齐（w>h 直接 false / 底部热区 /
+ * 左右镜像），这是当年那份注释里"两侧口径必须一致"的落地。 */
+static int hsb_corner_hit_xy(float x, float y, float w, float h, float ratio, float hot_pct,
+                             int *why_out) {
+    if (!(w > 0.0f) || !(h > 0.0f)) { if (why_out) *why_out = 3; return 0; }
+    if (w >= h) { if (why_out) *why_out = 2; return 0; }   /* 横屏不判：对齐 :ui 横屏走 B 路线 */
+    float edge = w * ratio;
+    float yband = h - (h * hot_pct / 100.0f);
+    int hit = (x <= edge || x >= w - edge) && (y >= yband);
+    if (why_out) *why_out = hit ? 0 : 1;
+    return hit;
+}
+
 static int hsb_corner_geom(uintptr_t self, int w_off, int h_off) {
     const volatile int *b = (const volatile int *) self;
     int w = b[w_off / 4];
@@ -632,10 +719,8 @@ static int hsb_corner_geom(uintptr_t self, int w_off, int h_off) {
     g_geom_checked_s = now;
     g_geom_w_off = w_off;
     g_geom_h_off = h_off;
-    /* 比例取 [0.02, 0.50] / [1, 50]：越界或非数字一律回落兜底（不猜）。
-     * 上限同时挡住"属性写坏把整个屏幕变成角区"。 */
-    float wr = hsb_prop_float(HSB_CORNER_W_PROP, 0.02f, 0.50f, HSB_CORNER_W_FALLBACK_RATIO);
-    float hp = hsb_prop_float(HSB_CORNER_HOT_PROP, 1.0f, 50.0f, HSB_CORNER_HOT_FALLBACK_PCT);
+    float wr, hp;
+    hsb_corner_ratio(&wr, &hp);
     g_corner_w_px = (float) w * wr;
     g_corner_hot_px = (float) h * hp / 100.0f;
     /* 几何每次刷新打一行（1 秒粒度，低频）：装错属性/回落兜底都当场可见，
@@ -704,30 +789,25 @@ static int hsb_corner_gate(uintptr_t self, double dx, double dy, uintptr_t rv,
         return 0;
     }
     const volatile int *b = (const volatile int *) self;
-    int w = b[HSB_DIMS_W_IMPL / 4];
-    int h = b[HSB_DIMS_H_IMPL / 4];
-    /* 横屏不门控：:ui 的 CornerTrigger.onDown 对 `screenW >= screenH` 直接返回 false
-     * （横屏触发整体走 B 路线），所以横屏下 native 若照判照让路，就是"吞了系统 Home、
-     * :ui 又不会呼出扇形"的同款死带。这里对齐它的前置条件——只判竖屏。 */
-    if (w >= h) {
-        __atomic_add_fetch(&g_cs.skip, 1u, __ATOMIC_RELAXED);
-        if (why_out) *why_out = 2;
-        return 0;
-    }
-    float x = hsb_lo32_float(dx);
-    float y = hsb_lo32_float(dy);
-    float edge = g_corner_w_px;
-    float yband = (float) h - g_corner_hot_px;
-    int hit = (x <= edge || x >= (float) w - edge) && (y >= yband);
+    float w = (float) b[HSB_DIMS_W_IMPL / 4];
+    float h = (float) b[HSB_DIMS_H_IMPL / 4];
+    float ratio, hot_pct;
+    hsb_corner_ratio(&ratio, &hot_pct);
+    int why = 0;
+    int hit = hsb_corner_hit_xy(hsb_lo32_float(dx), hsb_lo32_float(dy), w, h, ratio, hot_pct,
+                                &why);
+    if (why_out) *why_out = why;
+    if (why == 2) __atomic_add_fetch(&g_cs.skip, 1u, __ATOMIC_RELAXED);
+    if (why == 3) __atomic_add_fetch(&g_cs.bad, 1u, __ATOMIC_RELAXED);
     if (hit) {
         __atomic_add_fetch(&g_cs.hit, 1u, __ATOMIC_RELAXED);
         if (force) {
             *io_rv = 0u;
             __atomic_add_fetch(&g_cs.force, 1u, __ATOMIC_RELAXED);
         }
-    } else {
+    } else if (why == 1) {
+        /* 只在"坐标不在角区"时记 miss：横屏/尺寸非法各有自己的计数器（六数分区自洽） */
         __atomic_add_fetch(&g_cs.miss, 1u, __ATOMIC_RELAXED);
-        if (why_out) *why_out = 1;
     }
     return hit;
 }
@@ -1715,6 +1795,213 @@ static uintptr_t hsb_stub_pilfer(uintptr_t a0, uintptr_t a1, uintptr_t a2, uintp
                : 0u;
 }
 
+/* ===== 第三锚点：系统导航热区谓词的**只读**观测桩 =====
+ * 为什么只读：它是 trigger_gesture_judge 的第 7 参来源，系统的 Home/recents 判据就从这里出。
+ * 在改任何东西之前，必须先有一张"系统自己认为哪里是热区"的地图——否则互斥设计就是猜
+ * （x<10 组的教训：我们判据最好的地方，是我们和系统撞得最准的地方，跟区域大小无关）。
+ * (x,y)∈s0/s1 且按 float 存（调用点 fmov s0,s11 / fmov s1,s12），返回 bool∈w0。
+ *
+ * 为什么**每行必打**（2026-10-15 改，原实现是"第1次 + 每20次 + rv翻转"）：
+ * 一次手势只有个位数到十几次调用，每 20 次一采等于整轮手势一行都不出；第一版装机就是
+ * 这样，7 个手势只换来 2 行读数，边界图全是采样假象——探针开着却什么都没测到，比不打
+ * 更坏。这个 hook 只在 `debug.hsb.native.anchor3 nav_hot_zone` 显式打开后才装，量级由
+ * 采集人自己控制，所以这里不替任何人省日志。真的怕吵，用 logcat 抓完再关 prop 即可。
+ * 由此 g_navprobe_last_rv 那个共享 latch 也删了：它本来就是限流的附属品，且是多线程
+ * 下无同步的裸 int。 */
+static HsbFn16 g_orig_navprobe;
+static uint32_t g_navprobe_logged;
+
+static uintptr_t hsb_stub_navprobe(uintptr_t a0, uintptr_t a1, uintptr_t a2, uintptr_t a3,
+                                   uintptr_t a4, uintptr_t a5, uintptr_t a6, uintptr_t a7,
+                                   double d0, double d1, double d2, double d3,
+                                   double d4, double d5, double d6, double d7) {
+    uintptr_t rv = g_orig_navprobe
+                       ? g_orig_navprobe(a0, a1, a2, a3, a4, a5, a6, a7,
+                                         d0, d1, d2, d3, d4, d5, d6, d7)
+                       : 0u;
+    uint32_t n = __atomic_add_fetch(&g_navprobe_logged, 1u, __ATOMIC_RELAXED);
+    int rvi = (int) (uint32_t) rv;
+    LOGI("navprobe x=%.1f y=%.1f rv=%d #%u",
+         hsb_lo32_float(d0), hsb_lo32_float(d1), rvi, n);
+    return rv;
+}
+
+/* ===== 第三锚点（judge_probe）：`trigger_gesture_judge` 的**只读**观测桩 =====
+ * 为什么打它：nav_hot_zone 已测出系统热区=横向中段、与我们角窗 0 重叠 ⇒ "角窗内压制热区"
+ * 这条路被否。但三连照旧发生，说明系统在角区拿到"不在热区"的 verdict 后仍走了 Home 分支。
+ * 这个函数就是那个分叉点本体（调用点 0x7afca8 `bl trigger_gesture_judge`，w2 = 热区 verdict）。
+ *
+ * 签名（0x7afca8 调用点 + 本体序言双证）：
+ *   trigger_gesture_judge(x0 = downTime(ms), x1 = eventTime(ms),
+ *                         s0 = x, s1 = y, s2 = x2, s3 = y2, w2 = hot_zone verdict)
+ * 本体 `fsub s12, s3, s1` / `mov w19, w2` / `mov x20, x1` / `mov x21, x0`：这几个寄存器
+ * 一路活到后段，说明 x0/x1/w2 与 s0..s3 都是被缓存的入参；s3-s1 是终点-起点位移分量，
+ * 用于角度判定（s12）。s8/s9 是 s0/s1 的副本（`fmov s8,s2` / `fmov s9,s0`）。
+ *
+ * 每行必打（同 navprobe 的理由：不采样，采样会漏掉判据翻转点）。坐标原样打、不做任何
+ * 缩放或换算——第一版 navprobe 的教训就是"为了让日志好看而动数据"，下游脚本会拿错量纲。 */
+static HsbFn16 g_orig_judgeprobe;
+static uint32_t g_judgeprobe_logged;
+
+static uintptr_t hsb_stub_judgeprobe(uintptr_t a0, uintptr_t a1, uintptr_t a2, uintptr_t a3,
+                                     uintptr_t a4, uintptr_t a5, uintptr_t a6, uintptr_t a7,
+                                     double d0, double d1, double d2, double d3,
+                                     double d4, double d5, double d6, double d7) {
+    uintptr_t rv = g_orig_judgeprobe
+                       ? g_orig_judgeprobe(a0, a1, a2, a3, a4, a5, a6, a7,
+                                           d0, d1, d2, d3, d4, d5, d6, d7)
+                       : 0u;
+    uint32_t n = __atomic_add_fetch(&g_judgeprobe_logged, 1u, __ATOMIC_RELAXED);
+    LOGI("judge dt=%lld et=%llu x=%.1f y=%.1f x2=%.1f y2=%.1f hot=%u rv=%u #%u",
+         (long long) a0, (unsigned long long) a1,
+         hsb_lo32_float(d0), hsb_lo32_float(d1), hsb_lo32_float(d2), hsb_lo32_float(d3),
+         (unsigned) a2, (unsigned) (uint32_t) rv, n);
+    return rv;
+}
+
+/* ===== 第三锚点（pilfer_probe）：`GestureInputHomeHelper::do_pilfer` 的**只读**观测桩 =====
+ * 为什么换它（2026-10-15，judge_probe 无效之后）：
+ *   - judge_probe 实测 0 调用（69 个真人角区手势 + 我的标准中段上滑，全部 0 行）⇒
+ *     trigger_gesture_judge 不在我们的观测路径上，原"冲突在 judge"的推断作废；
+ *   - 调用点全表扫描（bl 0x6b8464）只有两处，且都在 `GestureInputMonitorImpl` 内部：
+ *         78e90c: add x0, x19, #0xc8 ; bl do_pilfer
+ *         78ef30: add x0, x19, #0xc8 ; bl do_pilfer
+ *     do_pilfer(x0 = monitor+0xc8) 单参；函数体自旋锁后 `bl input_InputMonitor_pilferPointers@plt`
+ *     (0x6b84f4) —— **pilfer 动作本体就在这里**。
+ * 现在只有它是"系统主动把角区流 pilfer 走"的可疑位置；打它 = 直接拿这个证据。
+ *
+ * 签名（调用点 + 本体双证）：do_pilfer(x0 = self+0xc8 子对象指针)，只 1 个整型参。
+ * 只读：透传 + 打 self/返回值，绝不改返回、绝不拦流。 */
+static HsbFn16 g_orig_pilferprobe;
+static uint32_t g_pilferprobe_logged;
+
+static uintptr_t hsb_stub_pilferprobe(uintptr_t a0, uintptr_t a1, uintptr_t a2, uintptr_t a3,
+                                      uintptr_t a4, uintptr_t a5, uintptr_t a6, uintptr_t a7,
+                                      double d0, double d1, double d2, double d3,
+                                      double d4, double d5, double d6, double d7) {
+    uintptr_t rv = g_orig_pilferprobe
+                       ? g_orig_pilferprobe(a0, a1, a2, a3, a4, a5, a6, a7,
+                                            d0, d1, d2, d3, d4, d5, d6, d7)
+                       : 0u;
+    uint32_t n = __atomic_add_fetch(&g_pilferprobe_logged, 1u, __ATOMIC_RELAXED);
+    LOGI("pilfer self=%p rv=%u #%u", (void *) a0, (unsigned) (uint32_t) rv, n);
+    return rv;
+}
+
+/* ===== 第三锚点（action_probe）：`motion_event_handled_proxy::should_handle_event` 桩 =====
+ * 静勘结论（docs/adaptation/os4-hook-point-survey.md）：pilfer 的唯一出口是 H2
+ * (GestureInputMonitor::pilfer_pointers)，但角区 pilfer 的**放行闸**是 H1——
+ *   `7af85c: mov x0, x19(事件) ; mov w1, #2(MOVE)`
+ *   `7af864: bl  should_handle_event`
+ *   `7af868: cbz w0, 0x7afb2c        // 返 0 ⇒ 整段 pilfer 不执行`
+ * 所以"只掐角区 pilfer"的着力点在 H1，而不是一拦全拦的 H2。
+ *
+ * 签名（调用点 + 本体双证）：should_handle_event(x0 = MotionEvent*, w1 = 期望 action)。
+ *
+ * ## 抑制档（2026-10-16，`debug.hsb.native.corner.supp`）
+ * 只读实测（os4-hook-point-survey.md §6.2）已证明**系统自己的返回值就带区域差异**：
+ * 角窗内 44 行 rv 全为 1、中段 62 行 rv=0 ⇒ `should_handle_event` 本来就是按区域放行的，
+ * 我们按同一区域返 false 不需要新造判据，天然对齐系统语义。
+ *
+ * 抑制条件（三条必须同时成立，缺一条就透传）：
+ *   1. 属性已开（默认关；debug. 前缀，重启即失效 = 安全的默认态）
+ *   2. `want == 2`（MOVE 闸）。只掐 pilfer 放行那一处，不碰 want=0/1 的另两个调用点
+ *   3. 事件坐标落在角窗（hsb_corner_hit_xy，与 hsb_corner_gate / :ui inCornerTriangle 同源）
+ *
+ * ## fail-open（本桩的硬约束）
+ * getter 未解析 / 屏尺寸属性缺失 / 横屏 / 比例属性非法 —— 任何一种都**原样返回系统的 verdict**。
+ * 宁可漏抑制（回到今天的三连），也绝不猜：猜错就是"吞了系统 Home 而扇形又没呼出"的死带，
+ * 2026-10-11 已经为这个付过一次代价（见 hsb_corner_ratio 的注释）。
+ *
+ * ## 观测
+ * 命中抑制必打一行（带 edge/band 便于回溯阈值），透传每 50 行 + 第 1 行打一条采样。 */
+#define HSB_ACTION_SUPP_PROP "debug.hsb.native.corner.supp"
+
+static int g_act_supp_on;
+static uint64_t g_act_supp_s;
+static uint32_t g_act_supp;    /* 命中抑制次数（进程内累计） */
+static uint32_t g_act_pass;    /* 透传次数 */
+
+static int hsb_action_supp_enabled(void) {
+    uint64_t now = hsb_now_s();
+    if (g_act_supp_s != now) {
+        char v[8] = {0};
+        g_act_supp_s = now;
+        g_act_supp_on = __system_property_get(HSB_ACTION_SUPP_PROP, v) > 0 && v[0] == '1';
+    }
+    return g_act_supp_on;
+}
+
+/* 屏尺寸（1 秒缓存）。action 桩手里没有 Impl self（a0 是 MotionEvent），屏幕尺寸只能走属性；
+ * 与条线同一来源（模块 App 推的 persist.hsb.band.screen_*，实测 1080x2400）。
+ * 缺失 ⇒ 0 ⇒ 上层 fail-open。 */
+static float g_act_scr_w, g_act_scr_h;
+static uint64_t g_act_scr_s;
+
+static void hsb_action_screen(float *w, float *h) {
+    uint64_t now = hsb_now_s();
+    if (g_act_scr_s != now) {
+        g_act_scr_s = now;
+        g_act_scr_w = hsb_prop_float(HSB_BAND_SW_PX_PROP, 1.0f, 100000.0f, 0.0f);
+        g_act_scr_h = hsb_prop_float(HSB_BAND_SH_PX_PROP, 1.0f, 100000.0f, 0.0f);
+    }
+    *w = g_act_scr_w;
+    *h = g_act_scr_h;
+}
+
+static HsbFn16 g_orig_actionprobe;
+static uint32_t g_actionprobe_logged;
+
+static uintptr_t hsb_stub_actionprobe(uintptr_t a0, uintptr_t a1, uintptr_t a2, uintptr_t a3,
+                                      uintptr_t a4, uintptr_t a5, uintptr_t a6, uintptr_t a7,
+                                      double d0, double d1, double d2, double d3,
+                                      double d4, double d5, double d6, double d7) {
+    /* 先调原函数：保留它 2468B 里的全部副作用（状态写、派发），只改回给调用方的 verdict。
+     * 不调原函数就返 0 会绕过副作用，那不是我这次敢改的东西。 */
+    uintptr_t rv = g_orig_actionprobe
+                       ? g_orig_actionprobe(a0, a1, a2, a3, a4, a5, a6, a7,
+                                            d0, d1, d2, d3, d4, d5, d6, d7)
+                       : 0u;
+    uint32_t n = __atomic_add_fetch(&g_actionprobe_logged, 1u, __ATOMIC_RELAXED);
+
+    HsbBackEv ev;
+    int ev_ok = hsb_back_event_read(a0, &ev);
+    int want = (int) a1;
+
+    /* 抑制：属性开 + MOVE 闸 + 角窗。任一条件不满足（含读不到坐标/屏尺寸）都走透传。 */
+    int suppressed = 0;
+    if (hsb_action_supp_enabled() && want == 2 && ev_ok) {
+        float sw, sh, ratio, hot_pct;
+        hsb_action_screen(&sw, &sh);
+        hsb_corner_ratio(&ratio, &hot_pct);
+        int why = 0;
+        if (hsb_corner_hit_xy(ev.x, ev.y, sw, sh, ratio, hot_pct, &why)) {
+            suppressed = 1;
+            __atomic_add_fetch(&g_act_supp, 1u, __ATOMIC_RELAXED);
+            LOGI("action SUPPRESS want=2 act=%d raw=(%.1f,%.1f) dt=%lld dev=%d rv=%u->0 #%u "
+                 "[edge=%.1f band=%.1f scr=%.0fx%.0f]",
+                 ev.act, ev.x, ev.y, (long long) ev.dt, ev.dev, (unsigned) rv, n,
+                 sw * ratio, sh - (sh * hot_pct / 100.0f), sw, sh);
+        } else if (n % 50u == 0u) {
+            LOGI("action PASS not-corner want=2 act=%d raw=(%.1f,%.1f) rv=%u #%u (why=%d)",
+                 ev.act, ev.x, ev.y, (unsigned) rv, n, why);
+        }
+    } else if (n == 1u || n % 50u == 0u) {
+        if (ev_ok) {
+            LOGI("action_probe ev=%p want=%d act=%d raw=(%.1f,%.1f) dt=%lld dev=%d rv=%u #%u%s",
+                 (void *) a0, want, ev.act, ev.x, ev.y, (long long) ev.dt, ev.dev,
+                 (unsigned) rv, n, hsb_action_supp_enabled() ? " (supp armed)" : "");
+        } else {
+            LOGI("action_probe ev=%p want=%d rv=%u #%u (coords unavailable: getters unresolved)",
+                 (void *) a0, want, (unsigned) rv, n);
+        }
+    }
+
+    if (suppressed) return 0u;   /* 只改 verdict：系统据此跳过 pilfer 放行段 */
+    __atomic_add_fetch(&g_act_pass, 1u, __ATOMIC_RELAXED);
+    return rv;
+}
+
 /* --- 候选 load bias + 可执行段边界（两条来源共用，先 phdr 后 maps 追加） --- */
 typedef struct {
     uintptr_t start;
@@ -1964,12 +2251,37 @@ static uintptr_t hsb_sigscan_mask(const uint8_t *pat, uint32_t *hits_out) {
     return hits == 1u ? found : 0u;
 }
 
-/* （第二锚点只支持 pilfer_pointers：backup 存 g_orig_pilfer，存活标志 g_hook2_installed） */
+/* （第二锚点只支持 pilfer_pointers：backup 存 g_orig_pilfer，存活标志 g_hook2_installed；
+   第三锚点只支持 nav_hot_zone：backup 存 g_orig_navprobe，存活标志 g_hook3_installed，
+   桩是只读的——透传 + 打 (x,y)→rv，绝不改返回值） */
+
+/* 附锚点（anchor3）的桩选择与 backup 落位。抽成函数是为了让**安装与自愈走同一套**：
+ * 否则两处各写一遍 strcmp 链，日后加第五个探针时改漏一处 = 自愈后调错原函数（崩桌面）。 */
+static void *hsb_aux3_stub_for(const char *name) {
+    if (name && strcmp(name, "action_probe") == 0) return (void *) hsb_stub_actionprobe;
+    if (name && strcmp(name, "pilfer_probe") == 0) return (void *) hsb_stub_pilferprobe;
+    if (name && strcmp(name, "judge_probe") == 0) return (void *) hsb_stub_judgeprobe;
+    return (void *) hsb_stub_navprobe;
+}
+
+static void hsb_aux3_save_backup(const char *name, void *backup) {
+    if (name && strcmp(name, "judge_probe") == 0) {
+        g_orig_judgeprobe = (HsbFn16) (uintptr_t) backup;
+    } else if (name && strcmp(name, "pilfer_probe") == 0) {
+        g_orig_pilferprobe = (HsbFn16) (uintptr_t) backup;
+    } else if (name && strcmp(name, "action_probe") == 0) {
+        g_orig_actionprobe = (HsbFn16) (uintptr_t) backup;
+    } else {
+        g_orig_navprobe = (HsbFn16) (uintptr_t) backup;
+    }
+}
 
 static void hsb_install_at(const HsbLauncherAnchor *a, uintptr_t at, uintptr_t base,
                            const char *how, int secondary) {
     void *backup = NULL;
-    void *stub = secondary ? (void *) hsb_stub_pilfer : (void *) hsb_stub;
+    void *stub = secondary == 2 ? hsb_aux3_stub_for(a->name)
+                     : secondary == 1 ? (void *) hsb_stub_pilfer
+                                      : (void *) hsb_stub;
     int rc = g_api->hook_func((void *) at, stub, &backup);
     /* ABI 稳健性（2026-10-14）：LSPosed 的 native `hook_func` **官方头文件我们并不持有**
      * ——所依赖的三个 artifact（api/interface/service 101.x）里没有任何 .h/.so，本结构体
@@ -1979,6 +2291,27 @@ static void hsb_install_at(const HsbLauncherAnchor *a, uintptr_t at, uintptr_t b
      * （调用前清零），成功与否与返回值语义解耦；rc 只用于日志。 */
     if (backup != NULL) {
         if (secondary) {
+            if (secondary == 2) {
+                /* 第三锚点（只读观测件）：只记 backup + 存活标志，不碰主/副锚点状态。
+                 * 四个探针各存各的 backup：混用一个的话，从 A 切到 B 时旧 backup 会指向
+                 * 已 unhook 的函数，调过去直接崩桌面。
+                 * 2026-10-16：同时记 target + 快照 + 原始序言，供心跳巡检与自愈用
+                 * （原先附锚点没有 G3：实测装上 235s 被 ROM 抹掉后静默失效，
+                 * 而日志与"探针没开"长得一模一样）。 */
+                hsb_aux3_save_backup(a->name, backup);
+                g_hook3_installed = 1;
+                snprintf(g_hook3_name, sizeof(g_hook3_name), "%s", a->name);
+                g_hook3_target = at;
+                memcpy(g_hook3_prol, a->prologue, sizeof(g_hook3_prol));
+                memcpy(g_hook3_snap, (const void *) at, sizeof(g_hook3_snap));
+                LOGI("hook installed(3) %s target=%p backup=%p size=%llu via=%s bias=%p stub=%s",
+                     a->name, (void *) at, backup, (unsigned long long) a->size, how, (void *) base,
+                     strcmp(a->name, "action_probe") == 0 ? "actionprobe"
+                       : strcmp(a->name, "pilfer_probe") == 0 ? "pilferprobe"
+                       : strcmp(a->name, "judge_probe") == 0 ? "judgeprobe"
+                                                             : "navprobe");
+                return;
+            }
             /* 第二锚点（pilfer_pointers）：只记 backup + 存活标志，不碰主锚点状态。 */
             g_orig_pilfer = (HsbFn16) (uintptr_t) backup;
             g_hook2_installed = 1;
@@ -2095,6 +2428,13 @@ static int hsb_install_named(const char *want, int secondary) {
         if (strcmp(a->name, want) != 0) continue;
         char how[16] = {0};
         uintptr_t base = 0u;
+        /* 第三锚点只收只读观测件：把"能不能挂 action/pilfer 桩"在这里就挡死，
+         * 不给后人把 nav_hot_zone 接到会改判定的桩上的机会（判定那一类集合见 has_gate/has_ret）。 */
+        if (secondary == 2 && !hsb_anchor_has_navprobe(a->name)) {
+            snprintf(g_hook.reason, sizeof(g_hook.reason), "aux3 %s 非只读观测件", want);
+            LOGI("hook skipped: %s", g_hook.reason);
+            return 0;
+        }
         uintptr_t at = hsb_locate(a, &base, how, sizeof(how));
         if (!at) return 0;
         hsb_install_at(a, at, base, how, secondary);
@@ -2108,8 +2448,11 @@ static int hsb_install_named(const char *want, int secondary) {
 static void hsb_try_install_hooks(void) {
     const char *want2 = hsb_chosen_anchor2();
     int need2 = want2 != NULL;
-    /* 全都装好了才停；主已装、副未装时仍要进来补（不重装已装的）。 */
-    if (g_hook.hook_installed && (!need2 || g_hook2_installed)) return;
+    const char *want3 = hsb_chosen_anchor3();
+    int need3 = want3 != NULL;
+    /* 全都装好了才停；主已装、副/附未装时仍要进来补（不重装已装的）。 */
+    if (g_hook.hook_installed && (!need2 || g_hook2_installed) && (!need3 || g_hook3_installed))
+        return;
     if (!g_api || !g_api->hook_func) return;
     if (g_hook.attempts >= HSB_MAX_ATTEMPTS) return;
     g_hook.attempts++;
@@ -2152,12 +2495,21 @@ static void hsb_try_install_hooks(void) {
         LOGI("anchor2 selected: %s", want2);
         if (!hsb_install_named(want2, 1)) LOGI("anchor2 install failed (primary stays)");
     }
+    /* 第三锚点（只读观测 nav_hot_zone）：底角热区地图，2026-10-14。缺省不装。
+     * 与副锚点不同，它**不要求主锚点是谁**——hook 装在系统自己的谓词上，与我们的主锚点
+     * 选哪条线无关；这也是它能独立当测量工具的原因。 */
+    if (need3 && !g_hook3_installed) {
+        LOGI("anchor3 selected: %s", want3);
+        if (!hsb_install_named(want3, 2)) LOGI("anchor3 install failed (primary stays)");
+    }
     /* 安装面汇总：一条可 grep 的"定论行"。真机取证/脚本判词都靠它——Java 侧的
      * NativeProbe.report 在 launcher 域没人调（OS4 没有模块 Java 半侧），别等它。
      * 走到这里说明本轮补齐结束；全部装好时上面的早退会拦住后续重复调用，故只打一次。 */
     if (g_hook.hook_installed) {
-        LOGI("hooks ready: main=%s anchor2=%s masked=%u", g_hook.anchor,
-             (g_hook2_installed && g_hook2_name[0]) ? g_hook2_name : "-", g_hook.prologue_masked);
+        LOGI("hooks ready: main=%s anchor2=%s aux3=%s masked=%u", g_hook.anchor,
+             (g_hook2_installed && g_hook2_name[0]) ? g_hook2_name : "-",
+             (g_hook3_installed && g_hook3_name[0]) ? g_hook3_name : "-",
+             g_hook.prologue_masked);
         /* 装上之后起心跳：从此"native 还活着吗/补丁还在吗"不用做手势也能看（见 hsb_heartbeat_thread） */
         hsb_heartbeat_start();
     }
@@ -2467,6 +2819,52 @@ static int hsb_patch_heal(void) {
     return 1;
 }
 
+/* ── 附锚点（anchor3）的自愈（2026-10-16）──────────────────────────────────────
+ * 为什么单独一份：G3 原来只自愈主锚点。实测（12:15 那轮之前）`action_probe` 装上 **235 秒**
+ * 就被 ROM 的内存压力策略抹掉，此后日志与"探针没开"完全一样 ⇒ 白跑一轮手势。
+ * 抹除机制与主锚点同一个（见 hsb_patch_heal 上方长注释：.text 直接 mmap 自 APK，
+ * LowMemDetector 外部抹页），所以做法也照抄：unhook → 校验回到原始序言 → 用**同一只桩**
+ * 重装 → 校验读回。不自己写字节（mprotect + 指令序撕裂，见主锚点注释）。
+ *
+ * 封顶与主锚点共用一个上限常量：连续失败同样停止自愈只报警（fail-closed）。 */
+static int hsb_hook3_heal(void) {
+    if (!g_hook3_installed || !g_hook3_target || !g_hook3_name[0]) return 0;
+    if (!g_api || !g_api->hook_func || !g_api->unhook_func) return 0;
+    if (g_hook3_heals + g_hook3_heal_fail >= HSB_PATCH_HEAL_MAX) return 0;
+
+    g_api->unhook_func((void *) g_hook3_target);
+
+    uint8_t now[32];
+    memcpy(now, (const void *) g_hook3_target, sizeof(now));
+    if (memcmp(now, g_hook3_prol, sizeof(now)) != 0) {
+        g_hook3_heal_fail++;
+        LOGI("hook HB aux3 自愈中止：unhook 后仍未回到原始序言 now=%02x%02x%02x%02x…（第三种扰动，不重装）",
+             now[0], now[1], now[2], now[3]);
+        return 0;
+    }
+
+    void *backup = NULL;
+    (void) g_api->hook_func((void *) g_hook3_target, hsb_aux3_stub_for(g_hook3_name), &backup);
+    if (backup == NULL) {
+        g_hook3_heal_fail++;
+        LOGI("hook HB aux3 自愈失败：hook_func 未给 backup ⇒ 补丁仍是被抹状态");
+        return 0;
+    }
+    uint8_t chk[32];
+    memcpy(chk, (const void *) g_hook3_target, sizeof(chk));
+    if (memcmp(chk, g_hook3_prol, sizeof(chk)) == 0) {
+        g_hook3_heal_fail++;
+        LOGI("hook HB aux3 自愈失败：hook_func 后目标仍是原始序言 ⇒ 补丁没写进去");
+        return 0;
+    }
+    memcpy(g_hook3_snap, chk, sizeof(g_hook3_snap));
+    hsb_aux3_save_backup(g_hook3_name, backup);
+    g_hook3_heals++;
+    LOGI("hook HB aux3 RE-ARMED (G3) #%u %s target=%p backup=%p；下一事件起探针/抑制恢复",
+         g_hook3_heals, g_hook3_name, (void *) g_hook3_target, backup);
+    return 1;
+}
+
 /* ── 心跳线程：补丁完整性巡检（G1 检测者）+ 被抹即自愈（G3）────────────────────
  *
  * 为什么必须是一条**定时**线：本文件里原来那条 `hook ALIVE …` 其实是 `hook HIT` 的限流版
@@ -2527,6 +2925,40 @@ static void *hsb_heartbeat_thread(void *arg) {
                      g_patch_orig[0], g_patch_orig[1], g_patch_orig[2], g_patch_orig[3]);
             }
             last_state = state;
+        }
+        /* ---- 附锚点（anchor3）巡检：同一块 .text 被抹时它一起死 ------------------
+         * 2026-10-16 之前这里什么都没有 ⇒ action_probe 装上 235s 被抹后静默失效，
+         * 而"被抹"与"没开探针"在日志里一模一样（B 组第一轮就是这么废掉的）。
+         * 判词与主锚点同构（snap=补丁在位 / prol=已被抹 / 其它=第三种扰动只报）。
+         * 单独一条行、不改主摘要行的格式：`hsb_native_silence_probe.ps1` 等脚本按主行判词，
+         * 动它会让既有判读失效。 */
+        if (g_hook3_installed && g_hook3_target) {
+            static const char *last3 = "-";
+            uint8_t l3[32];
+            memcpy(l3, (const void *) g_hook3_target, sizeof(l3));
+            const char *s3;
+            if (memcmp(l3, g_hook3_snap, sizeof(l3)) == 0) {
+                s3 = "ok";
+            } else if (memcmp(l3, g_hook3_prol, sizeof(l3)) == 0) {
+                s3 = hsb_hook3_heal() ? "healed" : "WIPED";
+            } else {
+                s3 = "CHANGED";
+            }
+            if (s3 != last3) {
+                if (s3[0] == 'W') {
+                    LOGI("hook HB aux3 WIPED %s：附锚点补丁被抹 ⇒ 探针/抑制静默失效"
+                         "（自愈 heal=%u fail=%u 未成功）", g_hook3_name, g_hook3_heals,
+                         g_hook3_heal_fail);
+                } else if (s3[0] == 'C') {
+                    LOGI("hook HB aux3 CHANGED %s live=%02x%02x%02x%02x…（第三种扰动，只报不重装）",
+                         g_hook3_name, l3[0], l3[1], l3[2], l3[3]);
+                }
+                last3 = s3;
+            }
+            if (ticks % 12u == 0u) {
+                LOGI("hook HB aux3=%s patch=%s heal=%u/%u target=%p", g_hook3_name, s3,
+                     g_hook3_heals, g_hook3_heal_fail, (void *) g_hook3_target);
+            }
         }
         if (ticks % 12u == 0u) {   /* 每 60s 一条摘要（含计数，给判词表用） */
             LOGI("hook HB main=%s alive=%llus patch=%s hits=%u seen=%u inband=%u dw=%u sw=%u af=%u ac=%u pub=%u/%u heal=%u/%u",
@@ -2736,6 +3168,8 @@ Java_com_lsp_hypersidebar_util_NativeProbe_report(JNIEnv *env, jclass clazz) {
              "hook: attempts=%u phdr=%u maps_x=%u checked=%u mismatch=%u masked=%u sigscan=%u/%u "
              "installed=%u failed=%u hits=%u anchor=%s via=%s bias=%p target=%p alive=%llus\n"
              "hook2: anchor2=%s installed2=%u (corner2 双锚点方案的 pilfer 动作位)\n"
+             "hook3: aux3=%s installed3=%u navprobe=%u (系统导航热区谓词，只读观测)\n"
+             "action: supp=%u on=%d pass=%u (should_handle_event 角窗抑制档)\n"
              "corner: fires=%u eval=%u hit=%u miss=%u bad=%u skip=%u force=%u "
              "latch=%u pblk=%u ppass=%u\n"
              "suppress: on=%d seen=%u inband=%u confirmed=%u reset=%u dwelled=%u would=%u "
@@ -2755,6 +3189,8 @@ Java_com_lsp_hypersidebar_util_NativeProbe_report(JNIEnv *env, jclass clazz) {
              g_hook.how[0] ? g_hook.how : "-", (void *) g_hook.bias, (void *) g_hook.target,
              g_hook.installed_at_s ? (unsigned long long) (hsb_now_s() - g_hook.installed_at_s) : 0ull,
              g_hook2_name[0] ? g_hook2_name : "-", g_hook2_installed,
+             g_hook3_name[0] ? g_hook3_name : "-", g_hook3_installed, g_navprobe_logged,
+             g_act_supp, hsb_action_supp_enabled(), g_act_pass,
              g_cs.fires, g_cs.eval, g_cs.hit, g_cs.miss, g_cs.bad, g_cs.skip, g_cs.force,
              g_cs.latch, g_cs.pilfer_blocked, g_cs.pilfer_passed,
              hsb_suppress_value(), g_supp.seen, g_supp.in_band, g_supp.confirmed, g_supp.reset,

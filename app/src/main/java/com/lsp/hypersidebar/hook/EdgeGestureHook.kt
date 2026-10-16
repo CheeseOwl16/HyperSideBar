@@ -558,17 +558,13 @@ class EdgeGestureHook(
                     resetPx = confirmPx * GestureThresholds.SWIPE_RESET_RATIO
                 }
                 val hot = view?.let { v -> hotSpacePx(v).toFloat() } ?: 0f
-                // 底角参数（防误触收紧 2026-10-01）：角窗宽度/角度锥全部设置项化（底角 sheet）
+                // 底角参数：2026-10-16 起不再是设置项（实测不决定角区成败：系统在自己的
+                // 导航热区之外照样 pilfer 抢流），取 GestureThresholds 常量——与 OS4 spy
+                // 完全同源同值，不会再出现"OS2/3 与 OS4 各一份"的死带。
                 val density = dm?.density ?: 1f
-                val widthRatio = runCatching {
-                    remotePrefs.getFloat(PrefKeys.CORNER_WIDTH_RATIO, LayoutDefaults.CORNER_WIDTH_RATIO)
-                }.getOrDefault(LayoutDefaults.CORNER_WIDTH_RATIO)
-                val minDeg = runCatching {
-                    remotePrefs.getInt(PrefKeys.CORNER_MIN_ANGLE_DEG, LayoutDefaults.CORNER_MIN_ANGLE_DEG)
-                }.getOrDefault(LayoutDefaults.CORNER_MIN_ANGLE_DEG).toFloat()
-                val maxDeg = runCatching {
-                    remotePrefs.getInt(PrefKeys.CORNER_MAX_ANGLE_DEG, LayoutDefaults.CORNER_MAX_ANGLE_DEG)
-                }.getOrDefault(LayoutDefaults.CORNER_MAX_ANGLE_DEG).toFloat()
+                val widthRatio = GestureThresholds.CORNER_WIDTH_RATIO
+                val minDeg = GestureThresholds.CORNER_MIN_ANGLE_DEG
+                val maxDeg = GestureThresholds.CORNER_MAX_ANGLE_DEG
                 val inwardMinPx = GestureThresholds.CORNER_INWARD_MIN_DP * density
                 val claimed = cornerTrigger.onDown(
                     ev.rawX, ev.rawY, w, h, hot,

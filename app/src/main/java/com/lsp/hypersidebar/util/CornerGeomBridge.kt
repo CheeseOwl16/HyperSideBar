@@ -17,11 +17,13 @@ import java.util.concurrent.Executors
  *
  * ## 为什么需要（不修会怎样）
  * native 门控（`hypersidebar_native.c` 的 `hsb_corner_gate`）与 `:ui` 的 `CornerTrigger`
- * 各持一份几何常量：native 原用 `W/5`（=216px），`:ui` 用 `W×cornerWidthRatio`
+ * 各持一份几何常量：native 原用 `W/5`（=216px），`:ui` 用 `W×CORNER_WIDTH_RATIO`
  * （默认 0.12=129.6px）。左角 `x∈(129.6, 216)` 这段里 native 判"是角区"⇒ 把系统 Home
  * 手势放弃，而 `:ui` 因 `x > cornerWidth` 不 claim ⇒ **手势被吞，扇形和 Home 都没有**。
- * 更糟的是用户拖 `cornerWidthRatio` 滑条会让这段死带实时变宽（0.10~0.25 对应
- * 108~270px，死带 0~54px）。y 方向同理（`cornerHotPercent` 3~25 对应 72~600px）。
+ * 2026-10-16 追记：`cornerWidthRatio`/`cornerHotPercent`/角度锥三个滑条已删——
+ * 实测证明它们不是角区成败的瓶颈（系统在自己的导航热区之外照样 pilfer 抢流，调宽调窄
+ * 只改 claim 概率）。现在两侧都取 GestureThresholds 常量（OS2/3 同源同值），本桥只负责
+ * 把常量折算成 native 要的比例/百分比。
  *
  * ## 为什么走属性而不是广播
  * native 门控跑在 `com.miui.home`，而 OS4 上**该进程没有模块 Java 半侧**
@@ -39,8 +41,8 @@ import java.util.concurrent.Executors
  *
  * ## 口径（必须与 :ui 完全一致）
  * 与 `SystemUiInputSpy.inCornerTriangle` / `TurboLayout.feedCornerGesture` 同源：
- *   角区宽 = `round(widthPixels × cornerWidthRatio)`
- *   热区高 = `round(heightPixels × cornerHotPercent / 100)`
+ *   角区宽 = `widthPixels × GestureThresholds.CORNER_WIDTH_RATIO`
+ *   热区高 = `GestureThresholds.CORNER_BAND_DP × density`（按屏高折算成百分比再送）
  * 用**真实屏**尺寸（`WindowManager.currentWindowMetrics`，与 `dm.widthPixels` 同值）。
  *
  * ## 失败语义
@@ -80,16 +82,21 @@ object CornerGeomBridge {
      * 代算——native 手里的 w/h 来自 Impl self（+0x260/+0x244），与手势引擎同源，权威。
      */
     fun push(context: Context, prefs: SharedPreferences) {
-        val ratio = runCatching {
-            prefs.getFloat(PrefKeys.CORNER_WIDTH_RATIO, LayoutDefaults.CORNER_WIDTH_RATIO)
-        }.getOrDefault(LayoutDefaults.CORNER_WIDTH_RATIO)
-        val hotPercent = runCatching {
-            prefs.getInt(PrefKeys.CORNER_HOT_PERCENT, LayoutDefaults.CORNER_HOT_PERCENT)
-        }.getOrDefault(LayoutDefaults.CORNER_HOT_PERCENT)
+        /* 2026-10-16：角区参数不再是设置项（滑条删除、常量搬到 GestureThresholds 与 OS2/3
+         * 同源同值）。这里只把常量折算成 native 要的两个数：
+         *   宽 = 比例（native 用它乘自己读到的屏宽）
+         *   高 = 百分比（native 用它乘自己读到的屏高）。热区基准是 dp 绝对值
+         *        CORNER_BAND_DP，按本机 density 与屏高折算成百分比——2400px@3x 时
+         *        25dp=75px ⇒ 3.125%，与早先实测的 3%（72px）同量级。prefs 形参保留
+         *        以兼容既有调用点，但不再读取。 */
+        val ratio = com.lsp.hypersidebar.hook.GestureThresholds.CORNER_WIDTH_RATIO
+        val dm = context.resources.displayMetrics
+        val hotPx = com.lsp.hypersidebar.hook.GestureThresholds.CORNER_BAND_DP * dm.density
+        val hotPercent = if (dm.heightPixels > 0) hotPx * 100f / dm.heightPixels else 0f
 
-        // 值与上次相同就不重复起 su（滑条拖动会高频回调）
+        // 值与上次相同就不重复起 su
         val wStr = String.format(java.util.Locale.US, "%.4f", ratio)
-        val hStr = hotPercent.toString()
+        val hStr = String.format(java.util.Locale.US, "%.4f", hotPercent)
         if (wStr == lastW && hStr == lastHot) return
         lastW = wStr
         lastHot = hStr

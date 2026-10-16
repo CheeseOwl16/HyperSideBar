@@ -5,6 +5,7 @@ import android.os.Looper
 import android.view.InputEvent
 import android.view.InputEventReceiver
 import android.view.MotionEvent
+import com.lsp.hypersidebar.hook.CornerTrigger
 import com.lsp.hypersidebar.util.HLog
 
 /**
@@ -132,7 +133,9 @@ object SystemUiInputSpy {
             // 门控快照（1007 导出 162021 教训：角落 DOWN 被门静默拒=导出无法判读是哪个门关了）。
             // sys prefs=启动快照，本行即本进程全部转发决策的依据
             HLog.i(TAG, "forward gates: cornerSwipe=${cornerSwipeEnabled()} " +
-                "cornerHot=%=${cornerHotPercent()} band=${bandWidthDp()}dp/${bandHeightPercent()}%+${bandPositionPercent()}%")
+                "corner=${com.lsp.hypersidebar.hook.GestureThresholds.CORNER_BAND_DP}dp/" +
+                "${(com.lsp.hypersidebar.hook.GestureThresholds.CORNER_WIDTH_RATIO * 100).toInt()}% " +
+                "band=${bandWidthDp()}dp/${bandHeightPercent()}%+${bandPositionPercent()}%")
             // 聋 monitor 观察窗：窗口内零 DOWN ⇒ dispose 重建（时序根因的自愈收口）
             mainHandler.postDelayed({ deafCheck() }, DEAF_CHECK_WINDOW_MS)
         }.onFailure {
@@ -294,6 +297,82 @@ object SystemUiInputSpy {
     private var pendingMove: MotionEvent? = null
     private var lastMoveFwdEventTime = 0L
 
+    // ===== 2a：底角判定搬进 SystemUI（与 InputMonitor 同进程）========================
+    //
+    // 为什么：真机实测（2026-10-14）底角斜滑触发率仅 19.5%，最大死因是
+    //   ① pilfer 指令要跨进程往返（:ui → 广播 → SystemUI），而手势 10–20ms 就结束
+    //      ⇒ 8 次请求 5 次 `identity mismatch cur(dt=0)`；
+    //   ② 9/31 次连一个 ACTION_MOVE 都没到 `:ui`（`hist=-1`）。
+    // 2a 的做法：**同一份 CornerTrigger 在 SystemUI 侧也跑一份**，喂的是到达观察副本的
+    // 原始事件（含 history 采样）。命中 SHOW 时：
+    //   - 直接 `monitorRef.pilferPointers()`——同进程、同线程、零往返、无身份竞速；
+    //   - 同时给 :ui 的流广播打上 `sysPilfered=1`，让 :ui 别再发抢占指令（省掉 mismatch 噪声）。
+    // :ui 侧的状态机**原样保留**：它是扇形的渲染/拖选驱动，也是本条路径失效时的退路。
+    //
+    // 开关：`debug.hsb.corner.sysjudge`（'0' = 关，回到纯 :ui 判定 + 广播 pilfer 的旧行为）。
+    private val sysCorner = CornerTrigger()
+    /** 本进程是否已对当前流 pilfer 过（UP/CANCEL 复位） */
+    private var sysPilfered = false
+    /** 2a 诊断：当前流收到/转发的 MOVE 事件数与其中的 history 采样总数 */
+    private var diagMoves = 0
+    private var diagFwdMoves = 0
+    private var diagHist = 0
+
+    /** 2a 总开关（默认开）：true = SystemUI 侧自行判定并直接 pilfer。
+     *  读 `debug.hsb.corner.sysjudge`——隐藏 API，与本仓其它属性读取一致走反射
+     *  （TurboLayout.sysPropGet 同款；失败=''=开）。 */
+    private fun sysJudgeEnabled(): Boolean {
+        val v = runCatching {
+            val c = Class.forName("android.os.SystemProperties")
+            c.getMethod("get", String::class.java).invoke(null, "debug.hsb.corner.sysjudge") as? String
+        }.getOrNull() ?: ""
+        // 显式 '0' 才关；空/异常 = 开（2a 是当前要验证的路径）
+        return v != "0"
+    }
+
+    /** 底角几何/阈值：与 OS2/3（EdgeGestureHook）同一份 GestureThresholds 常量。
+     *  2026-10-16 起不再是设置项（实测这三个参数不决定角区成败：系统在自己的热区之外
+     *  照样 pilfer 抢流），滑条删除，直接取常量。角度锥上沿 +75~85° 的取定见设计文档。 */
+    private fun sysCornerOnDown(x: Float, y: Float, w: Int, h: Int): Boolean {
+        val dm = runCatching { android.content.res.Resources.getSystem().displayMetrics }
+            .getOrNull() ?: return false
+        val gt = com.lsp.hypersidebar.hook.GestureThresholds
+        return sysCorner.onDown(
+            x, y, w.toFloat(), h.toFloat(),
+            hotSpacePx = gt.CORNER_BAND_DP * dm.density,
+            cornerWidth = w * gt.CORNER_WIDTH_RATIO,
+            confirmPx = gt.CORNER_INWARD_MIN_DP * dm.density,
+            inwardMinPx = gt.CORNER_INWARD_MIN_DP * dm.density,
+            minAngleDeg = gt.CORNER_MIN_ANGLE_DEG,
+            maxAngleDeg = gt.CORNER_MAX_ANGLE_DEG,
+            abandonExtraDeg = gt.CORNER_ABANDON_EXTRA_DEG,
+            confirmFrames = gt.CORNER_CONFIRM_FRAMES_FAST,
+        )
+    }
+
+    /** 同进程 pilfer：命中即抢，无广播往返、无身份竞速（仍失败只记日志，不影响扇形）。 */
+    private fun sysPilferNow(reason: String) {
+        if (sysPilfered) return
+        val r = runCatching {
+            monitorRef?.javaClass?.getMethod("pilferPointers")?.invoke(monitorRef)
+        }
+        if (r?.isSuccess == true) {
+            sysPilfered = true
+            HLog.i(TAG, "sys-pilfer ok ($reason) dt=$fwdDownTime — Rust 判定将收 CANCEL")
+        } else {
+            HLog.w(TAG, "sys-pilfer failed ($reason): ${r?.exceptionOrNull()?.message}")
+        }
+    }
+
+    /** 2a 逐点喂入（含 history 采样）；返回是否命中 SHOW。 */
+    private fun sysCornerOnMove(ev: MotionEvent): Boolean {
+        var show = false
+        for (s in ev.toGestureSamples()) {
+            if (sysCorner.onMove(s.x, s.y) == CornerTrigger.Action.SHOW) { show = true; break }
+        }
+        return show
+    }
+
     /** 注册抢占指令接收器（**只服务底角线**，2026-10-13）：:ui 底角锥内确认（SHOW）→
      *  五要素全匹配才 pilferPointers，系统收到 CANCEL 便不弹 recents/home。
      *  条上（竖屏触发带）的抢占已删除（用户 m03028：那是给 native 的冗余兜底，会打断
@@ -357,14 +436,18 @@ object SystemUiInputSpy {
     }
 
     /** 底角三角（B4 转发门，os4-trigger-final-plan §14.6）：竖屏，左右角窗
-     *  （宽=屏宽×CORNER_WIDTH_RATIO，:ui 同键）× 底部热区（屏高百分比，
-     *  cornerHotPercent——原 25dp≈3% 实机反馈"不易触发"，升为可调滑条）。与条带在
-     *  DOWN 处天然不相交（默认条带下沿 2H/3 << 热区上沿），zone 判定无歧义。 */
+     *  （宽=屏宽×GestureThresholds.CORNER_WIDTH_RATIO）× 底部热区
+     *  （高=GestureThresholds.CORNER_BAND_DP × density，OS2/3 同源同值）。
+     *  2026-10-16：热区从"屏高百分比"改为 dp 绝对值——原 25dp≈3% 被反馈"不易触发"后升成
+     *  百分比滑条，而实测证明它不是瓶颈，滑条删除，回到与 OS2/3 完全一致的定义。
+     *  与条带在 DOWN 处天然不相交（默认条带下沿 2H/3 << 热区上沿），zone 判定无歧义。 */
     private fun inCornerTriangle(x: Float, y: Float, w: Int, h: Int): Boolean {
         if (w > h) return false
-        val hotPx = h * cornerHotPercent() / 100f
+        val gt = com.lsp.hypersidebar.hook.GestureThresholds
+        val density = android.content.res.Resources.getSystem().displayMetrics.density
+        val hotPx = gt.CORNER_BAND_DP * density
         if (y < h - hotPx) return false
-        val cornerPx = w * cornerWidthRatio()
+        val cornerPx = w * gt.CORNER_WIDTH_RATIO
         return x <= cornerPx || x >= w - cornerPx
     }
 
@@ -373,20 +456,6 @@ object SystemUiInputSpy {
     private fun bandWidthDp(): Int = com.lsp.hypersidebar.prefs.LayoutDefaults.BAND_WIDTH_DP
     private fun bandHeightPercent(): Int = com.lsp.hypersidebar.prefs.LayoutDefaults.BAND_HEIGHT_PERCENT
     private fun bandPositionPercent(): Int = com.lsp.hypersidebar.prefs.LayoutDefaults.BAND_POSITION_PERCENT
-
-    private fun cornerHotPercent(): Int = runCatching {
-        prefs?.getInt(
-            com.lsp.hypersidebar.prefs.PrefKeys.CORNER_HOT_PERCENT,
-            com.lsp.hypersidebar.prefs.LayoutDefaults.CORNER_HOT_PERCENT
-        ) ?: com.lsp.hypersidebar.prefs.LayoutDefaults.CORNER_HOT_PERCENT
-    }.getOrDefault(com.lsp.hypersidebar.prefs.LayoutDefaults.CORNER_HOT_PERCENT)
-
-    private fun cornerWidthRatio(): Float = runCatching {
-        prefs?.getFloat(
-            com.lsp.hypersidebar.prefs.PrefKeys.CORNER_WIDTH_RATIO,
-            com.lsp.hypersidebar.prefs.LayoutDefaults.CORNER_WIDTH_RATIO
-        ) ?: com.lsp.hypersidebar.prefs.LayoutDefaults.CORNER_WIDTH_RATIO
-    }.getOrDefault(com.lsp.hypersidebar.prefs.LayoutDefaults.CORNER_WIDTH_RATIO)
 
     /** 底角功能开关（与 OS3 EdgeGestureHook 同键；关=角落流不转发） */
     private fun cornerSwipeEnabled(): Boolean = runCatching {
@@ -425,27 +494,68 @@ object SystemUiInputSpy {
             pendingMove?.recycle()
             pendingMove = null
             lastMoveFwdEventTime = ev.eventTime
+            // 2a：同进程起一份判定；DOWN 就接管（对齐 OS2/3 的 DOWN 域接管语义）
+            sysPilfered = false
+            diagMoves = 0; diagFwdMoves = 0; diagHist = 0
+            if (corner && sysJudgeEnabled()) {
+                val claimed = runCatching { sysCornerOnDown(ev.x, ev.y, w, h) }.getOrDefault(false)
+                HLog.i(TAG, "sys-corner DOWN raw=(${ev.x.toInt()},${ev.y.toInt()}) claimed=$claimed " +
+                    "judge=${sysJudgeEnabled()}")
+            }
         } else if (fwdDownTime != ev.downTime) {
             return // 非转发流的 MOVE/UP（带外起手）——静默忽略
         }
         if (a == MotionEvent.ACTION_MOVE) {
+            if (fwdZone == com.lsp.hypersidebar.prefs.PrefKeys.SPY_ZONE_CORNER) {
+                diagMoves++; diagHist += ev.historySize
+            }
             if (ev.eventTime - lastMoveFwdEventTime < MOVE_COALESCE_MS) {
                 // 窗口内：只留最新（框架会在 finishInputEvent 后回收 ev，故必须 obtain 副本）
                 pendingMove?.recycle()
                 pendingMove = MotionEvent.obtain(ev)
+                // 2a：合流扣下的这一帧也要判——角滑常在 16ms 内就完成锥形确认，
+                // 不判就等于把唯一一次机会让给"等 UP 前才冲刷"的那一帧。
+                if (fwdZone == com.lsp.hypersidebar.prefs.PrefKeys.SPY_ZONE_CORNER &&
+                    sysJudgeEnabled() && sysPilfered.not() && sysCornerOnMove(ev)
+                ) {
+                    sysPilferNow("coalesced")
+                }
                 return
             }
             lastMoveFwdEventTime = ev.eventTime
+            if (fwdZone == com.lsp.hypersidebar.prefs.PrefKeys.SPY_ZONE_CORNER) diagFwdMoves++
         } else if (a == MotionEvent.ACTION_UP || a == MotionEvent.ACTION_CANCEL) {
+            // 2a 诊断：一流一行，把"spy 收到 N 个 MOVE / 其中 history H 点 / 转发 M 个"
+            // 对齐——这是区分"系统 pilfer 后断流"与"广播丢包/合流吃点"的唯一手段。
+            if (fwdZone == com.lsp.hypersidebar.prefs.PrefKeys.SPY_ZONE_CORNER) {
+                HLog.i(TAG, "sys-corner $a dur=${ev.eventTime - ev.downTime}ms " +
+                    "moves=$diagMoves fwd=$diagFwdMoves hist=$diagHist " +
+                    "claimed=${sysCorner.claimed} shown=${sysCorner.lastReject == "SHOWN"} " +
+                    "pilfered=$sysPilfered ${sysCorner.diag()}")
+            }
             pendingMove?.let {
+                if (fwdZone == com.lsp.hypersidebar.prefs.PrefKeys.SPY_ZONE_CORNER &&
+                    sysJudgeEnabled() && sysPilfered.not() && sysCornerOnMove(it)
+                ) {
+                    sysPilferNow("flush-before-end")
+                }
                 sendStream(it, ctx, w, h, p)
                 it.recycle()
             }
             pendingMove = null
         }
+        // 非合流的 MOVE / DOWN：2a 也要判（这一帧是即将转发给 :ui 的同一帧）
+        if (fwdZone == com.lsp.hypersidebar.prefs.PrefKeys.SPY_ZONE_CORNER &&
+            a == MotionEvent.ACTION_MOVE && sysJudgeEnabled() && sysPilfered.not() &&
+            sysCornerOnMove(ev)
+        ) {
+            sysPilferNow("live")
+        }
         sendStream(ev, ctx, w, h, p)
         if (a == MotionEvent.ACTION_UP || a == MotionEvent.ACTION_CANCEL) {
             fwdDownTime = 0L
+            sysPilfered = false
+            sysCorner.reset()
         }
     }
 
@@ -458,6 +568,8 @@ object SystemUiInputSpy {
                 w > h
             )
             .putExtra(com.lsp.hypersidebar.prefs.PrefKeys.SPY_EXTRA_ZONE, fwdZone)
+            // 2a：SystemUI 已自行 pilfer ⇒ :ui 别再发抢占指令（发了也只有 mismatch 噪声）
+            .putExtra(com.lsp.hypersidebar.prefs.PrefKeys.SPY_EXTRA_SYS_PILFERED, sysPilfered)
         com.lsp.hypersidebar.util.RelayToken.attach(
             intent, com.lsp.hypersidebar.util.RelayToken.read(p)
         )

@@ -73,6 +73,56 @@ static const HsbLauncherAnchor kHsbAnchors[] = {
      * 呼出压根没开）⇒ 观测对象不存在，判死。真机偏移与定位方法（.gnu_debugdata 抽符号 +
      * 序言掩码比对）留档在 docs/adaptation/os4-native-hold-route-plan.md，不再占 profile。
      * 角区（底角斜滑）那条线的锚点照旧保留，见上。 */
+    /* ---- 手工追加（生成器 WANT 与来源表均未含本条）：系统导航热区谓词，只读观测 ----
+     * 2026-10-14：OS4 底角贴角起手会"系统 Home + 扇形呼出 + 打开应用"三连，根因是系统在
+     * 同一物理区域与我们同时行动（最贴边 x<10 组我们自己的判据成功率反而最高，4/12）。
+     * 本锚点为 trigger_gesture_judge 的第 7 参来源，(x,y)∈s0/s1、返回 bool∈w0；
+     * 配 hsb_stub_navprobe 只读桩（透传 + 打 (x,y)→rv，改返回值就等于改掉系统 Home 判据）。
+     * prop `debug.hsb.native.anchor3 nav_hot_zone` 才装，缺省空 = 不装。 */
+    {"nav_hot_zone", 0x6b8064, 1024,
+     {0xff, 0xc3, 0x03, 0xd1, 0xed, 0x33, 0x09, 0x6d, 0xeb, 0x2b, 0x0a, 0x6d, 0xe9, 0x23, 0x0b, 0x6d, 0xfd, 0x7b, 0x0c, 0xa9, 0xf5, 0x6b, 0x00, 0xf9, 0xf4, 0x4f, 0x0e, 0xa9, 0xfd, 0x03, 0x03, 0x91},
+     "_RNvMNtNtNtCs5erksEADHS4_12app_launcher7recents7gesture25gesture_input_home_helperNtB2_22GestureInputHomeHelper29is_in_navigation_bar_hot_zone"},
+    /* ---- 手工追加（生成器 WANT 与来源表均未含本条）：Home 判据本体，只读观测 ----
+     * 2026-10-15：上一轮锚点 nav_hot_zone 已测出系统热区=横向中段（x∈[400,760] y≈2380），
+     * 与我们角窗 0 重叠 ⇒ "在角窗内返回 false 压制热区"这条路被数据否掉（那里本来就不在热区）。
+     * 冲突在下游：调用点 0x7afca8 把热区 verdict 当 w2 传进来后，本函数仍照别处判据继续判。
+     * 签名（0x7afca8 调用点 + 本体序言坐实）：
+     *   trigger_gesture_judge(x0=downTime, x1=eventTime, s0=x, s1=y, s2=x2, s3=y2, w2=hotzone_verdict)
+     * 本体 `fsub s12, s3, s1` / `mov w19, w2` / `mov x20, x1` / `mov x21, x0` —— 后三个寄存器
+     * 一直活着，说明它们就是被缓存的入参；(s3-s1) 是终点-起点即位移分量，用于角度判定。
+     * 配 hsb_stub_judgeprobe 只读桩：打全部 6 个入参 + 返回值，不改任何值。
+     * prop `debug.hsb.native.anchor3 judge_probe` 才装，缺省空 = 不装。 */
+    {"judge_probe", 0x6b7868, 892,
+     {0xff, 0x83, 0x04, 0xd1, 0xec, 0x53, 0x00, 0xfd, 0xeb, 0x2b, 0x0b, 0x6d, 0xe9, 0x23, 0x0c, 0x6d, 0xfd, 0x7b, 0x0d, 0xa9, 0xfc, 0x67, 0x0e, 0xa9, 0xf8, 0x5f, 0x0f, 0xa9, 0xf6, 0x57, 0x10, 0xa9},
+     "_RNvMNtNtNtCs5erksEADHS4_12app_launcher7recents7gesture25gesture_input_home_helperNtB2_22GestureInputHomeHelper21trigger_gesture_judge"},
+    /* ---- 手工追加（生成器 WANT 与来源表均未含本条）：pilfer 动作本体，只读观测 ----
+     * 2026-10-15：judge_probe 实测 0 调用 ⇒ 换目标。全表扫 `bl 0x6b8464` 只有两处调用点，
+     * 且都在 GestureInputMonitorImpl 内部（0x78e77c–0x78ef38 大段里）：
+     *   78e90c: add x0, x19, #0xc8 ; bl 0x6b8464
+     *   78ef30: add x0, x19, #0xc8 ; bl 0x6b8464
+     * ⇒ do_pilfer(x0 = monitor+0xc8)，本体 `mov x19,x0` 缓存该入参；函数体自旋锁
+     * （ldaxrb/stxrb 0xf1a0a8）后 `bl input_InputMonitor_pilferPointers@plt`(0x6b84f4)
+     * —— **系统 pilfer 掉输入流的动作就在这**。角区三连的最后一块拼图。
+     * 配 hsb_stub_pilferprobe 只读桩：透传 + 打 self/返回值。
+     * prop `debug.hsb.native.anchor3 pilfer_probe` 才装，缺省空 = 不装。 */
+    {"pilfer_probe", 0x6b8464, 364,
+     {0xff, 0xc3, 0x01, 0xd1, 0xfd, 0x7b, 0x04, 0xa9, 0xf5, 0x2b, 0x00, 0xf9, 0xf4, 0x4f, 0x06, 0xa9, 0xfd, 0x03, 0x01, 0x91, 0x14, 0x43, 0x00, 0xd0, 0x94, 0xa2, 0x02, 0x91, 0xf3, 0x03, 0x00, 0xaa},
+     "_RNvMNtNtNtCs5erksEADHS4_12app_launcher7recents7gesture25gesture_input_home_helperNtB2_22GestureInputHomeHelper9do_pilfer"},
+    /* ---- 手工追加（生成器 WANT 与来源表均未含本条）：系统"是否处理事件"总闸，只读观测 ----
+     * 2026-10-16：静勘（os4-hook-point-survey.md）结论——pilfer 唯一出口是 H2，但**最锋利
+     * 的干预点是这里**：`0x7af864` 用 should_handle_event(event, MOVE) 给 pilfer 放行
+     * （`cbz w0` 即跳过 pilfer）。只对角区事件返 false 可精确抑制 pilfer 而不动系统正常
+     * Home/recents。本桩只读：透传 + 打 (event, 期望action, 实际action, 权威坐标, 返回值)，
+     * 先把"它在角区返什么、四个调用点各自管什么动作"测出来，再决定要不要上 action 桩。
+     *
+     * 签名（调用点 + 本体双证）：should_handle_event(x0 = MotionEvent*, w1 = 期望 action)
+     * 本体 `mov w22,w1` / `mov x19,x0`（x0 未动，直接喂 getActionMasked）+ `cmp w8,w22`。
+     * 4 个调用点（w1 = 期望动作）：0x73f2a4(DOWN) 0x742910(0) 0x78e418(MOVE) 0x7af864(MOVE)。
+     * 坐标用 launcher 自己的 UND getter 读（hsb_back_event_read），见该函数注释。
+     * prop `debug.hsb.native.anchor3 action_probe` 才装，缺省空 = 不装。 */
+    {"action_probe", 0x8f7bb8, 2468,
+     {0xff, 0xc3, 0x04, 0xd1, 0xfd, 0x7b, 0x0d, 0xa9, 0xfc, 0x6f, 0x0e, 0xa9, 0xfa, 0x67, 0x0f, 0xa9, 0xf8, 0x5f, 0x10, 0xa9, 0xf6, 0x57, 0x11, 0xa9, 0xf4, 0x4f, 0x12, 0xa9, 0xfd, 0x43, 0x03, 0x91},
+     "_RNvMNtNtNtCs5erksEADHS4_12app_launcher7recents7gesture26motion_event_handled_proxy19should_handle_event"},
 };
-#define HSB_ANCHOR_COUNT 12u
+#define HSB_ANCHOR_COUNT 16u
 #define HSB_PROFILE_PROLOGUE_BYTES 32u

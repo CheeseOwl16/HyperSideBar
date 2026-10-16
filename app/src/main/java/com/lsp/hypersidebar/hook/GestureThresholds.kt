@@ -23,9 +23,23 @@ object GestureThresholds {
     const val MAX_SWIPE_ANGLE_DEG = 60f
 
     /**
-     * 底角触发区宽度占比 / 角度锥上下沿（默认值见 LayoutDefaults.CORNER_*，2026-10-01 起
-     * 用户可配置：底角 sheet 滑条，hook 经 remotePrefs 读取）——触发参数已迁出常量区。
+     * 底角触发区宽度占比 / 角度锥上下沿 / 热区高度——**2026-10-16 收回常量区**
+     * （原 2026-10-01 迁去 PrefKeys+LayoutDefaults、做成底角 sheet 四个滑条）。
+     * 为什么收回：OS4 实测证明这三个参数不是瓶颈——系统在自己的导航热区（横向中段）之外
+     * 照样 pilfer 抢流，调宽调窄只改我们的 claim 概率，不解决"三连"；真修法是 native
+     * 在 should_handle_event 上按角窗抑制（见 docs/adaptation/os4-hook-point-survey.md）。
+     * 滑条于是变成"看起来能调、实际无用"的噪声，删掉。
+     *
+     * 取值与 OS2/3 完全对齐（同源同值，两边行为一致）：
+     *   - 宽度占比 0.12：1080px 屏 = 130px，即 OS2/3 的 130 宽
+     *   - 角度锥 25°~65°：OS2/3 现值（原 20°~82° 时靠边起手的日常上滑被 82° 上沿大量误呼出）
+     *   - 热区高度 25dp：见 CORNER_BAND_DP；2400px@3x = 75px ≈ OS2/3 的 69px
+     * 消费方（全部固定值，不再读 pref）：EdgeGestureHook（OS2/3 launcher 通道）、
+     * SystemUiInputSpy（OS4 spy 粗筛 + sysCorner 判定）、CornerGeomBridge（推 native 几何）。
      */
+    const val CORNER_WIDTH_RATIO = 0.12f
+    const val CORNER_MIN_ANGLE_DEG = 25f
+    const val CORNER_MAX_ANGLE_DEG = 65f
 
     /**
      * 内滑绝对量下限（dp，2026-10-01 新增）：角度是纯方向量不含幅度——起手贴边+
@@ -52,7 +66,10 @@ object GestureThresholds {
     /** 竖直判定余量（度）：deg > 锥上限+此值 连续 N 帧 = 明确竖直意图 → 重放透传。 */
     const val CORNER_ABANDON_EXTRA_DEG = 3f
 
-    /** 底角热区高度兜底（dp）：反射 NavStubView.getHotSpaceHeight() 失败时使用。 */
+    /** 底角热区高度（dp）：绝对值定义，OS2/3 与 OS4 同源同值。
+     *  OS2/3 通道 = 反射 NavStubView.getHotSpaceHeight() 取 ROM 真值，失败回落本值；
+     *  OS4 spy 直接用本值（那边没有 NavStubView 可反射）。
+     *  2400px@3x = 75px ≈ OS2/3 早先实测的 69px；推给 native 的 hot_pct 也由它折算。 */
     const val CORNER_BAND_DP = 25f
 
     /**

@@ -787,11 +787,16 @@ class TurboLayout(private val remotePrefs: SharedPreferences) : BaseHook() {
     private var cornerEngaged = false
     /** 角落流是否已喂过 fan 合成 DOWN（同条上通道 sFanSeen 语义） */
     private var cFanSeen = false
+    /** 本流最近一个 MOVE 的 history 采样数（0 = 没批处理 ⇒ 判据拒是真的判据拒） */
+    private var cLastHist = -1
+    /** SystemUI 侧（2a）是否已对本流 pilfer：是 ⇒ :ui 不再发跨进程抢占指令 */
+    private var cSysPilfered = false
 
-    fun feedCornerGesture(ctx: Context, ev: MotionEvent) {
+    fun feedCornerGesture(ctx: Context, ev: MotionEvent, sysPilfered: Boolean = false) {
         // fan 展示中：转发流驱动拖选（与条上通道同款；B2 流驱动旗标放行孤儿防护）
         if (fanController.isShowing) {
             com.lsp.hypersidebar.ui.fan.B2StreamDispatch.active = true
+            cSysPilfered = cSysPilfered || sysPilfered
             try {
                 if (!cFanSeen) {
                     val down = MotionEvent.obtain(
@@ -801,7 +806,13 @@ class TurboLayout(private val remotePrefs: SharedPreferences) : BaseHook() {
                 }
                 fanController.dispatchTouchEvent(ev)
                 if (ev.actionMasked == MotionEvent.ACTION_UP || ev.actionMasked == MotionEvent.ACTION_CANCEL) {
-                    if (fanController.isShowing) {
+                    if (ev.actionMasked == MotionEvent.ACTION_CANCEL) {
+                        // 安全阀：被系统抢流 ⇒ 立刻收窗（见下方 UP/CANCEL 分支的同款注释）。
+                        // 这里尤其关键：扇形正在展示时来 CANCEL，若不收窗，手指剩余的触摸
+                        // 会继续走拖选 ⇒ 与系统 Home 叠加成"三连"。
+                        cancelPendingStripShow()
+                        if (fanController.isShowing) fanController.dismiss()
+                    } else if (fanController.isShowing) {
                         if (fanPersistentOnRelease()) fanController.onGestureEnded()
                         else fanController.dismiss()
                     }
@@ -818,6 +829,8 @@ class TurboLayout(private val remotePrefs: SharedPreferences) : BaseHook() {
             MotionEvent.ACTION_DOWN -> {
                 cornerSeq++
                 cFanSeen = false
+                cLastHist = -1
+                cSysPilfered = sysPilfered
                 cornerEngaged = cornerSwipeEnabled() && !cornerAvoided(ctx)
                 if (!cornerEngaged) return
                 val dm = ctx.resources.displayMetrics
@@ -828,23 +841,16 @@ class TurboLayout(private val remotePrefs: SharedPreferences) : BaseHook() {
                 // 防误触由锥+内滑下限+2 帧一致性承担，行程门只留锥评估的启动线。
                 // OS3（DOWN 即接管、无竞争）仍用滑动距离，不受影响。
                 val cornerConfirmPx = GestureThresholds.CORNER_INWARD_MIN_DP * density
-                // 角落参数与 OS3 同键（底角 sheet）：角窗/锥角设置项化，幅度/帧数常量单源
-                val widthRatio = runCatching {
-                    remotePrefs.getFloat(PrefKeys.CORNER_WIDTH_RATIO, LayoutDefaults.CORNER_WIDTH_RATIO)
-                }.getOrDefault(LayoutDefaults.CORNER_WIDTH_RATIO)
-                val minDeg = runCatching {
-                    remotePrefs.getInt(PrefKeys.CORNER_MIN_ANGLE_DEG, LayoutDefaults.CORNER_MIN_ANGLE_DEG)
-                }.getOrDefault(LayoutDefaults.CORNER_MIN_ANGLE_DEG).toFloat()
-                val maxDeg = runCatching {
-                    remotePrefs.getInt(PrefKeys.CORNER_MAX_ANGLE_DEG, LayoutDefaults.CORNER_MAX_ANGLE_DEG)
-                }.getOrDefault(LayoutDefaults.CORNER_MAX_ANGLE_DEG).toFloat()
+                // 角落参数：2026-10-16 起不再是设置项（滑条删除），与 OS2/3 同取
+                // GestureThresholds 常量——单源同值，不再有"OS4 与 OS3 各一份"的死带。
+                // 热区基准是 dp 绝对值（OS4 无 NavStubView 可反射，直接算 px）。
+                val widthRatio = GestureThresholds.CORNER_WIDTH_RATIO
+                val minDeg = GestureThresholds.CORNER_MIN_ANGLE_DEG
+                val maxDeg = GestureThresholds.CORNER_MAX_ANGLE_DEG
                 val claimed = cornerTrigger.onDown(
                     ev.rawX, ev.rawY,
                     dm.widthPixels.toFloat(), dm.heightPixels.toFloat(),
-                    // 热区=屏高百分比（cornerHotPercent，与 spy 同键；OS4 无 NavStubView 可反射）
-                    dm.heightPixels * runCatching {
-                        remotePrefs.getInt(PrefKeys.CORNER_HOT_PERCENT, LayoutDefaults.CORNER_HOT_PERCENT)
-                    }.getOrDefault(LayoutDefaults.CORNER_HOT_PERCENT) / 100f,
+                    GestureThresholds.CORNER_BAND_DP * density,
                     dm.widthPixels * widthRatio,
                     cornerConfirmPx,
                     GestureThresholds.CORNER_INWARD_MIN_DP * density,
@@ -860,12 +866,27 @@ class TurboLayout(private val remotePrefs: SharedPreferences) : BaseHook() {
 
             MotionEvent.ACTION_MOVE -> {
                 if (!cornerEngaged) return
-                // 只认 SHOW：锥内确认 → 抢占（系统收 CANCEL 中止）+ 角落呼出
-                if (cornerTrigger.onMove(ev.rawX, ev.rawY) == CornerTrigger.Action.SHOW) {
-                    HLog.i(TAG, "k#$cornerSeq corner SHOW raw=(${ev.rawX.toInt()},${ev.rawY.toInt()})")
-                    StatsRecorder.onStall()
-                    RelayGestureSink.requestPilfer()
-                    postShowCornerFan(ctx, ev)
+                // 2a：SystemUI 可能在本次流转发过程中才 pilfer（它的判定与转发同帧）
+                cSysPilfered = cSysPilfered || sysPilfered
+                // 批处理事件的 history 也要吃：只读当前点时，10–20ms 的角滑整个被并成
+                // DOWN+UP（真机实测 20/41 次 moves=0 ⇒ NO_MOVE，触发率仅 19.5%）。
+                // 展开成按时间递增的采样序列逐点喂状态机——**判据一个没改**（角窗/锥角/
+                // 内滑下限原样），只是"一帧"从"一次事件投递"变成"一个输入采样"：
+                // OS4 本就是 confirmFrames=FAST=1 的抢跑模型，这里只是让它第一次有了
+                // 可用的采样。第一个锥内点即 SHOW。
+                val hs = ev.historySize
+                cLastHist = hs
+                for (s in ev.toGestureSamples()) {
+                    if (cornerTrigger.onMove(s.x, s.y) == CornerTrigger.Action.SHOW) {
+                        HLog.i(TAG, "k#$cornerSeq corner SHOW raw=(${s.x.toInt()},${s.y.toInt()}) " +
+                            "samples=${hs + 1}(hist=$hs)")
+                        StatsRecorder.onStall()
+                        // 2a：SystemUI 侧已同进程 pilfer 过就不再发广播指令（发了只会
+                        // 打出 identity mismatch 噪声）。没打过才走原来的跨进程路径。
+                        if (!cSysPilfered) RelayGestureSink.requestPilfer()
+                        postShowCornerFan(ctx, ev)
+                        break
+                    }
                 }
             }
 
@@ -876,7 +897,16 @@ class TurboLayout(private val remotePrefs: SharedPreferences) : BaseHook() {
             MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
                 if (!cornerEngaged) return
                 val engaged = cornerTrigger.claimed && !cornerTrigger.abandoned && !cornerTrigger.consumedToEnd
-                if (engaged) {
+                if (ev.actionMasked == MotionEvent.ACTION_CANCEL) {
+                    // ⚠ 安全阀（2026-10-14 实测：贴角时会"系统 Home + 扇形 + 启动应用"三连）：
+                    // CANCEL 只可能由输入系统发出——桌面 pilfer 抢走了这条流。此时系统的
+                    // Home/recents 很可能**已经在跑**，我们绝不保留扇形、也绝不让排队中的
+                    // show 落地：窗口留着，手指剩余的触摸会被 overlay 当成拖选 ⇒ 点中图标
+                    // ⇒ "回桌面"和"打开应用"同时发生。所以 CANCEL 一律收窗 + 撤排队，
+                    // 不顾常驻档（`fanPersistentOnRelease` 只对真正的 UP 有意义）。
+                    cancelPendingStripShow()
+                    if (fanController.isShowing) fanController.dismiss()
+                } else if (engaged) {
                     if (fanController.isShowing) {
                         if (fanPersistentOnRelease()) fanController.onGestureEnded()
                         else {
@@ -899,7 +929,7 @@ class TurboLayout(private val remotePrefs: SharedPreferences) : BaseHook() {
                 HLog.i(
                     TAG,
                     "k#$cornerSeq corner UP engaged=$engaged shown=${fanController.isShowing} " +
-                        cornerTrigger.diag()
+                        cornerTrigger.diag() + " hist=${cLastHist}"
                 )
                 cornerTrigger.reset()
             }
