@@ -111,6 +111,18 @@ class EdgeGestureHook(
     private var gestureSeq = 0   // 手势取证 id：贯穿 DOWN/确认/停顿/拦截/UP 日志（S 门数据源）
     private var gestureInZone = false  // DOWN 判定的触发区归属；区外手势整条透传
 
+    /**
+     * 底角已从**侧条窗口**（GestureStubView）认领本手势：整条事件流交给角区状态机。
+     *
+     * 为什么需要这个旗标：角区的旧入口是 `NavStubView`（`GestureStubHome` 窗口，实测
+     * frame=[0,2272]-[1080,2340]，只有最底 68px）；而侧条窗口
+     * （`GestureStubLeft/Right` frame=[·,868]-[·,2272]）覆盖其上方整段——贴角起手常常落在
+     * 侧条里，旧路径 `isInTriggerZone` 判 false 就整条透传，用户感受就是"底角不好呼出"。
+     * 三个 stub 窗口互不重叠（dumpsys 实测），同一触摸只进其中一个 ⇒ 与 NavStubView 入口
+     * 不会双处理。认领后由本旗标独占，直到 UP/CANCEL（含 handleCornerTouch 放手的尾巴）。
+     */
+    private var cornerOwnsGesture = false
+
     // ===== 停顿定时器（13.1，对齐 OS4 gesture_pause_detector 的"逐帧判静止"思路） =====
     // 旧判定把 `eventTime - anchorT >= dwell` 放在 MOVE 事件里评估——手指一停宿主就停止
     // 上报 MOVE，条件满足也没人来评估，只能等下一次抖动或 UP 结算：设定 250ms 实测
@@ -436,6 +448,11 @@ class EdgeGestureHook(
             return false
         }
         method.createBeforeHook {
+            // 底角重放回流守卫（replayCornerGesture 的合成事件也会经本钩子）。
+            // 2026-10-16 起角区也能从侧条窗口进入（见 handleTouch 的 DOWN 支），所以这条
+            // 以前只有 NavStubView 钩子才需要的守卫，本钩子同样必须有——否则角区放弃时的
+            // 重放会再次落回 handleTouch，形成递归。
+            if (cornerReplaying) return@createBeforeHook
             val ev = it.args[0] as? MotionEvent ?: return@createBeforeHook
             val stub = it.thisObject as? View
             if (handleTouch(ev, stub)) it.result = true
@@ -729,14 +746,31 @@ class EdgeGestureHook(
         // 数据源死亡停摆（迭代四 §1.3）：整条透传原生（原生返回优先），不再呼出
         if (DataDeadState.dead) {
             if (fanController.isShowing) fanController.dismiss(DismissCause.PREEMPTED)
+            resetGesture()
             return false
         }
         // 总开关门（设置页"启用超级侧边栏"）：关闭=整条透传原生（同数据源死亡语义），
         // 展示中的 fan 立即收起；重新打开即时恢复（SyncedPrefs 读=内存缓存命中）
         if (!moduleEnabled()) {
             if (fanController.isShowing) fanController.dismiss(DismissCause.PREEMPTED)
+            resetGesture()
             return false
         }
+        // 底角已认领本手势（从侧条窗口进入，见 DOWN 支）：整条事件流交给角区状态机——
+        // 与 NavStubView 入口完全是同一条路径（handleCornerTouch 自带 fan 转发、锥外重放
+        // 与收尾）。它返回 false 时=放手让原生走（典型是锥外重放后的尾巴），此时同样透传，
+        // 符合"角区放弃即让路"。放在 fan 转发块**之前**，让角区从 DOWN 到 UP 独占整条流，
+        // 避免两套收尾逻辑交叉（否则 cornerTrigger 会留下未复位的 claimed 状态）。
+        if (cornerOwnsGesture) {
+            val consumed = handleCornerTouch(ev, stub)
+            if (ev.actionMasked == MotionEvent.ACTION_UP ||
+                ev.actionMasked == MotionEvent.ACTION_CANCEL
+            ) {
+                cornerOwnsGesture = false
+            }
+            return consumed
+        }
+
         // fan 展示中：事件转发给 fan 并消费；UP/CANCEL 收起（未预选立即收起，PRD §7.1）
         if (fanController.isShowing) {
             if (!fanSeenThisGesture) {
@@ -807,7 +841,18 @@ class EdgeGestureHook(
                 val inZone = isInTriggerZone(ev.rawX, ev.rawY, stub)
                 gestureInZone = inZone
                 vlog("g#$gestureSeq DOWN raw=(${ev.rawX.toInt()},${ev.rawY.toInt()}) inZone=$inZone")
-                if (!inZone) return false
+                if (!inZone) {
+                    // 区外才试底角（2026-10-16）：竖屏触发带 [H/3, 2H/3] 与角区带 [H−hot, H]
+                    // 不相交（merlin 实测 1464 < 2128）⇒ "区外才试角区"等价于"角区才试角区"，
+                    // 返回手势路径逐字节不变。角区自己在 handleCornerTouch 里再判一次
+                    // 角窗宽/热区带/角度锥，判不中就返回 false，本函数照常透传。
+                    if (handleCornerTouch(ev, stub)) {
+                        cornerOwnsGesture = true
+                        HLog.i(TAG, "c#$cornerSeq claim from side strip raw=(${ev.rawX.toInt()},${ev.rawY.toInt()})")
+                        return true
+                    }
+                    return false
+                }
             }
 
             MotionEvent.ACTION_MOVE -> {
@@ -1142,6 +1187,9 @@ class EdgeGestureHook(
         stallFired = false
         speedWinT = 0L
         fanSeenThisGesture = false
+        // 角区所有权一并复位：本函数是"本帧起回到待触发态"的唯一收口，任何路径（含熔断/
+        // 总闸/数据源死亡的中途早退）走到这里都不该再把后续事件当角区处理。
+        cornerOwnsGesture = false
         cancelStallTimer()
     }
 
