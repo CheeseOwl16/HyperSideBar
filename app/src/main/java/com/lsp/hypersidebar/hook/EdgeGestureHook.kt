@@ -150,7 +150,6 @@ class EdgeGestureHook(
     // ===== 底角斜滑（N1，仅竖屏，opt-in）=====
     // NavStubView.onTouchEvent 入口；CornerTrigger 纯逻辑判定，本类负责消费/呼出。
     private val cornerTrigger = CornerTrigger()
-    private var hotMethod: java.lang.reflect.Method? = null
     private var cornerSeq = 0
 
     /** 底角事件快照：锥外早退时按原时序合成重放给原生（DOWN+MOVE，原生从未见过它们
@@ -469,14 +468,10 @@ class EdgeGestureHook(
         return true
     }
 
-    /** 反射 `NavStubView.getHotSpaceHeight()`（spike S1 实锤 hot=25dp）；失败用 25dp 兜底。 */
-    private fun hotSpacePx(view: View): Int {
-        val fallback = (GestureThresholds.CORNER_BAND_DP * view.resources.displayMetrics.density).toInt()
-        val m = hotMethod ?: runCatching {
-            view.javaClass.getDeclaredMethod("getHotSpaceHeight").apply { isAccessible = true }
-        }.getOrNull()?.also { hotMethod = it } ?: return fallback
-        return runCatching { (m.invoke(view) as Number).toInt() }.getOrDefault(fallback)
-    }
+    /* 2026-10-16 删除 hotSpacePx(view)：热区高度三 ROM 统一走 GestureThresholds.CORNER_BAND_DP。
+     * 原实现反射 NavStubView.getHotSpaceHeight() 取 ROM 真值（实测=25dp），而 OS4 的
+     * SystemUiInputSpy 用常量 ⇒ 三 ROM 各一份来源。角区已实测与系统导航热区 0 重叠
+     * （os4-hook-point-survey.md §6.2），"对齐 ROM 热区"不再是安全线，故统一为常量。 */
 
     /**
      * 底角手势状态机（NavStubView 入口）。返回 true = 消费（压掉原生）。
@@ -557,11 +552,13 @@ class EdgeGestureHook(
                     confirmPx = distanceDp * it.density
                     resetPx = confirmPx * GestureThresholds.SWIPE_RESET_RATIO
                 }
-                val hot = view?.let { v -> hotSpacePx(v).toFloat() } ?: 0f
                 // 底角参数：2026-10-16 起不再是设置项（实测不决定角区成败：系统在自己的
                 // 导航热区之外照样 pilfer 抢流），取 GestureThresholds 常量——与 OS4 spy
                 // 完全同源同值，不会再出现"OS2/3 与 OS4 各一份"的死带。
+                // density 先提上来：热区高度（下一步）也要用它。
                 val density = dm?.density ?: 1f
+                // 热区高度统一为常量（原 hotSpacePx(view) 反射 NavStubView.getHotSpaceHeight）
+                val hot = GestureThresholds.CORNER_BAND_DP * density
                 val widthRatio = GestureThresholds.CORNER_WIDTH_RATIO
                 val minDeg = GestureThresholds.CORNER_MIN_ANGLE_DEG
                 val maxDeg = GestureThresholds.CORNER_MAX_ANGLE_DEG

@@ -101,7 +101,7 @@ class CornerTrigger {
      * DOWN：判定是否命中底角触发区，命中即接管。
      *
      * @param cornerWidth 触发区宽度（px）：左右各以此为界
-     * @param hotSpacePx  底部热区高度（px，NavStubView.getHotSpaceHeight 兜底 25dp）
+     * @param hotSpacePx  底部热区高度（px，= GestureThresholds.CORNER_BAND_DP × density）
      * @param inwardMinPx 内滑绝对量下限（px，= dp×density；纯方向量之外的幅度硬判据）
      * @param confirmFrames 连续帧数：锥内命中与竖直判定的一致性要求
      * @return 是否命中并接管本手势

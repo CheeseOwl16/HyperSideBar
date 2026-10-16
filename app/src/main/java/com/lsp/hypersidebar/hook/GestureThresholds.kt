@@ -66,10 +66,10 @@ object GestureThresholds {
     /** 竖直判定余量（度）：deg > 锥上限+此值 连续 N 帧 = 明确竖直意图 → 重放透传。 */
     const val CORNER_ABANDON_EXTRA_DEG = 3f
 
-    /** 底角热区高度（dp）：绝对值定义，OS2/3 与 OS4 同源同值。
-     *  OS2/3 通道 = 反射 NavStubView.getHotSpaceHeight() 取 ROM 真值，失败回落本值；
-     *  OS4 spy 直接用本值（那边没有 NavStubView 可反射）。
-     *  2400px@3x = 75px ≈ OS2/3 早先实测的 69px；推给 native 的 hot_pct 也由它折算。 */
+    /** 底角热区高度（dp）：三 ROM 统一用本值（原 OS2/3 的 `NavStubView.getHotSpaceHeight()`
+     *  反射已于 2026-10-16 删除——实测该 ROM 值=25dp，与默认值相同，而 OS4 spy 一直用常量；
+     *  角区已实测与系统导航热区 0 重叠，"对齐 ROM 热区"不再是安全线）。
+     *  2400px@3x = 75px；推给 native 的 hot_pct 也由它折算（75/2400×100 = 2.8646）。 */
     const val CORNER_BAND_DP = 25f
 
     /**
