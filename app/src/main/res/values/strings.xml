@@ -64,6 +64,8 @@
     <string name="freeform_mode_mini">缩小（最小化）</string>
     <string name="freeform_mode_mini_summary">把点到的小窗缩成小窗挂起态——三代 ROM 同一个接口，兼容性最好</string>
     <string name="freeform_mode_close">关闭</string>
+    <string name="freeform_mode_pin">图标（钉住）</string>
+    <string name="freeform_mode_pin_summary">把小窗缩成钉在屏幕边缘的应用图标（ROM 的 pinAllFreeForm，带过渡动画）。点图标还原由系统自己处理；再次缩放/关闭对已钉住的窗是空操作</string>
     <string name="freeform_mode_close_summary">关闭点到的小窗。HyperOS 2 没有"关闭单个小窗"的系统接口，会退化成"退出小窗"（效果接近缩小）</string>
     <string name="freeform_takeover_title">点空白时不穿透</string>
     <string name="freeform_takeover_summary">空白处按下即抢走触摸：判定为轻点就吞掉（背后 app 收不到），一旦变成拖动/多指就立刻把手势原样还回去（含已缓冲部分，实时转发）。注入被系统拒绝时本开关会自动失效以保护整机</string>

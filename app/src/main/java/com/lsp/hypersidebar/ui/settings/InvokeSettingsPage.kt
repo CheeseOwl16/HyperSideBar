@@ -139,27 +139,34 @@ internal fun InvokeSettingsPage(prefs: SharedPreferences, modifier: Modifier = M
                     )
                     // "吞掉触摸（不穿透）"（2026-10-17，**默认关**）：真机反馈抢流会干扰正常拖动/缩小，
                     // 所以只在用户明确需要"点空白不漏给背后 app"时才开（回退=关掉即可，改完重启 SystemUI 生效）。
-                    var takeover by remember(effectivePrefs, repo.revision) {
-                        mutableStateOf(repo.freeformTakeoverEnabled())
-                    }
-                    SwitchPreference(
-                        title = stringResource(R.string.freeform_takeover_title),
-                        summary = stringResource(R.string.freeform_takeover_summary),
-                        checked = takeover,
-                        onCheckedChange = {
-                            takeover = it
-                            repo.save(PrefKeys.FREEFORM_BLANK_TAP_TAKEOVER, it)
+                    // 2026-10-18：与总开关联动——总开关关 ⇒ 后面的子项没有意义，不显示（用户口径）。
+                    if (enabled) {
+                        var takeover by remember(effectivePrefs, repo.revision) {
+                            mutableStateOf(repo.freeformTakeoverEnabled())
                         }
-                    )
+                        SwitchPreference(
+                            title = stringResource(R.string.freeform_takeover_title),
+                            summary = stringResource(R.string.freeform_takeover_summary),
+                            checked = takeover,
+                            onCheckedChange = {
+                                takeover = it
+                                repo.save(PrefKeys.FREEFORM_BLANK_TAP_TAKEOVER, it)
+                            }
+                        )
                     // 动作档：取值顺序 = 契约 LayoutDefaults.FREEFORM_BLANK_TAP_MODE_VALUES，
                     // 下标映射不得内联（与「背景模糊来源」同款约束）
+                    if (enabled) {
                     val modeValues = LayoutDefaults.FREEFORM_BLANK_TAP_MODE_VALUES
+                    // ⚠ options/summaries 与 FREEFORM_BLANK_TAP_MODE_VALUES **按下标一一对应**
+                    //（2026-10-18 曾漏第三项 ⇒ 图标档在下拉里看不见）
                     val modeOptions = listOf(
                         stringResource(R.string.freeform_mode_mini),
+                        stringResource(R.string.freeform_mode_pin),
                         stringResource(R.string.freeform_mode_close)
                     )
                     val modeSummaries = listOf(
                         stringResource(R.string.freeform_mode_mini_summary),
+                        stringResource(R.string.freeform_mode_pin_summary),
                         stringResource(R.string.freeform_mode_close_summary)
                     )
                     var mode by remember(effectivePrefs, repo.revision) {
@@ -177,8 +184,10 @@ internal fun InvokeSettingsPage(prefs: SharedPreferences, modifier: Modifier = M
                             repo.save(PrefKeys.FREEFORM_BLANK_TAP_MODE, value)
                         }
                     )
+                    }
                 }
             }
+        }
         }
         item {
             Text(

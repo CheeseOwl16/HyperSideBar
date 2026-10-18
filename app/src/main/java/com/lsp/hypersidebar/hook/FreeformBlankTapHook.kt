@@ -856,6 +856,11 @@ class FreeformBlankTapHook(private val prefs: SharedPreferences) : BaseHook() {
             HLog.i(TAG, "perform mode=$mode task=$taskId ok=$ok")
             return ok
         }
+        if (mode == PrefKeys.FREEFORM_BLANK_TAP_MODE_PIN) {
+            val ok = pinAll()
+            HLog.i(TAG, "perform mode=$mode task=$taskId ok=$ok")
+            return ok
+        }
         // ===== 缩小（mini）=====
         // ROM 的 fromFreeformToMini 是 void：既可能抛异常，也可能因"已有动画在跑"**静默返回**。
         // 只在"调用没抛 且 任务确认进入 mini 态"时算成功；否则才退广播兜底
@@ -913,7 +918,16 @@ class FreeformBlankTapHook(private val prefs: SharedPreferences) : BaseHook() {
      * 但后面有 700ms 回查 + shell 命令 + `exitFreeformTask` + 广播四级降级（见 [doExit]）。
      */
     private fun pickTargetTaskId(mode: String): Int? {
-        val allowMini = mode == PrefKeys.FREEFORM_BLANK_TAP_MODE_CLOSE
+        // 档位 × 状态 的"要不要把这只窗当目标"矩阵（2026-10-18 加 pin 档）：
+        // - close：mini/挂起/**钉住图标**全都可关 ⇒ 全算目标；
+        // - pin  ：normal/mini 都能缩成图标 ⇒ 算目标；**已钉住的不算**（ROM 的 pinAllFreeForm
+        //          会跳过已在钉住态的窗 ⇒ 对它动作是空操作，"吞了却动不了"的反模式）；
+        // - mini ：只有 normal 算（对 mini 再缩 / 对钉住图标再缩都是空操作）。
+        fun allows(mode: String, mini: Boolean, pinned: Boolean): Boolean = when (mode) {
+            PrefKeys.FREEFORM_BLANK_TAP_MODE_CLOSE -> true
+            PrefKeys.FREEFORM_BLANK_TAP_MODE_PIN -> !pinned
+            else -> !mini && !pinned
+        }
         val vm = decorVm
         if (vm != null) {
             val id = runCatching {
@@ -922,11 +936,12 @@ class FreeformBlankTapHook(private val prefs: SharedPreferences) : BaseHook() {
                 f.getInt(vm)
             }.getOrNull() ?: 0
             if (id > 0 && !isExiting(id)) {
-                if (isMiniState(id) && !allowMini) {
-                    HLog.i(TAG, "target task=$id 处于 mini/挂起态 ⇒ 本次不动作（mini 档空操作）")
+                val mini = isMiniState(id)
+                val pinned = isPinned(id)
+                if (!allows(mode, mini, pinned)) {
+                    HLog.i(TAG, "target task=$id mini=$mini pinned=$pinned ⇒ 本次不动作（mode=$mode 空操作）")
                 } else {
-                    if (isMiniState(id)) HLog.i(TAG, "target task=$id（mini 态，close 档允许）")
-                    else HLog.i(TAG, "target task=$id (decorVm.mFreeformTaskId)")
+                    HLog.i(TAG, "target task=$id (decorVm.mFreeformTaskId) mini=$mini pinned=$pinned mode=$mode")
                     return id
                 }
             }
@@ -935,26 +950,25 @@ class FreeformBlankTapHook(private val prefs: SharedPreferences) : BaseHook() {
         val ids = zOrderIds(repo)
         if (ids.isNotEmpty()) {
             HLog.i(TAG, "z-order freeform ids=$ids")
-            // 正常态优先（用户眼前那个）；close 档下退化到"任意未退出的"（含 mini）
-            val normal = ids.firstOrNull { !isExiting(it) && !isMiniState(it) }
+            // 正常态优先（用户眼前那个）；再按档位回退到 mini/钉住
+            val normal = ids.firstOrNull { !isExiting(it) && !isMiniState(it) && !isPinned(it) }
             if (normal != null) return normal
-            if (allowMini) {
-                val any = ids.firstOrNull { !isExiting(it) }
-                if (any != null) {
-                    HLog.i(TAG, "z-order 只有 mini/挂起窗 ⇒ 取 $any（close 档允许）")
-                    return any
-                }
+            val fallback = ids.firstOrNull { id -> !isExiting(id) && allows(mode, isMiniState(id), isPinned(id)) }
+            if (fallback != null) {
+                HLog.i(TAG, "z-order 无正常态小窗 ⇒ 取 $fallback（mode=$mode 允许）")
+                return fallback
             }
             if (ids.any { !isExiting(it) }) {
-                HLog.i(TAG, "z-order 里没有正常态小窗（全是 mini/挂起）⇒ 本次不动作")
+                HLog.i(TAG, "z-order 里没有本档位可动作的小窗（mode=$mode）⇒ 本次不动作")
             }
         }
         val infos = infoList(repo)
         val id = infos?.asSequence()?.mapNotNull { info ->
             val exiting = info.getOrNull("isExiting") as? Boolean ?: false
             val mini = info.getOrNull("isMiniState") as? Boolean ?: false
+            val pinned = info.getOrNull("isInPinMode") as? Boolean ?: false
             val id = (info.getOrNull("getTaskId") as? Number)?.toInt()
-            if (exiting || (mini && !allowMini) || id == null) null else id
+            if (exiting || !allows(mode, mini, pinned) || id == null) null else id
         }?.firstOrNull()
         if (id != null) HLog.i(TAG, "target task=$id (info list)")
         return id
@@ -1038,6 +1052,13 @@ class FreeformBlankTapHook(private val prefs: SharedPreferences) : BaseHook() {
         val getInfo = repo.javaClass.getMethod("getMiuiFreeformTaskInfo", Int::class.javaPrimitiveType)
         val info = getInfo.invoke(repo, taskId) ?: return false
         info.getOrNull("isMiniState") as? Boolean ?: false
+    }.getOrDefault(false)
+
+    private fun isPinned(taskId: Int): Boolean = runCatching {
+        val repo = repository ?: return false
+        val getInfo = repo.javaClass.getMethod("getMiuiFreeformTaskInfo", Int::class.javaPrimitiveType)
+        val info = getInfo.invoke(repo, taskId) ?: return false
+        info.getOrNull("isInPinMode") as? Boolean ?: false
     }.getOrDefault(false)
 
     private fun isExiting(taskId: Int): Boolean = runCatching {
@@ -1188,6 +1209,46 @@ class FreeformBlankTapHook(private val prefs: SharedPreferences) : BaseHook() {
             }
             if (!postToRomExecutor(Runnable { next() })) next()
         }, delayMs)
+    }
+
+    /**
+     * 全部小窗缩成**钉在屏幕边缘的应用图标**（2026-10-18 新增 pin 档的动作本体）。
+     *
+     * ROM 侧证据（OS4 jadx）：`MiuiFreeformModeController.pinAllFreeForm()`（`:2689`）——
+     * 遍历 z-order 里非钉住的小窗，`PinHandler.prepareFreeFormToPin` + `setPinAnimInfo`
+     * + `setBounds`，最后 `startAllPinShellTransition`（**带过渡动画**）；已在钉住态的窗被跳过。
+     * caption（`MiuiCaptionClickListener`）没有 pin 按钮 ⇒ ROM 自己没有用户入口，这正是补位。
+     * 首选直接反射调 controller（零权限）；失败退 ROM 的 shell 命令
+     * `cmd window shell miuifreeform pinAllFreeform`（与 close 的回退同款 su 模式）。
+     */
+    private fun pinAll(): Boolean {
+        // ⚠ pinAllFreeForm 内部是 WindowContainerTransaction + startAllPinShellTransition
+        //（WM 锁 + shell 过渡）——**必须跑在 ROM 的 WMShell 线程**，与 doExit 同一条纪律
+        //（"exit 仍必须在 ROM 的 WMShell 线程"，见 postToRomExecutor 注释）。
+        // 直接在主线程调 = 锁序死锁 = SystemUI 卡死（2026-10-18 真机：一点空白整机冻住）。
+        val c = controller
+        if (c != null) {
+            val posted = postToRomExecutor(Runnable {
+                runCatching {
+                    c.javaClass.methods.firstOrNull {
+                        it.name == "pinAllFreeForm" && it.parameterCount == 0
+                    }?.invoke(c)
+                }.onFailure { HLog.w(TAG, "pinAllFreeForm invoke failed: ${it.message}") }
+            })
+            if (posted) {
+                HLog.i(TAG, "pin via controller.pinAllFreeForm()（ROM 线程）")
+                return true
+            }
+        }
+        // 回退：ROM 的 shell 命令（进程级，无线程约束；与 close 的回退同款 su 模式）
+        return runCatching {
+            val p = ProcessBuilder(
+                "su", "-c", "cmd window shell miuifreeform pinAllFreeform"
+            ).start()
+            p.waitFor(2, java.util.concurrent.TimeUnit.SECONDS)
+            HLog.i(TAG, "pin via shell command")
+            true
+        }.onFailure { HLog.w(TAG, "pin via shell failed: ${it.message}") }.getOrDefault(false)
     }
 
     /** ROM 自己的 shell 命令（OS3/OS4 都有）：`cmd window shell miuifreeform exitFreeformTask <id>`。 */

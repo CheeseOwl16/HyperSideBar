@@ -59,6 +59,9 @@ object PrefKeys {
     const val FREEFORM_BLANK_TAP_MODE = "freeformBlankTapMode"
     const val FREEFORM_BLANK_TAP_MODE_MINI = "mini"
     const val FREEFORM_BLANK_TAP_MODE_CLOSE = "close"
+    /** 图标档（2026-10-18）：缩成**钉在屏幕边缘的应用图标**（ROM 的 pinAllFreeForm）——
+     *  与 mini 档（缩成边缘小窗挂起）是两个不同的 ROM 状态（isInPinMode vs isMiniState）。 */
+    const val FREEFORM_BLANK_TAP_MODE_PIN = "pin"
 
     /** 小窗状态广播（**ROM 的**契约，不是我们自己的——三代 SystemUI 都监听它）。
      *  用途：动作降级路径——没有"关闭单个小窗"API 的 ROM（OS2）用 `state=toHome` 触发
@@ -343,6 +346,7 @@ object LayoutDefaults {
     /** 动作档取值顺序 = 设置页下拉的下标映射（**不得在 UI 里内联**该顺序）。 */
     val FREEFORM_BLANK_TAP_MODE_VALUES = listOf(
         PrefKeys.FREEFORM_BLANK_TAP_MODE_MINI,
+        PrefKeys.FREEFORM_BLANK_TAP_MODE_PIN,
         PrefKeys.FREEFORM_BLANK_TAP_MODE_CLOSE
     )
 
