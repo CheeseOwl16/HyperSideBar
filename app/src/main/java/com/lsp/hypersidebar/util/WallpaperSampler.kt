@@ -34,24 +34,64 @@ object WallpaperSampler {
     @Volatile private var fetchedAt = 0L
     @Volatile private var receiverRegistered = false
 
+    /** 壁纸变更接收器 + 注册它的 context：**原先是匿名注册（无处注销）**——它由宿主 AMS
+     *  持有，API 102 热重载下会把旧代 classloader 钉住；新代再注册一份则每次换壁纸取两遍图。 */
+    private var receiver: BroadcastReceiver? = null
+    private var receiverCtx: Context? = null
+
     /** 呼出路径用（主线程安全、零 binder） */
     fun peek(): Bitmap? = cached
 
     /** init 空闲期调用：注册壁纸变更监听+后台首载；重复调用幂等 */
     fun ensure(context: Context) {
         val appCtx = context.applicationContext
-        if (!receiverRegistered) {
-            receiverRegistered = true
-            runCatching {
-                appCtx.registerReceiver(
-                    object : BroadcastReceiver() {
-                        override fun onReceive(c: Context?, i: Intent?) = refreshAsync(appCtx)
-                    },
-                    IntentFilter(Intent.ACTION_WALLPAPER_CHANGED)
-                )
-            }
-        }
+        armReceiver(appCtx)
         refreshAsync(appCtx)
+    }
+
+    /**
+     * 热重载重挂（与 [releaseForReload] 对称；attach 期那条路径共用 [armReceiver]）。
+     *
+     * 为什么需要：本进程的注册发生在 `EdgeGestureHook`/`TurboLayout` 的 init 空闲期
+     * （经 `DataLoader.prewarmWithRetry.onReady` → `ensure`），而 init 的 onReady 是异步的、
+     * 且要等数据源就绪 —— 释放后不能指望它"早晚会再跑一次"。
+     * **只重挂监听，不顺手重采壁纸**：`cached` 在释放时是刻意保留的，重采是额外 IO。
+     */
+    fun rearmHostSide(context: Context) {
+        armReceiver(context.applicationContext)
+    }
+
+    /** 注册壁纸变更监听（幂等；唯一实现——`ensure` 与热重载重挂都走这里）。 */
+    private fun armReceiver(appCtx: Context) {
+        if (receiverRegistered) return
+        receiverRegistered = true
+        runCatching {
+            val recv = object : BroadcastReceiver() {
+                override fun onReceive(c: Context?, i: Intent?) = refreshAsync(appCtx)
+            }
+            appCtx.registerReceiver(recv, IntentFilter(Intent.ACTION_WALLPAPER_CHANGED))
+            receiver = recv
+            receiverCtx = appCtx
+        }.onFailure { HLog.w(TAG, "register failed: ${it.message}") }
+    }
+
+    /**
+     * API 102 热重载释放（旧代退休前调用；幂等）。
+     *
+     * 为什么必须：壁纸变更接收器是**宿主 AMS 持有**的对象——不摘掉旧代 classloader 回收不了，
+     * 新代再注册一份会让每次换壁纸触发两次取图+模糊换算。
+     * 已采到的 [cached] 位图**保留**：那是数据不是资源（它只是一个 Bitmap，不引模块类），
+     * 清掉只会让新代头几次呼出退回亚克力底。
+     */
+    fun releaseForReload() {
+        runCatching {
+            val r = receiver
+            val c = receiverCtx
+            if (r != null && c != null) c.unregisterReceiver(r)
+        }.onFailure { HLog.w(TAG, "unregister failed: ${it.message}") }
+        receiver = null
+        receiverCtx = null
+        receiverRegistered = false
     }
 
     /**

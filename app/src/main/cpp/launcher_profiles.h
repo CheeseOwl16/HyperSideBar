@@ -20,109 +20,91 @@ typedef struct {
     uint64_t size;
     uint8_t prologue[32];
     const char* symbol;
+    /* 结构性必调导入（NULL 结尾；NULL = 本锚点不做结构校验）。
+     * 语义：hsb_locate 偏移路 prologue 命中后，再用 hsb_a64_call_targets_import 证明
+     * "该函数体内确有 bl/blr 落到这个导入的 GOT 槽"——比 prologue 字节更强的身份证据。
+     * 全部列出项都必须被调到，否则 cand rejected: struct-mismatch 并回落特征扫描路。
+     * 数据来源：本脚本顶部的 IMPORTS 表（llvm-objdump 反汇编实证），且 16/16 条 prologue
+     * 已对着设备那份 libapp_launcher.so 逐字节核过（= 同构建）。
+     * 只有函数体里真有 PLT 调用的锚点才填；其余（plt=0）留空，身份由 32B prologue 兜底。 */
+    const char* const* required_imports;
 } HsbLauncherAnchor;
+
+/* 各锚点的结构性必调导入（见本文件顶部 IMPORTS 的说明）。 */
+static const char* const kImportsOnBackInvoke[] = { "IOnBackInvokedCallback_on_back_invoked", "IOnBackInvokedCallback_drop", NULL };
+static const char* const kImportsOnBackCancelled[] = { "IOnBackInvokedCallback_on_back_cancelled", "BackNavigationInfo_drop", NULL };
+static const char* const kImportsHandleBackGesture[] = { "input_MotionEvent_getActionMasked", "input_MotionEvent_getRawX", "input_MotionEvent_getEventTime", NULL };
+static const char* const kImportsPilferPointers[] = { "input_InputMonitor_pilferPointers", NULL };
+static const char* const kImportsCancelHomeGestureToEngine[] = { "input_MotionEvent_clone", "input_MotionEvent_setAction", NULL };
+static const char* const kImportsNavHotZone[] = { "DisplayManager_get_instance", "DisplayManager_get_display", NULL };
+static const char* const kImportsPilferProbe[] = { "input_InputMonitor_pilferPointers", NULL };
+static const char* const kImportsActionProbe[] = { "input_MotionEvent_getActionMasked", "input_MotionEvent_getDownTime", NULL };
 
 static const HsbLauncherAnchor kHsbAnchors[] = {
     {"try_delegate_back_to_sidebar", 0x720308, 188,
      {0xff, 0x83, 0x01, 0xd1, 0xfd, 0x7b, 0x03, 0xa9, 0xf5, 0x23, 0x00, 0xf9, 0xf4, 0x4f, 0x05, 0xa9, 0xfd, 0xc3, 0x00, 0x91, 0x71, 0x7a, 0xfe, 0x97, 0xf3, 0x03, 0x00, 0xaa, 0xf5, 0x03, 0x00, 0xaa},
-     "_RNvMs1_NtNtNtCs5erksEADHS4_12app_launcher7recents7gesture25gesture_input_back_helperNtB5_22GestureInputBackHelper28try_delegate_back_to_sidebar"},
+     "_RNvMs1_NtNtNtCs5erksEADHS4_12app_launcher7recents7gesture25gesture_input_back_helperNtB5_22GestureInputBackHelper28try_delegate_back_to_sidebar",
+     NULL},
     {"on_swipe_start", 0x700b14, 1504,
      {0xff, 0x43, 0x03, 0xd1, 0xe8, 0x43, 0x00, 0xfd, 0xfd, 0x7b, 0x09, 0xa9, 0xf8, 0x5f, 0x0a, 0xa9, 0xf6, 0x57, 0x0b, 0xa9, 0xf4, 0x4f, 0x0c, 0xa9, 0xfd, 0x43, 0x02, 0x91, 0x37, 0x41, 0x00, 0xf0},
-     "_RNvMs0_NtNtNtCs5erksEADHS4_12app_launcher7recents7gesture25gesture_input_back_helperNtB5_22GestureInputBackHelper14on_swipe_start"},
+     "_RNvMs0_NtNtNtCs5erksEADHS4_12app_launcher7recents7gesture25gesture_input_back_helperNtB5_22GestureInputBackHelper14on_swipe_start",
+     NULL},
     {"on_swipe_process", 0x7010f4, 3380,
      {0xff, 0x83, 0x04, 0xd1, 0xeb, 0x2b, 0x0a, 0x6d, 0xe9, 0x23, 0x0b, 0x6d, 0xfd, 0x7b, 0x0c, 0xa9, 0xfc, 0x6b, 0x00, 0xf9, 0xfa, 0x67, 0x0e, 0xa9, 0xf8, 0x5f, 0x0f, 0xa9, 0xf6, 0x57, 0x10, 0xa9},
-     "_RNvMs0_NtNtNtCs5erksEADHS4_12app_launcher7recents7gesture25gesture_input_back_helperNtB5_22GestureInputBackHelper16on_swipe_process"},
+     "_RNvMs0_NtNtNtCs5erksEADHS4_12app_launcher7recents7gesture25gesture_input_back_helperNtB5_22GestureInputBackHelper16on_swipe_process",
+     NULL},
     {"on_back_invoke", 0x71fa60, 1476,
      {0xff, 0x83, 0x04, 0xd1, 0xfd, 0x7b, 0x0c, 0xa9, 0xfc, 0x6f, 0x0d, 0xa9, 0xfa, 0x67, 0x0e, 0xa9, 0xf8, 0x5f, 0x0f, 0xa9, 0xf6, 0x57, 0x10, 0xa9, 0xf4, 0x4f, 0x11, 0xa9, 0xfd, 0x03, 0x03, 0x91},
-     "_RNvMs1_NtNtNtCs5erksEADHS4_12app_launcher7recents7gesture25gesture_input_back_helperNtB5_22GestureInputBackHelper14on_back_invoke"},
+     "_RNvMs1_NtNtNtCs5erksEADHS4_12app_launcher7recents7gesture25gesture_input_back_helperNtB5_22GestureInputBackHelper14on_back_invoke",
+     kImportsOnBackInvoke},
     {"on_back_cancelled", 0x7200d0, 456,
      {0xff, 0xc3, 0x02, 0xd1, 0xfd, 0x7b, 0x08, 0xa9, 0xf6, 0x57, 0x09, 0xa9, 0xf4, 0x4f, 0x0a, 0xa9, 0xfd, 0x03, 0x02, 0x91, 0x14, 0x04, 0x40, 0xf9, 0xf3, 0x03, 0x00, 0xaa, 0xe0, 0x03, 0x14, 0xaa},
-     "_RNvMs1_NtNtNtCs5erksEADHS4_12app_launcher7recents7gesture25gesture_input_back_helperNtB5_22GestureInputBackHelper17on_back_cancelled"},
+     "_RNvMs1_NtNtNtCs5erksEADHS4_12app_launcher7recents7gesture25gesture_input_back_helperNtB5_22GestureInputBackHelper17on_back_cancelled",
+     kImportsOnBackCancelled},
     {"handle_back_gesture", 0x6fd3ac, 8364,
      {0xeb, 0x2b, 0xb8, 0x6d, 0xe9, 0x23, 0x01, 0x6d, 0xfd, 0x7b, 0x02, 0xa9, 0xfc, 0x6f, 0x03, 0xa9, 0xfa, 0x67, 0x04, 0xa9, 0xf8, 0x5f, 0x05, 0xa9, 0xf6, 0x57, 0x06, 0xa9, 0xf4, 0x4f, 0x07, 0xa9},
-     "_RNvMs0_NtNtNtCs5erksEADHS4_12app_launcher7recents10back_panel24gesture_stub_view_windowNtB5_21GestureStubViewWindow19handle_back_gesture"},
-    /* ---- 2026-10-09 第 2 步：DOWN 链路的区域判定（门控 + 底角）---- */
-    {"init_gesture_type", 0x78f048, 1012,
-     {0xff, 0x03, 0x03, 0xd1, 0xe8, 0x33, 0x00, 0xfd, 0xfd, 0x7b, 0x07, 0xa9, 0xfa, 0x67, 0x08, 0xa9, 0xf8, 0x5f, 0x09, 0xa9, 0xf6, 0x57, 0x0a, 0xa9, 0xf4, 0x4f, 0x0b, 0xa9, 0xfd, 0xc3, 0x01, 0x91},
-     "_RNvMNtNtCs5erksEADHS4_12app_launcher7recents7gesture21gesture_input_monitorNtB5_19GestureInputMonitor19init_gesture_type"},
-    {"is_in_bottom_gesture_region", 0x7b2d48, 168,
-     {0xff, 0xc3, 0x00, 0xd1, 0xfd, 0x7b, 0x01, 0xa9, 0xf3, 0x13, 0x00, 0xf9, 0xfd, 0x43, 0x00, 0x91, 0x13, 0x00, 0x04, 0x91, 0x68, 0xfe, 0x5f, 0x08, 0x48, 0x02, 0x00, 0x35, 0x28, 0x00, 0x80, 0x52},
-     "_RNvMNtNtNtCs5erksEADHS4_12app_launcher7recents7gesture26gesture_input_monitor_implNtB5_23GestureInputMonitorImpl27is_in_bottom_gesture_region"},
-    {"match_region_check", 0x6b7710, 344,
-     {0x08, 0x00, 0x38, 0x1e, 0x01, 0x02, 0x00, 0x36, 0x09, 0x30, 0x40, 0xb9, 0x3f, 0x01, 0x08, 0x6b, 0x0c, 0x0a, 0x00, 0x54, 0x09, 0x38, 0x40, 0xb9, 0x1f, 0x01, 0x09, 0x6b, 0xaa, 0x09, 0x00, 0x54},
-     "_RNvMNtNtCs5erksEADHS4_12app_launcher7recents7gesture24gesture_touchable_regionNtB2_22GestureTouchableRegion18match_region_check"},
-    /* ---- 动作位（第 3 步才接线，先占位：签名未验证前不调）---- */
-    {"pilfer_pointers", 0x78dc38, 140,
-     {0x40, 0x04, 0x00, 0xb4, 0xff, 0x83, 0x01, 0xd1, 0xfd, 0x7b, 0x04, 0xa9, 0xf3, 0x2b, 0x00, 0xf9, 0xfd, 0x03, 0x01, 0x91, 0xc8, 0x3c, 0x00, 0xd0, 0xf3, 0x03, 0x00, 0xaa, 0x08, 0xb9, 0x41, 0xf9},
-     "_RNvMNtNtCs5erksEADHS4_12app_launcher7recents7gesture21gesture_input_monitorNtB5_19GestureInputMonitor15pilfer_pointers"},
-    {"cancel_home_gesture_to_engine", 0x78fac8, 532,
-     {0xff, 0x83, 0x03, 0xd1, 0xfd, 0x7b, 0x0b, 0xa9, 0xf6, 0x57, 0x0c, 0xa9, 0xf4, 0x4f, 0x0d, 0xa9, 0xfd, 0xc3, 0x02, 0x91, 0x09, 0xf4, 0x45, 0x39, 0xe8, 0x03, 0x80, 0x52, 0xe1, 0x23, 0x00, 0xa9},
-     "_RNvMNtNtCs5erksEADHS4_12app_launcher7recents7gesture21gesture_input_monitorNtB5_19GestureInputMonitor29cancel_home_gesture_to_engine"},
-    /* ---- 手势**终态路径入口**（"取消"的第二半；可作备选主锚点做观测）----
-     * 偏移/大小/prologue 取自**设备那份** libapp_launcher.so（MiuiHome.apk!lib/arm64-v8a/）的
-     * `.gnu_debugdata` 迷你调试 ELF 符号 + 实测 prologue；与 .ota-extract 那份逐字节相同。
-     * （曾经给它配过一个 hsb_stub_swipe_stop 观测桩；2026-10-13 随"判死档清理"一起删了。） */
+     "_RNvMs0_NtNtNtCs5erksEADHS4_12app_launcher7recents10back_panel24gesture_stub_view_windowNtB5_21GestureStubViewWindow19handle_back_gesture",
+     kImportsHandleBackGesture},
     {"on_swipe_stop_direct", 0x701e28, 276,
      {0xff, 0xc3, 0x01, 0xd1, 0xe8, 0x23, 0x00, 0xfd, 0xfd, 0xfb, 0x04, 0xa9, 0xf5, 0x2f, 0x00, 0xf9, 0xf4, 0x4f, 0x06, 0xa9, 0xfd, 0x23, 0x01, 0x91, 0x08, 0x40, 0x20, 0x1e, 0x28, 0x41, 0x00, 0xd0},
-     "_RNvMs0_NtNtNtCs5erksEADHS4_12app_launcher7recents7gesture25gesture_input_back_helperNtB5_22GestureInputBackHelper20on_swipe_stop_direct"},
-    /* ---- 2026-10-13：附锚点（aux）整块删除 ----------------------------------------
-     * showSidebar(0x989c48) / SidebarEvokeHelper::is_hold_gesture_enabled(0x6bec5c) /
-     * is_sidebar_showing(0x6be304) / GestureBackArrowView::is_hold_gesture_enabled(0x784210) /
-     * SideSlideHoldAction::fallback_duration_ms(0x6bf360) 这五条只剩"官方停顿呼出侧栏"的
-     * 观测价值，而真机 `SideSlideHoldAction::read_from_settings` 读出 **None**（本机官方停顿
-     * 呼出压根没开）⇒ 观测对象不存在，判死。真机偏移与定位方法（.gnu_debugdata 抽符号 +
-     * 序言掩码比对）留档在 docs/adaptation/os4-native-hold-route-plan.md，不再占 profile。
-     * 角区（底角斜滑）那条线的锚点照旧保留，见上。 */
-    /* ---- 手工追加（生成器 WANT 与来源表均未含本条）：系统导航热区谓词，只读观测 ----
-     * 2026-10-14：OS4 底角贴角起手会"系统 Home + 扇形呼出 + 打开应用"三连，根因是系统在
-     * 同一物理区域与我们同时行动（最贴边 x<10 组我们自己的判据成功率反而最高，4/12）。
-     * 本锚点为 trigger_gesture_judge 的第 7 参来源，(x,y)∈s0/s1、返回 bool∈w0；
-     * 配 hsb_stub_navprobe 只读桩（透传 + 打 (x,y)→rv，改返回值就等于改掉系统 Home 判据）。
-     * prop `debug.hsb.native.anchor3 nav_hot_zone` 才装，缺省空 = 不装。 */
+     "_RNvMs0_NtNtNtCs5erksEADHS4_12app_launcher7recents7gesture25gesture_input_back_helperNtB5_22GestureInputBackHelper20on_swipe_stop_direct",
+     NULL},
+    {"init_gesture_type", 0x78f048, 1012,
+     {0xff, 0x03, 0x03, 0xd1, 0xe8, 0x33, 0x00, 0xfd, 0xfd, 0x7b, 0x07, 0xa9, 0xfa, 0x67, 0x08, 0xa9, 0xf8, 0x5f, 0x09, 0xa9, 0xf6, 0x57, 0x0a, 0xa9, 0xf4, 0x4f, 0x0b, 0xa9, 0xfd, 0xc3, 0x01, 0x91},
+     "_RNvMs_NtNtNtCs5erksEADHS4_12app_launcher7recents7gesture21gesture_input_monitorNtB4_19GestureInputMonitor17init_gesture_type",
+     NULL},
+    {"is_in_bottom_gesture_region", 0x7b2d48, 168,
+     {0xff, 0xc3, 0x00, 0xd1, 0xfd, 0x7b, 0x01, 0xa9, 0xf3, 0x13, 0x00, 0xf9, 0xfd, 0x43, 0x00, 0x91, 0x13, 0x00, 0x04, 0x91, 0x68, 0xfe, 0x5f, 0x08, 0x48, 0x02, 0x00, 0x35, 0x28, 0x00, 0x80, 0x52},
+     "_RNvMsk_NtNtCs5erksEADHS4_12app_launcher7recents17base_recents_implNtB5_23GestureInputMonitorImpl27is_in_bottom_gesture_region",
+     NULL},
+    {"match_region_check", 0x6b7710, 344,
+     {0x08, 0x00, 0x38, 0x1e, 0x01, 0x02, 0x00, 0x36, 0x09, 0x30, 0x40, 0xb9, 0x3f, 0x01, 0x08, 0x6b, 0x0c, 0x0a, 0x00, 0x54, 0x09, 0x38, 0x40, 0xb9, 0x1f, 0x01, 0x09, 0x6b, 0xaa, 0x09, 0x00, 0x54},
+     "_RNvMNtNtNtCs5erksEADHS4_12app_launcher7recents7gesture24gesture_touchable_regionNtB2_22GestureTouchableRegion18match_region_check",
+     NULL},
+    {"pilfer_pointers", 0x78dc38, 140,
+     {0x40, 0x04, 0x00, 0xb4, 0xff, 0x83, 0x01, 0xd1, 0xfd, 0x7b, 0x04, 0xa9, 0xf3, 0x2b, 0x00, 0xf9, 0xfd, 0x03, 0x01, 0x91, 0xc8, 0x3c, 0x00, 0xd0, 0xf3, 0x03, 0x00, 0xaa, 0x08, 0xb9, 0x41, 0xf9},
+     "_RNvMs_NtNtNtCs5erksEADHS4_12app_launcher7recents7gesture21gesture_input_monitorNtB4_19GestureInputMonitor15pilfer_pointers",
+     kImportsPilferPointers},
+    {"cancel_home_gesture_to_engine", 0x78fac8, 532,
+     {0xff, 0x83, 0x03, 0xd1, 0xfd, 0x7b, 0x0b, 0xa9, 0xf6, 0x57, 0x0c, 0xa9, 0xf4, 0x4f, 0x0d, 0xa9, 0xfd, 0xc3, 0x02, 0x91, 0x09, 0xf4, 0x45, 0x39, 0xe8, 0x03, 0x80, 0x52, 0xe1, 0x23, 0x00, 0xa9},
+     "_RNvMs_NtNtNtCs5erksEADHS4_12app_launcher7recents7gesture21gesture_input_monitorNtB4_19GestureInputMonitor29cancel_home_gesture_to_engine",
+     kImportsCancelHomeGestureToEngine},
     {"nav_hot_zone", 0x6b8064, 1024,
      {0xff, 0xc3, 0x03, 0xd1, 0xed, 0x33, 0x09, 0x6d, 0xeb, 0x2b, 0x0a, 0x6d, 0xe9, 0x23, 0x0b, 0x6d, 0xfd, 0x7b, 0x0c, 0xa9, 0xf5, 0x6b, 0x00, 0xf9, 0xf4, 0x4f, 0x0e, 0xa9, 0xfd, 0x03, 0x03, 0x91},
-     "_RNvMNtNtNtCs5erksEADHS4_12app_launcher7recents7gesture25gesture_input_home_helperNtB2_22GestureInputHomeHelper29is_in_navigation_bar_hot_zone"},
-    /* ---- 手工追加（生成器 WANT 与来源表均未含本条）：Home 判据本体，只读观测 ----
-     * 2026-10-15：上一轮锚点 nav_hot_zone 已测出系统热区=横向中段（x∈[400,760] y≈2380），
-     * 与我们角窗 0 重叠 ⇒ "在角窗内返回 false 压制热区"这条路被数据否掉（那里本来就不在热区）。
-     * 冲突在下游：调用点 0x7afca8 把热区 verdict 当 w2 传进来后，本函数仍照别处判据继续判。
-     * 签名（0x7afca8 调用点 + 本体序言坐实）：
-     *   trigger_gesture_judge(x0=downTime, x1=eventTime, s0=x, s1=y, s2=x2, s3=y2, w2=hotzone_verdict)
-     * 本体 `fsub s12, s3, s1` / `mov w19, w2` / `mov x20, x1` / `mov x21, x0` —— 后三个寄存器
-     * 一直活着，说明它们就是被缓存的入参；(s3-s1) 是终点-起点即位移分量，用于角度判定。
-     * 配 hsb_stub_judgeprobe 只读桩：打全部 6 个入参 + 返回值，不改任何值。
-     * prop `debug.hsb.native.anchor3 judge_probe` 才装，缺省空 = 不装。 */
+     "_RNvMNtNtNtCs5erksEADHS4_12app_launcher7recents7gesture25gesture_input_home_helperNtB2_22GestureInputHomeHelper29is_in_navigation_bar_hot_zone",
+     kImportsNavHotZone},
     {"judge_probe", 0x6b7868, 892,
      {0xff, 0x83, 0x04, 0xd1, 0xec, 0x53, 0x00, 0xfd, 0xeb, 0x2b, 0x0b, 0x6d, 0xe9, 0x23, 0x0c, 0x6d, 0xfd, 0x7b, 0x0d, 0xa9, 0xfc, 0x67, 0x0e, 0xa9, 0xf8, 0x5f, 0x0f, 0xa9, 0xf6, 0x57, 0x10, 0xa9},
-     "_RNvMNtNtNtCs5erksEADHS4_12app_launcher7recents7gesture25gesture_input_home_helperNtB2_22GestureInputHomeHelper21trigger_gesture_judge"},
-    /* ---- 手工追加（生成器 WANT 与来源表均未含本条）：pilfer 动作本体，只读观测 ----
-     * 2026-10-15：judge_probe 实测 0 调用 ⇒ 换目标。全表扫 `bl 0x6b8464` 只有两处调用点，
-     * 且都在 GestureInputMonitorImpl 内部（0x78e77c–0x78ef38 大段里）：
-     *   78e90c: add x0, x19, #0xc8 ; bl 0x6b8464
-     *   78ef30: add x0, x19, #0xc8 ; bl 0x6b8464
-     * ⇒ do_pilfer(x0 = monitor+0xc8)，本体 `mov x19,x0` 缓存该入参；函数体自旋锁
-     * （ldaxrb/stxrb 0xf1a0a8）后 `bl input_InputMonitor_pilferPointers@plt`(0x6b84f4)
-     * —— **系统 pilfer 掉输入流的动作就在这**。角区三连的最后一块拼图。
-     * 配 hsb_stub_pilferprobe 只读桩：透传 + 打 self/返回值。
-     * prop `debug.hsb.native.anchor3 pilfer_probe` 才装，缺省空 = 不装。 */
+     "_RNvMNtNtNtCs5erksEADHS4_12app_launcher7recents7gesture25gesture_input_home_helperNtB2_22GestureInputHomeHelper21trigger_gesture_judge",
+     NULL},
     {"pilfer_probe", 0x6b8464, 364,
      {0xff, 0xc3, 0x01, 0xd1, 0xfd, 0x7b, 0x04, 0xa9, 0xf5, 0x2b, 0x00, 0xf9, 0xf4, 0x4f, 0x06, 0xa9, 0xfd, 0x03, 0x01, 0x91, 0x14, 0x43, 0x00, 0xd0, 0x94, 0xa2, 0x02, 0x91, 0xf3, 0x03, 0x00, 0xaa},
-     "_RNvMNtNtNtCs5erksEADHS4_12app_launcher7recents7gesture25gesture_input_home_helperNtB2_22GestureInputHomeHelper9do_pilfer"},
-    /* ---- 手工追加（生成器 WANT 与来源表均未含本条）：系统"是否处理事件"总闸，只读观测 ----
-     * 2026-10-16：静勘（os4-hook-point-survey.md）结论——pilfer 唯一出口是 H2，但**最锋利
-     * 的干预点是这里**：`0x7af864` 用 should_handle_event(event, MOVE) 给 pilfer 放行
-     * （`cbz w0` 即跳过 pilfer）。只对角区事件返 false 可精确抑制 pilfer 而不动系统正常
-     * Home/recents。本桩只读：透传 + 打 (event, 期望action, 实际action, 权威坐标, 返回值)，
-     * 先把"它在角区返什么、四个调用点各自管什么动作"测出来，再决定要不要上 action 桩。
-     *
-     * 签名（调用点 + 本体双证）：should_handle_event(x0 = MotionEvent*, w1 = 期望 action)
-     * 本体 `mov w22,w1` / `mov x19,x0`（x0 未动，直接喂 getActionMasked）+ `cmp w8,w22`。
-     * 4 个调用点（w1 = 期望动作）：0x73f2a4(DOWN) 0x742910(0) 0x78e418(MOVE) 0x7af864(MOVE)。
-     * 坐标用 launcher 自己的 UND getter 读（hsb_back_event_read），见该函数注释。
-     * prop `debug.hsb.native.anchor3 action_probe` 才装，缺省空 = 不装。 */
+     "_RNvMNtNtNtCs5erksEADHS4_12app_launcher7recents7gesture25gesture_input_home_helperNtB2_22GestureInputHomeHelper9do_pilfer",
+     kImportsPilferProbe},
     {"action_probe", 0x8f7bb8, 2468,
      {0xff, 0xc3, 0x04, 0xd1, 0xfd, 0x7b, 0x0d, 0xa9, 0xfc, 0x6f, 0x0e, 0xa9, 0xfa, 0x67, 0x0f, 0xa9, 0xf8, 0x5f, 0x10, 0xa9, 0xf6, 0x57, 0x11, 0xa9, 0xf4, 0x4f, 0x12, 0xa9, 0xfd, 0x43, 0x03, 0x91},
-     "_RNvMNtNtNtCs5erksEADHS4_12app_launcher7recents7gesture26motion_event_handled_proxy19should_handle_event"},
+     "_RNvNtNtNtCs5erksEADHS4_12app_launcher7recents7gesture26motion_event_handled_proxy19should_handle_event",
+     kImportsActionProbe},
 };
 #define HSB_ANCHOR_COUNT 16u
 #define HSB_PROFILE_PROLOGUE_BYTES 32u

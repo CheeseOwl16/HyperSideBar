@@ -231,7 +231,7 @@ class AnchorEngineTest {
 
     @Test
     fun `host tables select the roles that actually exist per host`() {
-        // 安全中心 = 侧边栏全表；桌面 = 三个手势锚点；SystemUI / 未知宿主 = 空表
+        // 安全中心 = 侧边栏全表；桌面 = 三个手势锚点；SystemUI = 三条小窗 role；未知宿主 = 空表
         assertEquals(AnchorRoles.ALL, AnchorRoles.forHost("com.miui.securitycenter"))
         assertEquals(
             listOf(
@@ -239,7 +239,10 @@ class AnchorEngineTest {
             ),
             AnchorRoles.forHost("com.miui.home").map { it.role }
         )
-        assertTrue(AnchorRoles.forHost("com.android.systemui").isEmpty())
+        assertEquals(
+            listOf("freeform_controller", "freeform_event_handler", "freeform_input_router"),
+            AnchorRoles.forHost("com.android.systemui").map { it.role }
+        )
         assertTrue(AnchorRoles.forHost("com.example.unknown").isEmpty())
         assertTrue(AnchorRoles.forHost(null).isEmpty())
     }
@@ -249,15 +252,23 @@ class AnchorEngineTest {
      * 退化成 `unknown#0#0`。若此时直接 `forHost("unknown")` 得到空表，会**整表跳过**，
      * 侧边栏三通道静默降级（实机表现：三宿主全 `skipped-no-roles-for-host`）。
      *
-     * 约束：调用方必须能区分"未知宿主"（拿不到包名 ⇒ 回落全表）与"已知无关宿主"
-     * （如 systemui ⇒ 空表是正确结果）。判据是包名哨兵值，而不是"表为空"。
+     * 约束：调用方必须能区分"未知宿主"（拿不到包名 ⇒ 回落全表）与"已知宿主"
+     * （按包名选表），判据是**包名哨兵值**（`AnchorResolver.UNKNOWN_HOST`），而不是"表为空"。
+     *
+     * 2026-10-16 更新：本条原来拿 `com.android.systemui` 当"已知但无关宿主的空表示例"，
+     * 而 SystemUI 现在有小窗三条 role（见 `AnchorRoles.SYSTEM_UI`）⇒ 三个已知宿主的表
+     * 都不空了。断言随之改为"已知宿主非空 + 未识别/空包名为空"——保护的仍是同一个不变式
+     * （不能靠"空表"判未知宿主），只是不再有"已知却空表"的现成例子。
      */
     @Test
-    fun `unknown host is distinguishable from a known irrelevant host`() {
-        // 已知无关宿主 ⇒ 空表是**正确**的，应当跳过解析
-        assertTrue(AnchorRoles.forHost("com.android.systemui").isEmpty())
-        // 未知宿主同样返回空表 —— 所以调用方绝不能只看"空表"就跳过
+    fun `unknown host is distinguishable from a known host`() {
+        // 已知宿主：三个都有表（空表不再可能来自已知宿主）
+        assertTrue(AnchorRoles.forHost("com.miui.securitycenter").isNotEmpty())
+        assertTrue(AnchorRoles.forHost("com.miui.home").isNotEmpty())
+        assertTrue(AnchorRoles.forHost("com.android.systemui").isNotEmpty())
+        // 未知/缺失包名 ⇒ 空表：调用方**绝不能只看"空表"就跳过**（要按哨兵判）
         assertTrue(AnchorRoles.forHost("unknown").isEmpty())
+        assertTrue(AnchorRoles.forHost(null).isEmpty())
         // 回落目标：全表必须非空且覆盖六个侧边栏/工具箱 role
         assertEquals(6, AnchorRoles.ALL.size)
     }

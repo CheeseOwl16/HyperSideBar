@@ -5,7 +5,6 @@ import android.os.Environment
 import com.lsp.hypersidebar.BuildConfig
 import com.lsp.hypersidebar.prefs.PrefKeys
 import java.io.File
-import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 
 /**
@@ -64,9 +63,19 @@ object NativeGateBridge {
     /** 文件 marker 名（native 读同一个名字，见 plan §17） */
     private const val MARKER_NAME = "hsb_native_gate"
 
-    /** 单线程串行：sendSync 会被设置页写入触发，串行避免并发碰同一个文件 */
-    private val executor = Executors.newSingleThreadExecutor { r ->
-        Thread(r, "NativeGateBridge").apply { isDaemon = true }
+    /** 单线程串行：sendSync 会被设置页写入触发，串行避免并发碰同一个文件。
+     *  ⚠ 可重建（不是 `val`）：热重载要把旧代这条线程停掉（线程 Runnable 是旧代 lambda，
+     *  不停掉旧 classloader 就被它钉住），停完之后同代内再用必须能重建。 */
+    private val executorLock = Any()
+    @Volatile private var single: java.util.concurrent.ExecutorService? = null
+
+    private fun exec(): java.util.concurrent.ExecutorService {
+        single?.let { return it }
+        return synchronized(executorLock) {
+            single ?: java.util.concurrent.Executors.newSingleThreadExecutor { r ->
+                Thread(r, "NativeGateBridge").apply { isDaemon = true }
+            }.also { single = it }
+        }
     }
 
     /** 本进程内最近一次的**愿望**（去重，避免每次 sendSync 都碰文件） */
@@ -92,10 +101,26 @@ object NativeGateBridge {
             HLog.i(TAG, "总闸不表态（判不出 OS4 纯 native 桌面 ⇒ 不写任何通道；native 侧缺省=开）")
             return
         }
-        executor.execute {
+        exec().execute {
             if (wish == Wish.KILL) writeMarker("0") else clearMarker()
             warnIfPropStuckOff()
         }
+    }
+
+    /**
+     * API 102 热重载释放（旧代退休前调用；幂等）。
+     *
+     * 为什么必须：本 object 持有一条单线程执行器——它的 Runnable 是**旧代 lambda**，
+     * 线程活着旧 classloader 就回收不了。停掉它并清 [lastWish] 去重快照，使释放后
+     * 同代内再 push 真能动作一次（否则会以为"愿望没变"而跳过）。
+     * 只释放线程，**不撤销已写的 marker**：marker 表达的是用户配置的愿望，不是资源。
+     */
+    fun releaseForReload() {
+        runCatching { single?.shutdownNow() }
+            .onFailure { HLog.w(TAG, "executor shutdown failed: ${it.message}") }
+        single = null
+        lastWish = null
+        HLog.i(TAG, "releaseForReload: gate executor stopped (marker 保留)")
     }
 
     private fun wish(prefs: SharedPreferences): Wish {

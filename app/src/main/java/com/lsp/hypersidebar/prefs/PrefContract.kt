@@ -25,6 +25,19 @@ object PrefKeys {
 
     const val DEAD_ZONE = "deadZone"
     const val TRIGGER_DWELL_MS = "triggerDwellMs"
+
+    /** 扇形 scrim（压暗）过渡时长（ms）：用户可调（2026-10-17；原为 FanMenuCompose 内部常量 300）。 */
+    const val FAN_SCRIM_FADE_MS = "fanScrimFadeMs"
+
+    /** 底角"斜滑独占"（抑制系统同时响应）：开关（默认开），推 `persist.hsb.corner.supp`（2026-10-17）。 */
+    const val CORNER_SUPPRESS_ENABLED = "cornerSuppressEnabled"
+
+    /**
+     * "点空白时吞掉触摸（不穿透）"：**默认开**（2026-10-17 用户要求）。
+     * 安全性靠"边收边转 + 注入被拒即自动关"两条（见 `SystemUiInputSpy` 的 takeover 段注释）：
+     * 轻点=吞掉；一旦变拖动/多指=把手势实时还回去；注入被拒=永久关掉接管。
+     */
+    const val FREEFORM_BLANK_TAP_TAKEOVER = "freeformBlankTapTakeover"
     const val TRIGGER_MIN_DISTANCE = "triggerMinDistance"
 
     /** 底角斜滑触发开关（N1，仅竖屏）：默认关（opt-in）。开=底部两角斜向内上滑呼出扇形。 */
@@ -34,6 +47,27 @@ object PrefKeys {
      *  点空白收起（吞点击）、10s 无操作看门狗自动收起；关=现状（未预选松手立即收起）。
      *  同时是 OS4 R1-J（securitycenter 侧改道点选模式）的交互地基。 */
     const val FAN_PERSISTENT_ON_RELEASE = "fanPersistentOnRelease"
+
+    /** 小窗「点击空白处缩小/关闭」（2026-10-16，三代 ROM 通用）。
+     *  检测走 SystemUiInputSpy 的全局 monitor 通道（它无条件启动），动作层按 ROM 分化；
+     *  默认关（opt-in）——这是"系统没有的行为"，装完模块不该悄悄改变点空白的结果。 */
+    const val FREEFORM_BLANK_TAP_ENABLED = "freeformBlankTapEnabled"
+
+    /** 命中后的动作档：取值见下方 FREEFORM_BLANK_TAP_MODE_*；默认 mini（缩小/最小化）。
+     *  为何默认 mini：mini 三代同名同签名（`fromFreeformToMini(I)V`）最可移植，且语义是
+     *  "挂起"而不是"关掉"；close 在 OS2 没有单任务关闭 API，会退化成 minimizeTask（=退出小窗）。 */
+    const val FREEFORM_BLANK_TAP_MODE = "freeformBlankTapMode"
+    const val FREEFORM_BLANK_TAP_MODE_MINI = "mini"
+    const val FREEFORM_BLANK_TAP_MODE_CLOSE = "close"
+
+    /** 小窗状态广播（**ROM 的**契约，不是我们自己的——三代 SystemUI 都监听它）。
+     *  用途：动作降级路径——没有"关闭单个小窗"API 的 ROM（OS2）用 `state=toHome` 触发
+     *  `allFreeformFromFreeformToMini()`（≈缩小全部小窗）。实测三代均可用
+     *  （OS3/OS4 由 `MiuiFreeformModeSettingsObserver` 动态注册；OS2 是
+     *  `MiuiFreeformModeObserver.FreeFormBroadcastReceiver`）。 */
+    const val FREEFORM_STATE_ACTION = "com.miui.fullscreen_state_change"
+    const val FREEFORM_STATE_EXTRA = "state"
+    const val FREEFORM_STATE_TO_HOME = "toHome"
 
     // ===== B 路线跨进程通道（sys spy ⇄ :ui 状态机，2026-10-05）=====
     /** spy→:ui 带内手势事件转发（每事件一播，MotionEvent 直塞 extra） */
@@ -301,6 +335,17 @@ object LayoutDefaults {
     /** 常驻扇形默认开关：默认关=现状交互（未预选松手立即收起）。 */
     const val FAN_PERSISTENT_ON_RELEASE = false
 
+    /** 小窗「点击空白处」默认值（2026-10-16）：开关默认关（opt-in，不改系统既有行为）；
+     *  动作默认 mini（缩小/挂起）——三代同名同签名，比 close 可移植，语义也不是"关掉"。 */
+    const val FREEFORM_BLANK_TAP_ENABLED = false
+    const val FREEFORM_BLANK_TAP_MODE_DEFAULT = PrefKeys.FREEFORM_BLANK_TAP_MODE_MINI
+
+    /** 动作档取值顺序 = 设置页下拉的下标映射（**不得在 UI 里内联**该顺序）。 */
+    val FREEFORM_BLANK_TAP_MODE_VALUES = listOf(
+        PrefKeys.FREEFORM_BLANK_TAP_MODE_MINI,
+        PrefKeys.FREEFORM_BLANK_TAP_MODE_CLOSE
+    )
+
     /** 底角斜滑扇形样式默认值：图标沿用竖屏（32dp），半径与数量独立定档（仿 Flyme 大半径
      *  四分之一弧，双环 13 图标不挤在小弧上）。0922 起数量不再跟竖屏联动。
      *  可在底角布局 sheet 独立微调。 */
@@ -336,6 +381,12 @@ object LayoutDefaults {
     const val FAN_FOG_MAX = 0.70f
     const val FAN_FOG_STEP = 0.05f
 
+    /** 扇形压暗过渡时长滑条（ms）：min / max / 步进。默认值=下方 FAN_SCRIM_FADE_MS。
+     *  调的是 scrim **淡入/淡出**时长（不是压暗量——压暗量固定 `FAN_DIM_AMOUNT`，不做滑条）。 */
+    const val FAN_SCRIM_FADE_MIN_MS = 80
+    const val FAN_SCRIM_FADE_MAX_MS = 400
+    const val FAN_SCRIM_FADE_STEP_MS = 20
+
     /**
      * 图标尺寸滑条量程上限：用户"请求"的最大值。**实际可达上限还要受环上弦长约束**
      * （见 LayoutBottomSheet 的动态量程），所以这只是请求上限，不是生效上限。
@@ -360,6 +411,26 @@ object LayoutDefaults {
     const val FAN_FOG_INTENSITY = 0.55f
     const val FAN_DIM_ENABLED = false
     const val FAN_DIM_AMOUNT = 0.24f
+
+    /** scrim 过渡时长默认 300ms（原 `FanMenuCompose.SCRIM_FADE_MS` 内部常量，2026-10-17 改为设置项）。 */
+    const val FAN_SCRIM_FADE_MS = 300
+
+    /**
+     * 底角"斜滑独占"默认**开**（2026-10-17 用户拍板）：底角斜滑时让系统（Home/recents）不再同时响应，
+     * 只出我们的扇形。关闭后回到"系统与模块同时判"的旧行为。推 `persist.hsb.corner.supp`。
+     */
+    const val CORNER_SUPPRESS_ENABLED = true
+
+    /**
+     * "点空白时吞掉触摸（不穿透）"：**默认开**（2026-10-17 用户要求"点空白不能穿透"）。
+     *
+     * 安全性靠两条机制保证（都在 `SystemUiInputSpy`）：
+     * ① **边收边转**：手势一旦越过"轻点"阈值（位移/时长/多指）立刻把缓冲按序注入并转入**实时转发**
+     *    ⇒ 拖动/滚动在原时长内送达，不会像"等抬手整条重放"那样被还原成一次点击；
+     * ② **注入被拒即自动关**：`injectInputEvent` 返回 false ⇒ 立刻永久关掉接管（避免整机被吞）。
+     * 手动回退：`debug.hsb.takeover=0`（或设置里关掉本开关 + 重启 SystemUI）。
+     */
+    const val FREEFORM_BLANK_TAP_TAKEOVER = true
 
     // ===== 板材质（Route D，0915 重构：板材质与「背后像素来源」解耦）=====
     // 板 = miuix textureBlur 单条管线：采样 backdrop（壁纸 / 空）→ 高斯模糊 → 主题混色

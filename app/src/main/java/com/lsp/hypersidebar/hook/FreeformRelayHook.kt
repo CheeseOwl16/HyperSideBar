@@ -39,6 +39,18 @@ class FreeformRelayHook(
     private val strategy = DirectLaunchStrategy(remotePrefs)
     private var registered = false
 
+    /**
+     * 本进程注册的两个接收器 + 注册用的原始 ctx。
+     *
+     * ⚠ **必须存字段**（2026-10-16 热重载审计）：原先第一个是局部 `val receiver`（出了函数就
+     * 只剩 AMS 的 receiver 表持有）、第二个是匿名对象（连局部变量都没有）——热重载时**无处注销**，
+     * 旧代 classloader 被钉住；新代再注册一份就会每次启动转发被处理两遍（fan 启动非幂等：
+     * 一次呼出开两个小窗/两次 startShortcut）。
+     */
+    private var launchReceiver: BroadcastReceiver? = null
+    private var resultReceiver: BroadcastReceiver? = null
+    private var registeredCtx: Context? = null
+
     override fun init() {
         HLog.i(TAG, "=== FreeformRelayHook init ===")
         val hooked = MethodFinder.fromClass("android.app.Application")
@@ -47,28 +59,49 @@ class FreeformRelayHook(
             .firstOrNull()
             ?.createAfterHook {
                 val ctx = it.args[0] as? Context ?: return@createAfterHook
-                registerReceiver(ctx)
-                com.lsp.hypersidebar.anchor.AnchorResolver.completeWithContext(ctx)
-                HLog.i(TAG, "anchor after attach: ${com.lsp.hypersidebar.anchor.AnchorResolver.stateLine()}")
-                // 配置同步通道（批次 2 同款，:ui 补接）：收设置页全量推送，
-                // 总开关/横屏 dwell 等 remotePrefs 读取的实时性不再单靠 LSPosed push
-                com.lsp.hypersidebar.util.ConfigSync.registerHookSide(ctx)
-                // 日志拉取回传（§11.2）：模块 App 请求时回传 HLog 缓冲；:ui 的熔断快照
-                // 在 TurboLayout（同进程），经其伴生句柄取，未初始化时给空快照
-                com.lsp.hypersidebar.util.LogDumpBridge.register(
-                    ctx,
-                    statusProvider = { TurboLayout.breakerSnapshot() },
-                    statsProvider = { com.lsp.hypersidebar.util.StatsRecorder.dump() }
-                )
-                // 数据记录（§11.3）：注入宿主 context（聚合结构落盘宿主本地 prefs）
-                com.lsp.hypersidebar.util.StatsRecorder.init(ctx)
+                armHostSide(ctx, "Application.attach")
             }
         if (hooked == null) {
             HLog.e(TAG, "Application.attach hook failed（B 链路不可用，边缘通道选中将无响应）")
         }
     }
 
-    private fun registerReceiver(context: Context) {
+    /**
+     * 热重载重挂（API 102；与 [releaseForReload] 严格对称）。
+     *
+     * 为什么需要：:ui 的注册体挂在 `Application.attach` 钩子里，而热重载**不重放 attach**
+     * ⇒ 释放后不显式重挂，fan 启动转发 / root 代发结果回告 / 配置同步 / 日志回传会一直死到
+     * 宿主重启（症状：边缘手势选中后小窗不开、设置改了不生效、自检报告 [ui] 段空白）。
+     * 与 attach 路径**共用同一段实现**（[armHostSide]），没有第二份注册代码。
+     */
+    override fun rearmHostSide(ctx: Context) = armHostSide(ctx, "hot reload")
+
+    /** 宿主侧装配的唯一实现：attach（冷启动）与热重载重挂都走这里，全部幂等。 */
+    private fun armHostSide(ctx: Context, via: String) {
+        registerReceiver(ctx, via)
+        runCatching {
+            com.lsp.hypersidebar.anchor.AnchorResolver.completeWithContext(ctx)
+            HLog.i(TAG, "anchor after arm($via): ${com.lsp.hypersidebar.anchor.AnchorResolver.stateLine()}")
+        }.onFailure { HLog.w(TAG, "anchor complete failed: ${it.message}") }
+        // 配置同步通道（批次 2 同款，:ui 补接）：收设置页全量推送，
+        // 总开关/横屏 dwell 等 remotePrefs 读取的实时性不再单靠 LSPosed push
+        runCatching { com.lsp.hypersidebar.util.ConfigSync.registerHookSide(ctx) }
+            .onFailure { HLog.w(TAG, "config sync register failed: ${it.message}") }
+        // 日志拉取回传（§11.2）：模块 App 请求时回传 HLog 缓冲；:ui 的熔断快照
+        // 在 TurboLayout（同进程），经其伴生句柄取，未初始化时给空快照
+        runCatching {
+            com.lsp.hypersidebar.util.LogDumpBridge.register(
+                ctx,
+                statusProvider = { TurboLayout.breakerSnapshot() },
+                statsProvider = { com.lsp.hypersidebar.util.StatsRecorder.dump() }
+            )
+        }.onFailure { HLog.w(TAG, "log dump register failed: ${it.message}") }
+        // 数据记录（§11.3）：注入宿主 context（聚合结构落盘宿主本地 prefs）
+        runCatching { com.lsp.hypersidebar.util.StatsRecorder.init(ctx) }
+            .onFailure { HLog.w(TAG, "stats init failed: ${it.message}") }
+    }
+
+    private fun registerReceiver(context: Context, via: String) {
         if (registered) return
         registered = true
         try {
@@ -160,35 +193,71 @@ class FreeformRelayHook(
                 },
                 Context.RECEIVER_EXPORTED
             )
-            HLog.i(TAG, "ACTION_FAN_LAUNCH/REQUEST_SUGGESTIONS receiver registered (via Application.attach)")
+            launchReceiver = receiver
+            registeredCtx = context
+            HLog.i(TAG, "ACTION_FAN_LAUNCH/REQUEST_SUGGESTIONS receiver registered (via $via)")
             // root 代发结果回告接收器（2026-09-05）：模块 App 执行完代发（su 链）后把
             // 结果发回本进程——失败 toast 到前台（成功静默，只进日志与自检报告）。
             // 校验用 verifyFan 对 :ui 快照（模块 App 是令牌权威，快照即真值）
-            context.registerReceiver(
-                object : BroadcastReceiver() {
-                    override fun onReceive(ctx: Context, intent: Intent) {
-                        if (!RelayToken.verifyFan(intent, RelayToken.read(remotePrefs))) return
-                        val trace = intent.getStringExtra(Trace.EXTRA)
-                        val ok = intent.getBooleanExtra(PrefKeys.RELAY_RESULT_EXTRA_OK, false)
-                        val label = intent.getStringExtra(PrefKeys.RELAY_RESULT_EXTRA_LABEL) ?: ""
-                        val reason = intent.getStringExtra(PrefKeys.RELAY_RESULT_EXTRA_REASON) ?: ""
-                        HLog.i(TAG, "[${trace ?: "-"}] relay result: ok=$ok label=$label reason=$reason")
-                        if (!ok) {
-                            runCatching {
-                                android.widget.Toast.makeText(
-                                    ctx, "快捷方式执行失败：$label（$reason）",
-                                    android.widget.Toast.LENGTH_LONG
-                                ).show()
-                            }
+            val resultRecv = object : BroadcastReceiver() {
+                override fun onReceive(ctx: Context, intent: Intent) {
+                    if (!RelayToken.verifyFan(intent, RelayToken.read(remotePrefs))) return
+                    val trace = intent.getStringExtra(Trace.EXTRA)
+                    val ok = intent.getBooleanExtra(PrefKeys.RELAY_RESULT_EXTRA_OK, false)
+                    val label = intent.getStringExtra(PrefKeys.RELAY_RESULT_EXTRA_LABEL) ?: ""
+                    val reason = intent.getStringExtra(PrefKeys.RELAY_RESULT_EXTRA_REASON) ?: ""
+                    HLog.i(TAG, "[${trace ?: "-"}] relay result: ok=$ok label=$label reason=$reason")
+                    if (!ok) {
+                        runCatching {
+                            android.widget.Toast.makeText(
+                                ctx, "快捷方式执行失败：$label（$reason）",
+                                android.widget.Toast.LENGTH_LONG
+                            ).show()
                         }
                     }
-                },
+                }
+            }
+            context.registerReceiver(
+                resultRecv,
                 IntentFilter(PrefKeys.ACTION_RELAY_RESULT),
                 Context.RECEIVER_EXPORTED
             )
-            HLog.i(TAG, "ACTION_RELAY_RESULT receiver registered (via Application.attach)")
+            resultReceiver = resultRecv
+            HLog.i(TAG, "ACTION_RELAY_RESULT receiver registered (via $via)")
         } catch (e: Throwable) {
             HLog.e(TAG, "receiver registration failed: ${e.message}", e)
         }
+    }
+
+    /**
+     * API 102 热重载释放（旧代退休前由 `XposedInit.onHotReloading` 调用；幂等）。
+     *
+     * 为什么必须：本 hook 在 :ui 进程注册了两个接收器（fan 启动转发端 + root 代发结果回告），
+     * 它们由**宿主 AMS** 持有——不注销，旧代 classloader 回收不了，且新代再注册一份就会
+     * 把同一次广播处理两遍（启动动作非幂等：会开两个小窗 / 两次 startShortcut）。
+     * 同时停掉 :ui 侧的三条共享通道：`ConfigSync`（SYNC 接收器+延迟回推 Runnable）、
+     * `LogDumpBridge`（日志回传接收器）、主线程上排队的回调。
+     * 复位 `registered` 使**同代内**（如锚点晚解析 re-arm 路径）能重新注册。
+     * 任一步失败只 `HLog.w`。
+     */
+    override fun releaseForReload() {
+        runCatching {
+            val c = registeredCtx
+            if (c != null) {
+                launchReceiver?.let { c.unregisterReceiver(it) }
+                resultReceiver?.let { c.unregisterReceiver(it) }
+            }
+        }.onFailure { HLog.w(TAG, "unregister failed: ${it.message}") }
+        launchReceiver = null
+        resultReceiver = null
+        registeredCtx = null
+        registered = false
+        runCatching { mainHandler.removeCallbacksAndMessages(null) }
+            .onFailure { HLog.w(TAG, "handler cleanup failed: ${it.message}") }
+        runCatching { com.lsp.hypersidebar.util.ConfigSync.releaseForReload() }
+            .onFailure { HLog.w(TAG, "config sync release failed: ${it.message}") }
+        runCatching { com.lsp.hypersidebar.util.LogDumpBridge.releaseForReload() }
+            .onFailure { HLog.w(TAG, "log dump release failed: ${it.message}") }
+        HLog.i(TAG, "releaseForReload: relay receivers + config/log channels released")
     }
 }

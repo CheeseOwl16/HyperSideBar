@@ -58,13 +58,11 @@ private val IconFlySpec = spring(
 private val IconAlphaSpec = tween<Float>(durationMillis = 90)
 private val ContentAlphaSpec = tween<Float>(durationMillis = 150)
 private val QuickEnterSpec = tween<Float>(durationMillis = 200, easing = DecelerateEasing(1.5f))
-private val EnterDimSpec = tween<Float>(durationMillis = SCRIM_FADE_MS, easing = SinOutEasing)
 
 // ===== 收拢（exit）：内容层缩向锚点+淡出、scrim 同步淡出，完成回调后宿主摘窗 =====
 // 加速缓动（收=渐快离场）；时长=离场观感与跟手性的折中（交互零延迟：窗口即置不可摸）
 private val ExitScaleSpec = tween<Float>(durationMillis = 150, easing = AccelerateEasing(1.5f))
 private val ExitAlphaSpec = tween<Float>(durationMillis = 120, easing = AccelerateEasing(1.5f))
-private val ExitDimSpec = tween<Float>(durationMillis = 150, easing = SinOutEasing)
 
 /** 图标级联总跨度（按角度归一化分摊）：末枚起飞 ≈120ms，全程 ~320ms 内收束 */
 private const val ICON_STAGGER_SPAN_MS = 120L
@@ -76,8 +74,8 @@ private const val QUICK_ENTER_SLIDE_DP = 20
 /** 收拢终态缩放（缩向锚点，不到 0——配合淡出足够，也避免极端小尺度渲染开销） */
 private const val EXIT_SCALE_FLOOR = 0.55f
 
-/** scrim 淡入时长（独立常量：后续做"压暗过渡"设置项时直接暴露此值） */
-private const val SCRIM_FADE_MS = 300
+/** scrim 淡入/淡出时长由设置项驱动（`PrefKeys.FAN_SCRIM_FADE_MS`，2026-10-17 起可调；
+ *  默认值见 `LayoutDefaults.FAN_SCRIM_FADE_MS`）。缓动=SinOut（雾化渐显/渐隐）。 */
 
 @Composable
 internal fun FanMenuCompose(
@@ -86,6 +84,8 @@ internal fun FanMenuCompose(
     colors: FanThemeColors,
     fogIntensity: Float,
     dimEnabled: Boolean,
+    /** 压暗（scrim）淡入/淡出时长（ms）：进出对称（用户 2026-10-17 拍板"用同一个值"） */
+    scrimFadeMs: Int,
     source: FanBackdropSource,
     wallpaper: android.graphics.Bitmap?,
     wallpaperOffset: IntOffset,
@@ -111,6 +111,13 @@ internal fun FanMenuCompose(
     val arcSweep = remember { Animatable(0f) }
     val quickP = remember { Animatable(0f) }
     val scrimAlpha = remember { Animatable(0f) }
+    // 压暗时长来自设置项（进出对称）：remember(scrimFadeMs) ⇒ 设置改动在下次呼出重组合时生效
+    val enterDimSpec = remember(scrimFadeMs) {
+        tween<Float>(durationMillis = scrimFadeMs, easing = SinOutEasing)
+    }
+    val exitDimSpec = remember(scrimFadeMs) {
+        tween<Float>(durationMillis = scrimFadeMs, easing = SinOutEasing)
+    }
     // 收拢两通道：exitTick 被 host 递增即触发（enterTick 基线=组合进入时刻的 tick，
     // 池化逐呼出重组合 → remember 重置，天然不会误触发）
     val exitScale = remember { Animatable(1f) }
@@ -120,7 +127,7 @@ internal fun FanMenuCompose(
     LaunchedEffect(Unit) {
         launch { contentAlpha.animateTo(1f, ContentAlphaSpec) }
         launch { arcSweep.animateTo(1f, ArcSweepSpec) }
-        launch { scrimAlpha.animateTo(1f, EnterDimSpec) }
+        launch { scrimAlpha.animateTo(1f, enterDimSpec) }
         launch {
             delay(QUICK_ENTER_DELAY_MS)
             quickP.animateTo(1f, QuickEnterSpec)
@@ -132,7 +139,7 @@ internal fun FanMenuCompose(
         joinAll(
             launch { exitScale.animateTo(EXIT_SCALE_FLOOR, ExitScaleSpec) },
             launch { exitAlpha.animateTo(0f, ExitAlphaSpec) },
-            launch { scrimAlpha.animateTo(0f, ExitDimSpec) }
+            launch { scrimAlpha.animateTo(0f, exitDimSpec) }
         )
         onExitFinished()
     }

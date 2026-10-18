@@ -67,7 +67,7 @@ class EdgeGestureHook(
 
     private val breaker = CircuitBreaker(PrefKeys.CIRCUIT_OPEN_HOME, remotePrefs)
 
-    private val fanController: FanMenuController by lazy {
+    private val fanLazy: Lazy<FanMenuController> = lazy {
         FanMenuController(
             remotePrefs,
             BroadcastLaunchStrategy(
@@ -97,6 +97,9 @@ class EdgeGestureHook(
             }
         )
     }
+
+    /** [fanLazy] 的取值入口；释放路径要先判 `isInitialized()`，不能顺手把它初始化出来。 */
+    private val fanController: FanMenuController get() = fanLazy.value
 
     // ===== 单指手势状态（DOWN 重置） =====
     private var downX = 0f
@@ -158,6 +161,19 @@ class EdgeGestureHook(
     private var processorMissingLogged = false
     private var fanSeenThisGesture = false
     private var probeRegistered = false
+
+    /**
+     * 本进程（launcher）注册的三个接收器 + 注册用的 ctx。
+     *
+     * ⚠ **必须存字段**（2026-10-16 热重载审计）：原先探针接收器只存在局部变量里、另外两个是
+     * 匿名对象——热重载时**无处注销**，宿主 AMS 持有的 receiver 会把旧代 classloader 钉住；
+     * 新代再注册一份就会让设置页的一次 ping 收到两个应答、一次快捷方式请求被查询两遍
+     * （manifest 查询是重活，且两个应答会互相覆盖 resultExtras）。
+     */
+    private var probeReceiver: BroadcastReceiver? = null
+    private var manifestShortcutsReceiver: BroadcastReceiver? = null
+    private var shortcutLaunchReceiver: BroadcastReceiver? = null
+    private var registeredCtx: android.content.Context? = null
 
     // ===== 底角斜滑（N1，仅竖屏，opt-in）=====
     // NavStubView.onTouchEvent 入口；CornerTrigger 纯逻辑判定，本类负责消费/呼出。
@@ -262,36 +278,7 @@ class EdgeGestureHook(
             .firstOrNull()
             ?.createAfterHook {
                 val ctx = it.args[0] as? Context ?: return@createAfterHook
-                if (probeRegistered) return@createAfterHook
-                probeRegistered = true
-                try {
-                    val receiver = object : BroadcastReceiver() {
-                        override fun onReceive(c: Context, intent: Intent) {
-                            // 仅应答状态，无任何动作分支；非有序广播无 resultCode 可写
-                            if (isOrderedBroadcast) resultCode = HookProbeState.homeCode()
-                        }
-                    }
-                    ctx.registerReceiver(
-                        receiver, IntentFilter(PrefKeys.PROBE_ACTION_HOME), Context.RECEIVER_EXPORTED
-                    )
-                    HLog.i(TAG, "probe receiver registered (via Application.attach)")
-                    com.lsp.hypersidebar.anchor.AnchorResolver.completeWithContext(ctx)
-                    HLog.i(TAG, "anchor after attach: ${com.lsp.hypersidebar.anchor.AnchorResolver.stateLine()}")
-                    // 配置同步通道（批次 2）：收设置页全量推送，根治 hook 进程死快照
-                    com.lsp.hypersidebar.util.ConfigSync.registerHookSide(ctx)
-                    HLog.i(TAG, "config sync receiver registered (via Application.attach)")
-                    registerManifestShortcutsBridge(ctx)
-                    // 日志拉取回传（§11.2）：模块 App 请求时回传 HLog 缓冲 + 熔断快照
-                    com.lsp.hypersidebar.util.LogDumpBridge.register(
-                        ctx,
-                        statusProvider = { breaker.snapshot() },
-                        statsProvider = { StatsRecorder.dump() }
-                    )
-                    // 数据记录（§11.3）：注入宿主 context（聚合结构落盘宿主本地 prefs）
-                    com.lsp.hypersidebar.util.StatsRecorder.init(ctx)
-                } catch (e: Throwable) {
-                    HLog.e(TAG, "probe receiver registration failed: ${e.message}", e)
-                }
+                armHostSide(ctx, "Application.attach")
             }
         if (hooked == null) {
             HLog.e(TAG, "Application.attach hook failed（状态探针不可用，设置页将显示无应答）")
@@ -299,12 +286,82 @@ class EdgeGestureHook(
     }
 
     /**
+     * 热重载重挂（API 102；与 [releaseForReload] 严格对称）。
+     *
+     * 为什么需要：本进程（launcher）的注册体全挂在 `Application.attach` 钩子里，而热重载
+     * **不重放 attach** ⇒ 释放后若不显式重挂，探针应答 / manifest 快捷方式桥 / startShortcut
+     * 代发 / 配置同步 / 日志回传 / 壁纸监听会一直死到宿主重启。
+     * 与 attach 路径**共用同一段实现**（[armHostSide]），没有第二份注册代码。
+     *
+     * 覆盖范围与 [releaseForReload] 一一对应，另有两条"非资源但同样只在 attach 期做"的装配
+     * （`AnchorResolver.completeWithContext` 的宿主纠正、`StatsRecorder.init` 的 ctx 注入）
+     * 也放进同一段：新代若缺它们，锚点宿主判定与数据记录会静默退化。
+     */
+    override fun rearmHostSide(ctx: Context) = armHostSide(ctx, "hot reload")
+
+    /** 宿主侧装配的唯一实现：attach（冷启动）与热重载重挂都走这里，全部幂等。 */
+    private fun armHostSide(ctx: Context, via: String) {
+        // 注销必须用**同一个 context 实例**（LoadedApk 的 receiver 表以外层 context 为键）：
+        // 本进程三个接收器都用这个 ctx 注册，所以在这里就记下，别等到 probe 那一支里记
+        // （probe 注册失败时也要能注销 manifest/shortcut 那两个）。
+        registeredCtx = ctx
+        // 状态探针接收器（§2.5.4）：设置页对 home 进程发有序 ping（PROBE_ACTION_HOME），
+        // 应答 resultCode（熔断态）。
+        if (!probeRegistered) {
+            probeRegistered = true
+            runCatching {
+                val receiver = object : BroadcastReceiver() {
+                    override fun onReceive(c: Context, intent: Intent) {
+                        // 仅应答状态，无任何动作分支；非有序广播无 resultCode 可写
+                        if (isOrderedBroadcast) resultCode = HookProbeState.homeCode()
+                    }
+                }
+                ctx.registerReceiver(
+                    receiver, IntentFilter(PrefKeys.PROBE_ACTION_HOME), Context.RECEIVER_EXPORTED
+                )
+                probeReceiver = receiver
+                HLog.i(TAG, "probe receiver registered (via $via)")
+            }.onFailure {
+                HLog.e(TAG, "probe receiver registration failed: ${it.message}", it)
+                probeRegistered = false
+            }
+        }
+        runCatching {
+            com.lsp.hypersidebar.anchor.AnchorResolver.completeWithContext(ctx)
+            HLog.i(TAG, "anchor after arm($via): ${com.lsp.hypersidebar.anchor.AnchorResolver.stateLine()}")
+        }.onFailure { HLog.w(TAG, "anchor complete failed: ${it.message}") }
+        // 配置同步通道（批次 2）：收设置页全量推送，根治 hook 进程死快照
+        runCatching {
+            com.lsp.hypersidebar.util.ConfigSync.registerHookSide(ctx)
+            HLog.i(TAG, "config sync receiver registered (via $via)")
+        }.onFailure { HLog.w(TAG, "config sync register failed: ${it.message}") }
+        registerManifestShortcutsBridge(ctx, via)
+        // 日志拉取回传（§11.2）：模块 App 请求时回传 HLog 缓冲 + 熔断快照
+        runCatching {
+            com.lsp.hypersidebar.util.LogDumpBridge.register(
+                ctx,
+                statusProvider = { breaker.snapshot() },
+                statsProvider = { StatsRecorder.dump() }
+            )
+        }.onFailure { HLog.w(TAG, "log dump register failed: ${it.message}") }
+        // 壁纸变更监听（本进程的注册点是 init 的 DataLoader.onReady，异步且依赖数据源就绪；
+        // 释放后不能指望它"早晚会再跑一次"，故在这里显式重挂。只挂监听、不重采壁纸）。
+        runCatching { com.lsp.hypersidebar.util.WallpaperSampler.rearmHostSide(ctx) }
+            .onFailure { HLog.w(TAG, "wallpaper rearm failed: ${it.message}") }
+        // 数据记录（§11.3）：注入宿主 context（聚合结构落盘宿主本地 prefs）
+        runCatching { com.lsp.hypersidebar.util.StatsRecorder.init(ctx) }
+            .onFailure { HLog.w(TAG, "stats init failed: ${it.message}") }
+    }
+
+    /**
      * manifest 快捷方式 launcher 桥（批次 3，2026-09-05 实锤）：LauncherApps.getShortcuts
      * 对非默认桌面抛 SecurityException，而本进程恰是默认桌面（有访问权）。收设置页
      * REQUEST → 查询 → JSON 应答给模块 App 的 ShortcutRelayReceiver（显式组件寻址+
-     * 令牌）。数据仅驱动选择器展示，伪造危害=列表造假，仍按令牌严格校验。
+     * 数据仅驱动选择器展示，伪造危害=列表造假，仍按令牌严格校验。
      */
-    private fun registerManifestShortcutsBridge(ctx: Context) {
+    private fun registerManifestShortcutsBridge(ctx: Context, via: String) {
+        // 幂等：attach（冷启动）与热重载重挂共用本函数，重复进来自会多注册两份接收器
+        if (manifestShortcutsReceiver != null || shortcutLaunchReceiver != null) return
         runCatching {
             ctx.registerReceiver(
                 object : BroadcastReceiver() {
@@ -376,11 +433,11 @@ class EdgeGestureHook(
                             }
                         }.start()
                     }
-                },
+                }.also { manifestShortcutsReceiver = it },
                 IntentFilter(PrefKeys.MANIFEST_SHORTCUTS_REQUEST),
                 Context.RECEIVER_EXPORTED
             )
-            HLog.i(TAG, "manifest shortcuts request receiver registered (via Application.attach)")
+            HLog.i(TAG, "manifest shortcuts request receiver registered (via $via)")
         }.onFailure { HLog.e(TAG, "manifest shortcuts bridge register failed: ${it.message}") }
 
         // 动态/固定快捷方式 startShortcut 代发（2026-09-08）：有序广播进本进程（默认桌面，
@@ -429,12 +486,64 @@ class EdgeGestureHook(
                             pending.finish()
                         }.start()
                     }
-                },
+                }.also { shortcutLaunchReceiver = it },
                 IntentFilter(PrefKeys.SHORTCUT_ID_LAUNCH_REQUEST),
                 Context.RECEIVER_EXPORTED
             )
-            HLog.i(TAG, "shortcut-id launch receiver registered (via Application.attach)")
+            HLog.i(TAG, "shortcut-id launch receiver registered (via $via)")
         }.onFailure { HLog.e(TAG, "shortcut-id launch register failed: ${it.message}") }
+    }
+
+    /**
+     * API 102 热重载释放（旧代退休前由 `XposedInit.onHotReloading` 调用；幂等）。
+     *
+     * 为什么必须：launcher 进程的模块资源有六类全都由宿主长期持有，不会随旧代消失：
+     *  ① 探针接收器（设置页 ping 的应答端）；
+     *  ② manifest 快捷方式查询接收器 + startShortcut 代发接收器；
+     *  ③ [ConfigSync] / [LogDumpBridge] 在本进程注册的接收器；
+     *  ④ [WallpaperSampler] 的壁纸变更接收器；
+     *  ⑤ 扇形悬浮窗（`ComposeFanHost` 的窗口 + Compose composition + lifecycle）；
+     *  ⑥ 停顿定时器 / 待呼出 show / 主线程排队回调（都是**旧代闭包**，不清则旧代
+     *     一直被钉住；停顿定时器尤其危险——旧代定时器到点会去呼出旧代的扇形窗口）。
+     *
+     * 只释放资源与注册，**不动 native**（见 `XposedInit.onHotReloaded` 的说明）。
+     * 任一步失败只 `HLog.w`：释放不完整不该让热重载整体失败。
+     */
+    override fun releaseForReload() {
+        // 定时器与待执行回调（先撤，避免释放过程中被旧代回调打断）
+        runCatching {
+            cancelPendingShow()
+            cancelStallTimer()
+            stallTimerHandler?.removeCallbacksAndMessages(null)
+            mainHandler.removeCallbacksAndMessages(null)
+        }.onFailure { HLog.w(TAG, "timer cleanup failed: ${it.message}") }
+        // 本进程注册的接收器
+        runCatching {
+            val c = registeredCtx
+            if (c != null) {
+                probeReceiver?.let { c.unregisterReceiver(it) }
+                manifestShortcutsReceiver?.let { c.unregisterReceiver(it) }
+                shortcutLaunchReceiver?.let { c.unregisterReceiver(it) }
+            }
+        }.onFailure { HLog.w(TAG, "receiver unregister failed: ${it.message}") }
+        probeReceiver = null
+        manifestShortcutsReceiver = null
+        shortcutLaunchReceiver = null
+        registeredCtx = null
+        probeRegistered = false
+        // 共享通道（本进程各自注册了一份）
+        runCatching { com.lsp.hypersidebar.util.ConfigSync.releaseForReload() }
+            .onFailure { HLog.w(TAG, "config sync release failed: ${it.message}") }
+        runCatching { com.lsp.hypersidebar.util.LogDumpBridge.releaseForReload() }
+            .onFailure { HLog.w(TAG, "log dump release failed: ${it.message}") }
+        runCatching { com.lsp.hypersidebar.util.WallpaperSampler.releaseForReload() }
+            .onFailure { HLog.w(TAG, "wallpaper release failed: ${it.message}") }
+        // 扇形悬浮窗：窗口/composition 都绑在旧代 classloader 上。控制器若从未初始化过
+        // 就不要在这里把它初始化出来（isInitialized 判定）。
+        runCatching {
+            if (fanLazy.isInitialized()) fanLazy.value.releaseForReload()
+        }.onFailure { HLog.w(TAG, "fan controller release failed: ${it.message}") }
+        HLog.i(TAG, "releaseForReload: receivers/timers/fan window released (launcher)")
     }
 
     /** 记录层：触摸流入口，BeforeHook。返回 true = 消费（拦截原生处理）。 */
@@ -1107,8 +1216,15 @@ class EdgeGestureHook(
     }
 
     private fun cancelPendingShow() {
+        val hadPending = pendingShow != null
         pendingShow?.let { mainHandler.removeCallbacks(it) }
         pendingShow = null
+        // 判据（2026-10-17 用户口径）：极快抡（起手到抬手 ~24–50ms）本来就可能是误触 ⇒ 保持
+        // "不落地"的现状，但留一行能对账的证据，免得"为什么快滑没反应"只能靠猜。
+        if (hadPending && lastDownTime > 0L) {
+            val dur = android.os.SystemClock.uptimeMillis() - lastDownTime
+            if (dur < 120L) HLog.i(TAG, "early-release dur=${dur}ms（视为误触：抬手早于扇形落地）")
+        }
     }
 
     // ===== 停顿定时器（13.1）：确认挂上 → 速度超阈值重启 → UP/滑回/重置取消 → 到点开火 =====

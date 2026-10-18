@@ -38,8 +38,11 @@ object GestureThresholds {
      * SystemUiInputSpy（OS4 spy 粗筛 + sysCorner 判定）、CornerGeomBridge（推 native 几何）。
      */
     const val CORNER_WIDTH_RATIO = 0.12f
-    const val CORNER_MIN_ANGLE_DEG = 25f
-    const val CORNER_MAX_ANGLE_DEG = 65f
+    // 2026-10-17 放宽（用户实测反馈"呼出的角度可以适当宽一些"）：原 [25,65]（锥宽 40°）收得太紧，
+    // 斜滑稍偏就出锥；现 [15,75]（锥宽 60°，对 45° 对称）。放宽的代价是更容易把"斜向拖页"
+    // 误判成角滑，仍由 CORNER_INWARD_MIN_DP 的**幅度**下限兜底（角度是方向量、不含幅度）。
+    const val CORNER_MIN_ANGLE_DEG = 15f
+    const val CORNER_MAX_ANGLE_DEG = 75f
 
     /**
      * 内滑绝对量下限（dp，2026-10-01 新增）：角度是纯方向量不含幅度——起手贴边+
@@ -65,6 +68,22 @@ object GestureThresholds {
 
     /** 竖直判定余量（度）：deg > 锥上限+此值 连续 N 帧 = 明确竖直意图 → 重放透传。 */
     const val CORNER_ABANDON_EXTRA_DEG = 3f
+
+    /**
+     * 小窗「点击空白处」的 tap 判据（2026-10-16，三代 ROM 通用）。
+     *
+     * 语义：小窗打开时，在小窗**之外**的空白处轻点一下 ⇒ 缩小/关闭这个小窗。
+     * 检测走 SystemUiInputSpy 已有的全局 monitor 通道（它看得到全部触摸），本组常量只
+     * 定义"什么算一次轻点"——判定核是纯 JVM 的 `hook/BlankTapDetector.kt`。
+     *
+     * 为什么是这两个值：
+     * - `SLOP_DP = 12`：与 `CORNER_INWARD_MIN_DP` 同量级，指按住时的手抖/微漂上限；
+     *   超过就不是"点"而是"拖"（拖动是用户在小窗外做其它事，绝不能误收小窗）。
+     * - `MAX_MS = 300`：与 Android `ViewConfiguration.getLongPressTimeout()`(500ms) 拉开
+     *   距离，保证长按不会被当成点。两者都是"宁可不动作，也不误动作"的方向。
+     */
+    const val BLANK_TAP_SLOP_DP = 12f
+    const val BLANK_TAP_MAX_MS = 300L
 
     /** 底角热区高度（dp）：三 ROM 统一用本值（原 OS2/3 的 `NavStubView.getHotSpaceHeight()`
      *  反射已于 2026-10-16 删除——实测该 ROM 值=25dp，与默认值相同，而 OS4 spy 一直用常量；

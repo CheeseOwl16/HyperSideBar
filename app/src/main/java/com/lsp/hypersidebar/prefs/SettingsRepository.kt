@@ -92,6 +92,23 @@ class SettingsRepository(val prefs: SharedPreferences) {
 
     fun deadZone(): Float = prefs.getFloat(PrefKeys.DEAD_ZONE, LayoutDefaults.DEAD_ZONE)
     fun triggerDwellMs(): Int = prefs.getInt(PrefKeys.TRIGGER_DWELL_MS, LayoutDefaults.TRIGGER_DWELL_MS)
+
+    /** 扇形压暗过渡时长（ms）：draft-aware（布局页滑条即时预览，未保存前跟随草稿）。 */
+    fun fanScrimFadeMs(): Int = getDraft(PrefKeys.FAN_SCRIM_FADE_MS) {
+        prefs.getInt(PrefKeys.FAN_SCRIM_FADE_MS, LayoutDefaults.FAN_SCRIM_FADE_MS)
+    }
+
+    /** 底角"斜滑独占"开关：draft-aware（底角 sheet 内开关与样式"✕全撤/✓全存"同步）。 */
+    fun cornerSuppressEnabled(): Boolean = getDraft(PrefKeys.CORNER_SUPPRESS_ENABLED) {
+        prefs.getBoolean(PrefKeys.CORNER_SUPPRESS_ENABLED, LayoutDefaults.CORNER_SUPPRESS_ENABLED)
+    }
+
+    /** "点空白吞掉触摸"开关（默认关；抢流会干扰正常拖动 ⇔ 真机反馈，见键注释）。 */
+    fun freeformTakeoverEnabled(): Boolean = getDraft(PrefKeys.FREEFORM_BLANK_TAP_TAKEOVER) {
+        prefs.getBoolean(
+            PrefKeys.FREEFORM_BLANK_TAP_TAKEOVER, LayoutDefaults.FREEFORM_BLANK_TAP_TAKEOVER
+        )
+    }
     fun triggerMinDistanceDp(): Float =
         prefs.getFloat(PrefKeys.TRIGGER_MIN_DISTANCE, LayoutDefaults.TRIGGER_MIN_DISTANCE_DP)
 
@@ -112,6 +129,16 @@ class SettingsRepository(val prefs: SharedPreferences) {
     /** 常驻扇形开关（呼出后松手不收起，点选交互；13.1 同批新增）。 */
     fun fanPersistentOnRelease(): Boolean =
         prefs.getBoolean(PrefKeys.FAN_PERSISTENT_ON_RELEASE, LayoutDefaults.FAN_PERSISTENT_ON_RELEASE)
+
+    /** 小窗「点击空白处」开关与动作档（2026-10-16）。动作档做了白名单校验：
+     *  取到不在契约里的值一律回落默认（防旧键/手改 prefs 把动作层带进未定义分支）。 */
+    fun freeformBlankTapEnabled(): Boolean =
+        prefs.getBoolean(PrefKeys.FREEFORM_BLANK_TAP_ENABLED, LayoutDefaults.FREEFORM_BLANK_TAP_ENABLED)
+
+    fun freeformBlankTapMode(): String =
+        prefs.getString(PrefKeys.FREEFORM_BLANK_TAP_MODE, LayoutDefaults.FREEFORM_BLANK_TAP_MODE_DEFAULT)
+            ?.takeIf { it in LayoutDefaults.FREEFORM_BLANK_TAP_MODE_VALUES }
+            ?: LayoutDefaults.FREEFORM_BLANK_TAP_MODE_DEFAULT
 
     /** 背景模糊来源（auto / dialog / wallpaper / behind / off）；非法或缺失值一律回 auto */
     fun fanBlurSource(): String =
@@ -201,9 +228,20 @@ class SettingsRepository(val prefs: SharedPreferences) {
             putFloat(PrefKeys.TRIGGER_MIN_DISTANCE, LayoutDefaults.TRIGGER_MIN_DISTANCE_DP)
             putBoolean(PrefKeys.CORNER_SWIPE_ENABLED, LayoutDefaults.CORNER_SWIPE_ENABLED)
             putBoolean(PrefKeys.FAN_PERSISTENT_ON_RELEASE, LayoutDefaults.FAN_PERSISTENT_ON_RELEASE)
+            putBoolean(PrefKeys.FREEFORM_BLANK_TAP_ENABLED, LayoutDefaults.FREEFORM_BLANK_TAP_ENABLED)
+            putString(PrefKeys.FREEFORM_BLANK_TAP_MODE, LayoutDefaults.FREEFORM_BLANK_TAP_MODE_DEFAULT)
             putFloat(PrefKeys.FAN_FOG_INTENSITY, LayoutDefaults.FAN_FOG_INTENSITY)
             putBoolean(PrefKeys.FAN_DIM_ENABLED, LayoutDefaults.FAN_DIM_ENABLED)
+            putInt(PrefKeys.FAN_SCRIM_FADE_MS, LayoutDefaults.FAN_SCRIM_FADE_MS)
+            putBoolean(PrefKeys.CORNER_SUPPRESS_ENABLED, LayoutDefaults.CORNER_SUPPRESS_ENABLED)
+            putBoolean(PrefKeys.FREEFORM_BLANK_TAP_TAKEOVER, LayoutDefaults.FREEFORM_BLANK_TAP_TAKEOVER)
             putString(PrefKeys.FAN_BLUR_SOURCE, LayoutDefaults.FAN_BLUR_SOURCE_DEFAULT)
+            // 孤儿键清理（2026-10-17）：这四个是已删除的底角滑条的键（`GestureThresholds` 常量取代），
+            // 设备上的旧值不再被任何代码读写；"恢复默认"顺手删掉，避免留成永久垃圾。
+            remove("cornerWidthRatio")
+            remove("cornerHotPercent")
+            remove("cornerMinAngleDeg")
+            remove("cornerMaxAngleDeg")
         }.apply()
         // 同上：批量写不走 savePref，显式推一次
         com.lsp.hypersidebar.util.ConfigSync.notifyConfigChanged("(restoreAllDefaults)")

@@ -40,6 +40,13 @@ object RelayGestureSink {
     @Volatile private var appCtx: Context? = null
     @Volatile private var owner: TurboLayout? = null
 
+    /**
+     * spy 流转发接收器：**原先匿名注册（无处注销）**——它由宿主 AMS 持有，热重载下会把
+     * 旧代 classloader 钉住；而新代再注册一份就会把同一条转发流喂给两代状态机
+     * （条上/底角判定各跑两遍，是"两个扇形"级别的错误）。
+     */
+    @Volatile private var streamReceiver: BroadcastReceiver? = null
+
     /** 当前转发流的手势五要素快照（DOWN 时写入；底角线 [requestPilfer] 的身份匹配用） */
     @Volatile private var streamDownTime: Long = 0L
     @Volatile private var streamDeviceId: Int = -1
@@ -67,6 +74,18 @@ object RelayGestureSink {
         }.onFailure { HLog.w(TAG, "arm failed: ${it.message}") }
     }
 
+    /**
+     * 热重载重挂（API 102；与 [releaseForReload] 严格对称）。
+     *
+     * 为什么需要：本 sink 的接收器挂在**它自己的** `Application.attach` 钩子里（[arm] 装的），
+     * 热重载不重放 attach ⇒ 释放后 :ui 收不到 spy 转发的流，竖屏条上/底角触发整体失效。
+     * 由 [TurboLayout.rearmHostSide] 转发（同进程同代，新代的 `arm(this)` 已把 owner 接回来）。
+     * [register] 自身幂等（`registered` 守卫），且会重设 [appCtx]（`requestPilfer` 要用）。
+     */
+    fun rearmHostSide(ctx: Context) {
+        register(ctx)
+    }
+
     private fun register(ctx: Context) {
         if (registered) return
         registered = true
@@ -74,23 +93,52 @@ object RelayGestureSink {
         // 仍为 null（LoadedApk 未挂完）——1005 实锤 register NPE，SystemUiInputSpy 同款教训
         appCtx = ctx
         runCatching {
-            ctx.registerReceiver(
-                object : BroadcastReceiver() {
-                    override fun onReceive(c: Context, intent: Intent) {
-                        val ev = intent.getParcelableExtra<MotionEvent>(PrefKeys.SPY_EXTRA_EVENT)
-                            ?: return
-                        try {
-                            dispatch(c, intent, ev)
-                        } finally {
-                            ev.recycle()
-                        }
+            val recv = object : BroadcastReceiver() {
+                override fun onReceive(c: Context, intent: Intent) {
+                    val ev = intent.getParcelableExtra<MotionEvent>(PrefKeys.SPY_EXTRA_EVENT)
+                        ?: return
+                    try {
+                        dispatch(c, intent, ev)
+                    } finally {
+                        ev.recycle()
                     }
-                },
+                }
+            }
+            ctx.registerReceiver(
+                recv,
                 IntentFilter(PrefKeys.SPY_STREAM_ACTION),
                 Context.RECEIVER_EXPORTED
             )
+            streamReceiver = recv
             HLog.i(TAG, "spy stream sink registered (OS4 恒开，b2Enabled 门控)")
         }.onFailure { HLog.w(TAG, "register failed: ${it.message}") }
+    }
+
+    /**
+     * API 102 热重载释放（由 [TurboLayout.releaseForReload] 调用；幂等）。
+     *
+     * 为什么必须：本 object 在 :ui 进程注册了一个 spy 流转发接收器——宿主 AMS 持有它，
+     * 不注销则旧代 classloader 回收不了；新代再注册一份会让**同一条转发流**同时喂给
+     * 两代状态机（§7 铁律"判定逻辑单源"被破坏，症状是重复呼出）。
+     * 复位 `armed`/`owner` 使同代内可重新 [arm]（新代由 `installFor(UI)` → TurboLayout.init
+     * 重新 arm，或同代重启路径重新挂）。
+     * 任一步失败只 `HLog.w`。
+     */
+    fun releaseForReload() {
+        runCatching {
+            val r = streamReceiver
+            val c = appCtx
+            if (r != null && c != null) c.unregisterReceiver(r)
+        }.onFailure { HLog.w(TAG, "unregister failed: ${it.message}") }
+        streamReceiver = null
+        registered = false
+        armed = false
+        owner = null
+        appCtx = null
+        // 流身份快照清零：旧代的过期 requestPilfer 不该再撞新代的手势
+        streamDownTime = 0L
+        streamCorner = false
+        HLog.i(TAG, "releaseForReload: spy stream sink released")
     }
 
     private fun dispatch(c: Context, intent: Intent, ev: MotionEvent) {

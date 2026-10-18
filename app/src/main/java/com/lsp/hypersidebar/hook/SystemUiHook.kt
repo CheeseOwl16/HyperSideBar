@@ -54,6 +54,20 @@ class SystemUiHook(private val prefs: SharedPreferences) : BaseHook() {
 
     @Volatile private var exemptionMissingLogged = false
 
+    /**
+     * QS 点击接收器 + 注册用的原始 ctx：**原先匿名注册（引用只存在 AMS 的 receiver 表里）
+     * ⇒ 热重载时无处注销**——AMS 持有的 receiver 就是旧代的匿名类，旧 classloader 因此
+     * 回收不了；新代再注册一份则同一次点击被两代各处理一遍（磁贴 click 非幂等）。
+     */
+    @Volatile private var clickReceiver: BroadcastReceiver? = null
+    @Volatile private var clickCtx: Context? = null
+
+    /**
+     * 点击后的投递诊断 Handler：原先在 [scheduleClick] 里每次 new 一个，那个延迟 800ms 的
+     * Runnable 是旧代闭包且**没人能撤**。收敛成一个字段，热重载时可以整体 `removeCallbacksAndMessages`。
+     */
+    private val clickHandler = Handler(Looper.getMainLooper())
+
     override fun init() {
         // 结构化锚点解析（每宿主进程一次）：本宿主建表并写日志（自检报告经三进程日志尾回收，
         // 见 SelfCheck / LogCollector）。SystemUI 本轮只建表，不做 hook 门控 ——
@@ -61,9 +75,38 @@ class SystemUiHook(private val prefs: SharedPreferences) : BaseHook() {
         runCatching { com.lsp.hypersidebar.anchor.AnchorResolver.resolveAll(prefs) }
             .onFailure { HLog.w(TAG, "anchor resolve failed: ${it.message}") }
         HLog.i(TAG, "anchor: ${com.lsp.hypersidebar.anchor.AnchorResolver.stateLine()}")
+        // IME 权威事件源：**进程启动期**就装（早于 WMShell 的 Dagger 建图 ⇒ `PerDisplay` 构造器
+        // 钩子能捕到实例，冷启动拉取路才可用）。见 InsetProbe.installWmShellHooksEagerly。
+        runCatching { com.lsp.hypersidebar.hook.InsetProbe.installWmShellHooksEagerly() }
+            .onFailure { HLog.w(TAG, "wmshell ime eager install failed: ${it.message}") }
         hookAdapterStash()
         hookClickReceiver()
+        // 小窗「点击空白处」动作层（2026-10-16）：ROM 耦合（MulWinSwitchEventHandler /
+        // MiuiFreeformModeController）全在这个子 hook 里；它锚点未命中时 present=false，
+        // spy 侧的判定（SystemUiInputSpy.maybeBlankTap）自然什么都不做（功能静默关闭）。
+        // 实例只建一次：init() 在新代重装时会重跑（XposedInit 每次热重载重建本 hook 实例，
+        // 所以这里的 null 守卫实际只防同代重复 init）。
+        if (freeformTapHook == null) {
+            freeformTapHook = FreeformBlankTapHook(prefs)
+        }
+        // 子 hook 自己装（XposedInit.initHooks 是私有的，这里照它的口径：isInit 守卫 + 打点）
+        val tap = freeformTapHook
+        if (tap != null && !tap.isInit) {
+            runCatching {
+                tap.init()
+                tap.isInit = true
+                HLog.i(TAG, "Hook [${tap.name}] registered OK")
+            }.onFailure {
+                // current 的 setter 是 private（companion 内部维护），这里不复位：
+                // init() 里 prime() 全部 runCatching 吞异常，失败时 available=false，
+                // spy 侧的 isBlank/perform 照样 fail-closed（不误触发动作）。
+                HLog.w(TAG, "freeform blank-tap hook install failed: ${it.message}")
+            }
+        }
     }
+
+    /** 小窗「点击空白处」动作层（见 init 的注释）。 */
+    private var freeformTapHook: FreeformBlankTapHook? = null
 
     private fun hookAdapterStash() {
         // 类解析必须走宿主 classloader（EzXHelper ClassLoaderProvider）——
@@ -135,56 +178,148 @@ class SystemUiHook(private val prefs: SharedPreferences) : BaseHook() {
             .firstOrNull()
             ?.createAfterHook {
                 val ctx = it.args[0] as? Context ?: return@createAfterHook
-                ctx.registerReceiver(
-                    object : BroadcastReceiver() {
-                        override fun onReceive(c: Context, intent: Intent) {
-                            // 严格令牌校验：点击可切换任意 QS 开关（含 VPN），无令牌一律拒绝
-                            val expected = RelayToken.read(prefs)
-                            val got = intent.getStringExtra(PrefKeys.RELAY_LAUNCH_EXTRA_TOKEN)
-                            if (expected.isNullOrEmpty() || got != expected) {
-                                HLog.w(TAG, "qs tile click rejected: bad token")
-                                return
-                            }
-                            val cn = intent.getStringExtra(PrefKeys.QS_TILE_CLICK_EXTRA)
-                                ?.let { ComponentName.unflattenFromString(it) } ?: return
-                            val prebind = intent.getBooleanExtra(PrefKeys.QS_TILE_PREBIND_EXTRA, false)
-                            if (isOrderedBroadcast) resultCode = resolveAndClick(c, cn, prebind)
-                        }
-                    },
-                    IntentFilter(PrefKeys.QS_TILE_CLICK_ACTION),
-                    Context.RECEIVER_EXPORTED
-                )
-                HLog.i(TAG, "qs tile click receiver registered (via Application.attach)")
-                    com.lsp.hypersidebar.anchor.AnchorResolver.completeWithContext(ctx)
-                    HLog.i(TAG, "anchor after attach: ${com.lsp.hypersidebar.anchor.AnchorResolver.stateLine()}")
-                // 日志回传接收器（09-27 修复观测盲区）：此前只有 launcher/:ui 注册了
-                // LogDumpBridge，**SystemUI 进程的日志永远收不到** —— 自检报告里磁贴通道
-                // 等于全盲（27 日报告：[ui] 段是 securitycenter:ui，SystemUiHook 的日志
-                // 一行都没有，无法判断 hook 是否加载、适配器是否解析成功、点击走到哪一档）。
-                // 本进程不注册 CircuitBreaker/StatsRecorder，只回传 HLog 缓冲。
-                runCatching { LogDumpBridge.register(ctx) }
-                    .onFailure { HLog.w(TAG, "log dump register failed: ${it.message}") }
-                // ConfigSync 活同步（1007 教训）：本进程此前只有"启动快照"——装包+连续
-                // 重启的时序里快照可能读到陈旧门控值（162021 导出：cornerSwipe
-                // 服务端真值 true，spy 却整窗零转发；重启宿主自愈）。挂上 hook 侧接收器
-                // 后门控值随设置页改动实时生效，快照陈旧自愈（:ui 同款机制）。
-                runCatching { com.lsp.hypersidebar.util.ConfigSync.registerHookSide(ctx) }
-                    .onFailure { HLog.w(TAG, "config sync register failed: ${it.message}") }
+                armHostSide(ctx, "Application.attach")
                 // 总闸「框架推送」（2026-10-14）已删除：真机证明 system uid 也写不进
                 // `persist.hsb.native.hook`（NativeProbe.nativeSetProp 回 rc=-1/readback=0，
                 // SystemProperties.set 抛 RuntimeException），而 fail-open 下"写 1"是空操作
                 // ⇒ 总闸只有模块 App 写文件 marker 这一条路（NativeGateBridge）。
                 // B1 spy（os4-trigger-final-plan §6）：observe-only 输入观察副本。
                 // 挂在 attach（有 context）而非 init——MiuiBackGestureHook 实锤
-                // monitorGestureInput 须从 context 的 InputManager 服务实例发起
+                // monitorGestureInput 须从 context 的 InputManager 服务实例发起。
+                // ⚠ 只在**冷启动**这里首建：热重载路径不重放 attach，spy 由
+                // `XposedInit.onHotReloaded` 单独重起（见 rearmHostSide 注释）——
+                // 所以这行不进 [armHostSide]。
                 runCatching { SystemUiInputSpy.start(ctx, prefs) }
                     .onFailure { HLog.w(TAG, "input spy start failed: ${it.message}") }
-                // B2-2：抢占指令接收端（:ui 底角 SHOW → 五要素匹配 → pilfer）。
-                // 2026-10-13（用户 m03028）起只服务**底角线**：条上（竖屏触发带）那条是给
-                // native 的冗余兜底、会打断 native 停顿判定链，已删除调用。
-                runCatching { SystemUiInputSpy.registerPilferReceiver(ctx, prefs) }
-                    .onFailure { HLog.w(TAG, "pilfer receiver register failed: ${it.message}") }
+                // IME 高度探针（2026-10-17）：隐藏 API 全断 ⇒ 用 1×1 透明窗口收 WindowInsets 读
+                // `Type.ime().bottom`（见 InsetProbe 注释）。只在冷启动首建，幂等。
+                runCatching { InsetProbe.start(ctx) }
+                    .onFailure { HLog.w(TAG, "inset probe start failed: ${it.message}") }
+                // IME insets 钩子在 InsetProbe 里（installInsetsHook + WMShell 事件源，
+                // 2026-10-17）。注意区分两个真实存在的坑：
+                //  - **热重载**不会重新加载新 dex 类 ⇒ 新加的类在新代里日志全无，要重启设备
+                //    （docs/adaptation/freeform-blank-tap-scheme.md:322 实证）；
+                //  - `install -r` + 重启宿主**会**加载新类 —— "新类永不生效"是未证实的说法。
+                // 所以钩子装在哪（新类 or 已加载类）不影响正确性，只影响热重载时的可观测性。
             }
+    }
+
+    /**
+     * 热重载重挂（API 102；与 [releaseForReload] 严格对称）。
+     *
+     * 为什么需要：本进程的注册体都挂在 `Application.attach` 钩子里，而热重载**不重放 attach**
+     * ⇒ 释放后若不显式重挂，QS 点击 / 配置同步 / 日志回传 / pilfer 全部到宿主重启前失效。
+     *
+     * 与 attach 路径**共用同一段实现**（[armHostSide]），没有第二份注册代码。
+     * ⚠ 例外：spy 的 `start()` 由 `XposedInit.onHotReloaded` 单独调用（它是 object 单例、
+     * 不属本 hook 的装配面），故不在这里重起，只重挂它的 pilfer 接收器。
+     * ⚠ LogCollector 不在重挂面内：它是**模块 App 进程**的日志归档端（`LOG_DUMP_REPLY`
+     * 定向到模块包），hook 进程从不注册它——[releaseForReload] 里的转发是防御性空操作，
+     * 这里对称地不重挂（在 hook 进程注册它只会凭空多一个永远收不到东西的接收器）。
+     */
+    override fun rearmHostSide(ctx: Context) = armHostSide(ctx, "hot reload")
+
+    /** 宿主侧装配的唯一实现：attach（冷启动）与热重载重挂都走这里，全部幂等。 */
+    private fun armHostSide(ctx: Context, via: String) {
+        // QS 点击接收器
+        if (clickReceiver == null) {
+            clickCtx = ctx
+            runCatching {
+                val recv = object : BroadcastReceiver() {
+                    override fun onReceive(c: Context, intent: Intent) {
+                        // 严格令牌校验：点击可切换任意 QS 开关（含 VPN），无令牌一律拒绝
+                        val expected = RelayToken.read(prefs)
+                        val got = intent.getStringExtra(PrefKeys.RELAY_LAUNCH_EXTRA_TOKEN)
+                        if (expected.isNullOrEmpty() || got != expected) {
+                            HLog.w(TAG, "qs tile click rejected: bad token")
+                            return
+                        }
+                        val cn = intent.getStringExtra(PrefKeys.QS_TILE_CLICK_EXTRA)
+                            ?.let { ComponentName.unflattenFromString(it) } ?: return
+                        val prebind = intent.getBooleanExtra(PrefKeys.QS_TILE_PREBIND_EXTRA, false)
+                        if (isOrderedBroadcast) resultCode = resolveAndClick(c, cn, prebind)
+                    }
+                }
+                ctx.registerReceiver(
+                    recv,
+                    IntentFilter(PrefKeys.QS_TILE_CLICK_ACTION),
+                    Context.RECEIVER_EXPORTED
+                )
+                clickReceiver = recv
+                HLog.i(TAG, "qs tile click receiver registered (via $via)")
+            }.onFailure {
+                HLog.w(TAG, "qs tile click receiver register failed: ${it.message}")
+                clickCtx = null
+            }
+        }
+        runCatching {
+            com.lsp.hypersidebar.anchor.AnchorResolver.completeWithContext(ctx)
+            HLog.i(TAG, "anchor after arm($via): ${com.lsp.hypersidebar.anchor.AnchorResolver.stateLine()}")
+        }.onFailure { HLog.w(TAG, "anchor complete failed: ${it.message}") }
+        // 日志回传接收器（09-27 修复观测盲区）：此前只有 launcher/:ui 注册了
+        // LogDumpBridge，**SystemUI 进程的日志永远收不到** —— 自检报告里磁贴通道
+        // 等于全盲（27 日报告：[ui] 段是 securitycenter:ui，SystemUiHook 的日志
+        // 一行都没有，无法判断 hook 是否加载、适配器是否解析成功、点击走到哪一档）。
+        // 本进程不注册 CircuitBreaker/StatsRecorder，只回传 HLog 缓冲。
+        runCatching { LogDumpBridge.register(ctx) }
+            .onFailure { HLog.w(TAG, "log dump register failed: ${it.message}") }
+        // ConfigSync 活同步（1007 教训）：本进程此前只有"启动快照"——装包+连续
+        // 重启的时序里快照可能读到陈旧门控值（162021 导出：cornerSwipe
+        // 服务端真值 true，spy 却整窗零转发；重启宿主自愈）。挂上 hook 侧接收器
+        // 后门控值随设置页改动实时生效，快照陈旧自愈（:ui 同款机制）。
+        // 热重载重挂顺带重发一次 ACTION_REQUEST（registerHookSide 内建）⇒ 立即拉一次最新配置。
+        runCatching { com.lsp.hypersidebar.util.ConfigSync.registerHookSide(ctx) }
+            .onFailure { HLog.w(TAG, "config sync register failed: ${it.message}") }
+        // B2-2：抢占指令接收端（:ui 底角 SHOW → 五要素匹配 → pilfer）。
+        // 2026-10-13（用户 m03028）起只服务**底角线**：条上（竖屏触发带）那条是给
+        // native 的冗余兜底、会打断 native 停顿判定链，已删除调用。
+        runCatching { SystemUiInputSpy.registerPilferReceiver(ctx, prefs) }
+            .onFailure { HLog.w(TAG, "pilfer receiver register failed: ${it.message}") }
+    }
+
+    /**
+     * API 102 热重载释放（旧代退休前由 `XposedInit.onHotReloading` 调用；幂等）。
+     *
+     * 为什么必须：本 hook 是 SystemUI 进程里模块资源的**总装点**，它代表的四类东西全部
+     * 由宿主长期持有、不会随旧代消失：
+     *  ① QS 点击接收器（AMS 的 receiver 表持有 → 旧 classloader 回收不了；重复注册=一次点击
+     *     被两代各点一遍）；
+     *  ② [LogDumpBridge] / [ConfigSync] 的接收器（本进程注册的那一份，同上）；
+     *  ③ [SystemUiInputSpy] 的 monitorInput spy（InputChannel/receiver 挂在 native 侧）——
+     *     不 dispose 就与热重载后新代那份**同时存在**两份（Verification B5 的判据）；
+     *  ④ 主线程上排队的点击投递诊断回调（旧代闭包）。
+     *
+     * 只释放"注册/资源"：不动 `hostAdapter`（宿主 dagger 单例，旧代实例随 classloader 一起
+     * 退休，新代初始化时会自己 stash 一次），也不动 native（见 `XposedInit.onHotReloaded`）。
+     * 任一步失败只 `HLog.w`——释放失败不该让热重载整体失败（框架仍会换代）。
+     */
+    override fun releaseForReload() {
+        runCatching {
+            val r = clickReceiver
+            val c = clickCtx
+            if (r != null && c != null) c.unregisterReceiver(r)
+        }.onFailure { HLog.w(TAG, "click receiver unregister failed: ${it.message}") }
+        clickReceiver = null
+        clickCtx = null
+        runCatching { clickHandler.removeCallbacksAndMessages(null) }
+            .onFailure { HLog.w(TAG, "click handler cleanup failed: ${it.message}") }
+        runCatching { SystemUiInputSpy.releaseForReload() }
+            .onFailure { HLog.w(TAG, "spy release failed: ${it.message}") }
+        // 子 hook 不注册任何宿主侧通道（无接收器），因此只需释放在新代里会失效的缓存：
+        // 反射句柄缓存、present 标志、退出竞态状态（见 FreeformBlankTapHook.releaseForReload）。
+        // 新代首次用到时按需重新探测，无需 rearm。
+        runCatching { freeformTapHook?.releaseForReload() }
+            .onFailure { HLog.w(TAG, "freeform blank-tap release failed: ${it.message}") }
+        freeformTapHook = null
+        runCatching { LogDumpBridge.releaseForReload() }
+            .onFailure { HLog.w(TAG, "log dump release failed: ${it.message}") }
+        runCatching { com.lsp.hypersidebar.util.ConfigSync.releaseForReload() }
+            .onFailure { HLog.w(TAG, "config sync release failed: ${it.message}") }
+        // LogCollector 注册在模块 App 进程（自检/日志页），本进程一般没注册它；入口是按
+        // "模块侧自检链在同一热重载里退役"的口径一并调的，幂等、未注册即空操作。
+        runCatching { com.lsp.hypersidebar.util.LogCollector.releaseForReload() }
+            .onFailure { HLog.w(TAG, "log collector release failed: ${it.message}") }
+        HLog.i(TAG, "releaseForReload: click/spy/log/config channels released")
     }
 
     /**
@@ -213,7 +348,15 @@ class SystemUiHook(private val prefs: SharedPreferences) : BaseHook() {
             if (adapterClass == null) {
                 HLog.w(TAG, "adapter unavailable: no candidate passed the contract check (ROM drift?)")
                 return null
-            }            // 到这里说明：类解析没问题，但构造器从未被调用过 ⇒ QS 自启动以来没被打开过
+            }
+            // 到这里说明：类解析没问题，但构造器从未被调用过 ⇒ QS 自启动以来没被打开过。
+            // 先走 **Dagger 按需取实例**（2026-10-17 新路径）：适配器本身就是 Dagger 懒提供的单例，
+            // 而 Dagger 图在 SystemUI 启动时就完整了 ⇒ 直接向组件要它，不必等用户下拉面板。
+            obtainAdapterViaDagger(context)?.let {
+                hostAdapter = it
+                HLog.i(TAG, "adapter obtained lazily via Dagger: ${adapterClass!!.name}")
+                return it
+            }
             HLog.w(
                 TAG,
                 "adapter not stashed: ${adapterClass!!.name} has not been constructed yet " +
@@ -222,6 +365,47 @@ class SystemUiHook(private val prefs: SharedPreferences) : BaseHook() {
             return null
         }
     }
+
+    /**
+     * **不打开控制中心**也要拿到 QS 宿主适配器（OS2 的必走路径）。
+     *
+     * 依据（三代反编译实证）：
+     * - `QSHostAdapter` 由 Dagger 懒提供（OS2：`DaggerReferenceGlobalRootComponent` 里 new，
+     *   组件字段名 `qSHostAdapterProvider`）；它在「首次打开 QS」时才被构造 ⇒ 之前只能等用户下拉。
+     * - 取用链：`SystemUIAppComponentFactoryBase.systemUIInitializer`（**public static** 实测）
+     *   → `getSysUIComponent()` → 组件里名字含 `SHostAdapter` 的 Provider 字段 → `get()`。
+     *   拿不到 static 时退回 `SystemUIApplication.mInitializer`（我们从 `Application.attach` 有 ctx）。
+     * - 安全性：Dagger 组件在启动时已构建完成，这里只是**提前要一个它本来就会提供的单例**，
+     *   不存在"提前触碰 ROM 静态单例把它污染"那类风险（对比 WMShell `MultiTaskingControllerStub` 血案）。
+     * 全程 runCatching；任何一步失败都只记日志并保持旧行为（回落 root 兜底）。
+     */
+    private fun obtainAdapterViaDagger(context: Context): Any? = runCatching {
+        val cls = adapterClass ?: return@runCatching null
+        val loader = cls.classLoader
+        val init = runCatching {
+            Class.forName("com.android.systemui.SystemUIAppComponentFactoryBase", false, loader)
+                .getField("systemUIInitializer").get(null)
+        }.getOrNull() ?: runCatching {
+            val app = context.applicationContext
+            app.javaClass.getField("mInitializer").get(app)
+        }.getOrNull() ?: return@runCatching null
+        val comp = listOf("getSysUIComponent", "getRootComponent").firstNotNullOfOrNull { m ->
+            runCatching { init.javaClass.getMethod(m).invoke(init) }.getOrNull()
+        } ?: return@runCatching null
+        // provider 字段：名字含 SHostAdapter/HostAdapter，且对象上有零参 get()（鸭子类型，免依赖 javax.inject）
+        val prov = comp.javaClass.declaredFields.firstOrNull { f ->
+            val n = f.name.lowercase()
+            (n.contains("hostadapter") && n.contains("provider"))
+        }?.let { f -> runCatching { f.isAccessible = true; f.get(comp) }.getOrNull() }
+        val got = prov?.let { p ->
+            runCatching { p.javaClass.getMethod("get").invoke(p) }.getOrNull()
+        } ?: runCatching { comp.javaClass.getMethod("qSHostAdapter").invoke(comp) }.getOrNull()
+        if (got != null && cls.isInstance(got)) got
+        else {
+            HLog.w(TAG, "Dagger adapter route failed (init=${init.javaClass.simpleName} comp=${comp.javaClass.simpleName} prov=${prov?.javaClass?.simpleName})")
+            null
+        }
+    }.getOrNull()
 
     /** 数据层直点磁贴；返回 1=磁贴已定位（点击异步），0=未就绪/未找到/异常。
      *  纯反射（libxposed 新 API 无 XposedHelpers）。注意：jadx 反编译里的 Kotlin
@@ -364,7 +548,9 @@ class SystemUiHook(private val prefs: SharedPreferences) : BaseHook() {
             // NPE 静默/handler 卡死/实例销毁，用字段值直接判）
             val diag = runCatching {
                 val state = (readField(tile, "mTile") as? android.service.quicksettings.Tile)?.state
-                val ext = readField(tile, "mCustomTileExt") != null
+                // OS2 的 CustomTile **没有** mCustomTileExt（三代反编译对照实证）⇒ 这里必须容错，
+                // 否则整行 diag 直接失败成 "diag failed"，把其它字段的诊断价值一起埋掉。
+                val ext = runCatching { readField(tile, "mCustomTileExt") != null }.getOrNull()
                 val bound = mgr?.let { runCatching { readField(it, "mBound") }.getOrNull() }
                 val req = mgr?.let { runCatching { readField(it, "mBindRequested") }.getOrNull() }
                 val allow = mgr?.let { runCatching { readField(it, "mBindAllowed") }.getOrNull() }
@@ -435,7 +621,7 @@ class SystemUiHook(private val prefs: SharedPreferences) : BaseHook() {
      *  OS2 的 TileLifecycleManager 没有 hasPendingClick()，退看排队消息集合
      *  （mQueuedMessages 非空=绑定链上还有未冲刷消息，含 listening，仅供诊断）。 */
     private fun scheduleClick(lifecycle: Any?, clickAction: Runnable) {
-        val h = Handler(Looper.getMainLooper())
+        val h = clickHandler
         h.post(clickAction)
         h.postDelayed({
             val pending = runCatching {

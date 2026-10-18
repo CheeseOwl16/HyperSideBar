@@ -41,48 +41,81 @@ object LogCollector {
 
     @Volatile private var registered = false
 
+    /** 注册用的 context 与接收器引用：**原先是匿名注册（无处注销）**——API 102 热重载下
+     *  AMS 持有的 receiver 会把旧代 classloader 钉住，且新代再注册一份=两份归档端。 */
+    @Volatile private var registeredCtx: Context? = null
+    private var receiver: BroadcastReceiver? = null
+
     /** 幂等注册（MainActivity/日志页进入时调用；模块进程内只需一次） */
     fun register(context: Context) {
         if (registered) return
         registered = true
+        // 注册与注销必须用**同一个 context 实例**（LoadedApk 的 receiver 表以外层 context 为键），
+        // 所以这里取一次就存字段，不再各算各的 applicationContext
+        val appCtx = context.applicationContext
+        registeredCtx = appCtx
         runCatching {
-            context.applicationContext.registerReceiver(
-                object : BroadcastReceiver() {
-                    override fun onReceive(c: Context, intent: Intent) {
-                        val proc = intent.getStringExtra(PrefKeys.LOG_DUMP_EXTRA_PROC) ?: return
-                        if (intent.getLongExtra(PrefKeys.LOG_DUMP_EXTRA_ROUND, 0L) != currentRound) return
-                        intent.getStringExtra(PrefKeys.LOG_DUMP_EXTRA_META)?.let {
-                            if (it.isNotEmpty()) metas[proc] = it
-                        }
-                        intent.getStringExtra(PrefKeys.LOG_DUMP_EXTRA_STATUS)?.let {
-                            if (it.isNotEmpty()) statuses[proc] = it
-                        }
-                        intent.getStringExtra(PrefKeys.LOG_DUMP_EXTRA_STATS)?.let {
-                            if (it.isNotEmpty()) stats[proc] = it
-                        }
-                        val json = intent.getStringExtra(PrefKeys.LOG_DUMP_EXTRA_LOGS) ?: "[]"
-                        val entries = parse(json)
-                        val total = intent.getIntExtra(PrefKeys.LOG_DUMP_EXTRA_CHUNK_TOTAL, 1)
-                        val seq = intent.getIntExtra(PrefKeys.LOG_DUMP_EXTRA_CHUNK_SEQ, 0)
-                        if (total <= 1) {
-                            logs[proc] = entries
-                            return
-                        }
-                        synchronized(pending) {
-                            pendingTotal[proc] = total
-                            val acc = pending.getOrPut(proc) { HashMap() }
-                            acc[seq] = entries
-                            if (acc.size < total) return
-                            pending.remove(proc)
-                            pendingTotal.remove(proc)
-                            logs[proc] = (0 until total).flatMap { acc[it].orEmpty() }
-                        }
+            val recv = object : BroadcastReceiver() {
+                override fun onReceive(c: Context, intent: Intent) {
+                    val proc = intent.getStringExtra(PrefKeys.LOG_DUMP_EXTRA_PROC) ?: return
+                    if (intent.getLongExtra(PrefKeys.LOG_DUMP_EXTRA_ROUND, 0L) != currentRound) return
+                    intent.getStringExtra(PrefKeys.LOG_DUMP_EXTRA_META)?.let {
+                        if (it.isNotEmpty()) metas[proc] = it
                     }
-                },
+                    intent.getStringExtra(PrefKeys.LOG_DUMP_EXTRA_STATUS)?.let {
+                        if (it.isNotEmpty()) statuses[proc] = it
+                    }
+                    intent.getStringExtra(PrefKeys.LOG_DUMP_EXTRA_STATS)?.let {
+                        if (it.isNotEmpty()) stats[proc] = it
+                    }
+                    val json = intent.getStringExtra(PrefKeys.LOG_DUMP_EXTRA_LOGS) ?: "[]"
+                    val entries = parse(json)
+                    val total = intent.getIntExtra(PrefKeys.LOG_DUMP_EXTRA_CHUNK_TOTAL, 1)
+                    val seq = intent.getIntExtra(PrefKeys.LOG_DUMP_EXTRA_CHUNK_SEQ, 0)
+                    if (total <= 1) {
+                        logs[proc] = entries
+                        return
+                    }
+                    synchronized(pending) {
+                        pendingTotal[proc] = total
+                        val acc = pending.getOrPut(proc) { HashMap() }
+                        acc[seq] = entries
+                        if (acc.size < total) return
+                        pending.remove(proc)
+                        pendingTotal.remove(proc)
+                        logs[proc] = (0 until total).flatMap { acc[it].orEmpty() }
+                    }
+                }
+            }
+            appCtx.registerReceiver(
+                recv,
                 IntentFilter(PrefKeys.LOG_DUMP_REPLY),
                 Context.RECEIVER_EXPORTED
             )
+            receiver = recv
         }.onFailure { HLog.w("LogCollector", "register failed: ${it.message}") }
+    }
+
+    /**
+     * API 102 热重载释放（幂等）。
+     *
+     * 为什么必须：回传接收器由宿主 AMS 持有——不解注册，旧代 classloader 回收不了，
+     * 且新代再注册一份就会把同一次请求的分块归档两遍（自检报告出现重复 proc 段）。
+     * 本对象注册在**模块 App 进程**（MainActivity/日志页），该进程通常不在热重载目标里；
+     * 入口仍然提供，供"模块进程也在 scope 内"的配置或未来统一清理路径调用，未注册即空操作。
+     * 已归档的 [logs]/[statuses]/[stats] 不清：释放的是"注册"，不是"已采到的数据"。
+     */
+    fun releaseForReload() {
+        runCatching {
+            val r = receiver
+            val c = registeredCtx
+            if (r != null && c != null) c.unregisterReceiver(r)
+        }.onFailure { HLog.w("LogCollector", "unregister failed: ${it.message}") }
+        receiver = null
+        registeredCtx = null
+        registered = false
+        // 半集齐的分块暂存：留着只会与新代（若重注册）的新一轮混在一起
+        synchronized(pending) { pending.clear(); pendingTotal.clear() }
     }
 
     /** 拉一轮：广播请求各 hook 进程 + 直读本进程缓冲（proc="app"）。 */

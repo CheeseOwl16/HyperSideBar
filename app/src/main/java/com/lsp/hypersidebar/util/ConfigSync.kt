@@ -145,35 +145,42 @@ object ConfigSync {
         modulePrefs = prefs
         if (moduleRegistered) return
         moduleRegistered = true
+        // 只在**真正注册**时记注册 ctx：后到的调用可能带另一个 context 实例（Activity vs
+        // Application），覆盖了就与注册键不一致 ⇒ 注销会失败
+        moduleRegCtx = context
         runCatching {
             val writeListener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
                 sendSync(context, prefs, key)
             }
             moduleWriteListener = writeListener // 强引用存活，见字段注释
             prefs.registerOnSharedPreferenceChangeListener(writeListener)
+            val requestReceiver = object : BroadcastReceiver() {
+                override fun onReceive(c: Context, intent: Intent) {
+                    sendSync(c, prefs)
+                }
+            }
             context.registerReceiver(
-                object : BroadcastReceiver() {
-                    override fun onReceive(c: Context, intent: Intent) {
-                        sendSync(c, prefs)
-                    }
-                },
+                requestReceiver,
                 IntentFilter(ACTION_REQUEST),
                 Context.RECEIVER_EXPORTED
             )
+            moduleRequestReceiver = requestReceiver
             // 回执接收（仅诊断）：模块进程活着时才收得到——而"改设置"必然发生在本进程活着时，
             // 所以「日志页 → 本应用 → ack」是判定投递是否成功的有效信号
+            val ackReceiver = object : BroadcastReceiver() {
+                override fun onReceive(c: Context, intent: Intent) {
+                    HLog.i(
+                        TAG,
+                        "ack: proc=${intent.getStringExtra("proc")} keys=${intent.getIntExtra("n", -1)}"
+                    )
+                }
+            }
             context.registerReceiver(
-                object : BroadcastReceiver() {
-                    override fun onReceive(c: Context, intent: Intent) {
-                        HLog.i(
-                            TAG,
-                            "ack: proc=${intent.getStringExtra("proc")} keys=${intent.getIntExtra("n", -1)}"
-                        )
-                    }
-                },
+                ackReceiver,
                 IntentFilter(ACTION_SYNC_ACK),
                 Context.RECEIVER_EXPORTED
             )
+            moduleAckReceiver = ackReceiver
             // 绑定完成即推一次：hook 进程启动早于模块进程时靠这条补齐
             sendSync(context, prefs)
         }
@@ -245,34 +252,130 @@ object ConfigSync {
 
     @Volatile private var hookRegistered = false
 
+    /** hook 侧 SYNC 接收器：**原先是匿名注册（无处注销）**——API 102 热重载下 AMS 持有的
+     *  receiver 会钉住旧代 classloader，而新代再注册一份就会出现两份 applySync。 */
+    @Volatile private var hookSyncReceiver: BroadcastReceiver? = null
+
+    /**
+     * **注册时用的那个 context 实例**（≠ [hookCtx]）。
+     *
+     * 为什么必须分开存：`LoadedApk` 的 receiver 表以"外层 context"为键（`getOuterContext()`），
+     * 注销必须用**同一个 context 实例**，否则 `unregisterReceiver` 抛
+     * IllegalArgumentException（实则没摘掉）。而 [hookCtx] 存的是 `context.applicationContext`
+     * ——attach 时刻它可能还是 null（1004/1005 实锤），且即使非 null 也不保证与注册用的那个
+     * 实例同键。注销一律用本字段。
+     */
+    @Volatile private var hookRegCtx: Context? = null
+
+    /** 注册后那个"延迟 3s 请求回推"用的 Handler：存引用才能在热重载时清掉排队回调
+     *  （被排队的 Runnable 是**旧代闭包**，不清就得等它跑完旧代才可能被回收）。 */
+    @Volatile private var hookRequestHandler: android.os.Handler? = null
+
+    /** 模块侧两个接收器（ACTION_REQUEST 应答 / ACK 回执）的引用，同上：匿名注册无处注销。 */
+    @Volatile private var moduleRequestReceiver: BroadcastReceiver? = null
+    @Volatile private var moduleAckReceiver: BroadcastReceiver? = null
+
+    /** 模块侧**注册时用的那个 context 实例**（理由同 [hookRegCtx]：注销必须同键）。 */
+    @Volatile private var moduleRegCtx: Context? = null
+
     /**
      * hook 进程侧注册（幂等，挂在 Application.attach hook 内调用）：
      * - 收 SYNC → applySync
      * - 注册后延迟发 ACTION_REQUEST 请求模块回推（补 hook 先于模块启动的缺口）
+     *
+     * ⚠ 同时是 **API 102 热重载的重挂入口**（由各 hook 的 `rearmHostSide` 调）：冷启动
+     * attach 路径与热重载重挂共用本函数（唯一实现）；`hookRegistered` 守卫在
+     * [releaseForReload] 里被复位，所以重挂能真正再注册一次，并顺带重发一次
+     * ACTION_REQUEST（热重载后立即拉一次最新配置）。
      */
     fun registerHookSide(context: Context) {
         if (hookRegistered) return
         hookRegistered = true
         hookCtx = context.applicationContext
+        hookRegCtx = context
         runCatching {
+            val syncRecv = object : BroadcastReceiver() {
+                override fun onReceive(c: Context, intent: Intent) {
+                    val map = intent.getSerializableExtra("map") as? Map<*, *> ?: return
+                    @Suppress("UNCHECKED_CAST")
+                    applySync(map as Map<String, Any>)
+                }
+            }
             context.registerReceiver(
-                object : BroadcastReceiver() {
-                    override fun onReceive(c: Context, intent: Intent) {
-                        val map = intent.getSerializableExtra("map") as? Map<*, *> ?: return
-                        @Suppress("UNCHECKED_CAST")
-                        applySync(map as Map<String, Any>)
-                    }
-                },
+                syncRecv,
                 IntentFilter(ACTION_SYNC),
                 Context.RECEIVER_EXPORTED
             )
+            hookSyncReceiver = syncRecv
             // 请求模块回推：延迟 3s（等模块进程/接收器就绪；无应答则静默，
             // 用户下次打开设置页会再同步）
-            android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+            val handler = android.os.Handler(android.os.Looper.getMainLooper())
+            hookRequestHandler = handler
+            handler.postDelayed({
                 runCatching { context.sendBroadcast(Intent(ACTION_REQUEST)) }
             }, 3000L)
             HLog.i(TAG, "hook-side sync receiver registered")
         }.onFailure { HLog.w(TAG, "hook-side register failed: ${it.message}") }
+    }
+
+    /**
+     * API 102 热重载释放（旧代退休前调用；幂等，两侧都摘）。
+     *
+     * 为什么必须：本 object 在两个方向各注册了广播接收器 / prefs 写入监听——
+     * 它们全都是**宿主长期持有**的对象（AMS 的 receiver 表、`RemotePreferences` 的
+     * listener 表），不摘掉旧代 classloader 回收不了；而新代再注册一份就会出现
+     * "两份 applySync / 两次 sendSync"。排队在 Handler 上的延迟回推 Runnable 同理
+     * （它是旧代闭包）。
+     *
+     * ⚠ 只释放**注册**，不清 `cache`：配置缓存是数据不是资源，清掉会让读取瞬间回落到
+     * 启动快照（旧值），在同代内若不再收到 SYNC 就会一直停在旧值上。
+     * 模块侧的 `moduleCtx`/`modulePrefs` 也**保留**（它们是纯引用，且 `notifyConfigChanged`
+     * 靠它们继续工作——模块进程自己的写入推送不受本释放影响）。
+     */
+    fun releaseForReload() {
+        // ===== hook 进程侧 =====
+        runCatching {
+            val r = hookSyncReceiver
+            val c = hookRegCtx
+            if (r != null && c != null) c.unregisterReceiver(r)
+        }.onFailure { HLog.w(TAG, "hook-side unregister failed: ${it.message}") }
+        hookSyncReceiver = null
+        hookRegCtx = null
+        runCatching { hookRequestHandler?.removeCallbacksAndMessages(null) }
+            .onFailure { HLog.w(TAG, "hook request callback cleanup failed: ${it.message}") }
+        hookRequestHandler = null
+        hookCtx = null
+        hookRegistered = false
+        // ===== 模块进程侧 =====
+        runCatching {
+            val c = moduleRegCtx
+            if (c != null) {
+                moduleRequestReceiver?.let { c.unregisterReceiver(it) }
+                moduleAckReceiver?.let { c.unregisterReceiver(it) }
+            }
+        }.onFailure { HLog.w(TAG, "module-side unregister failed: ${it.message}") }
+        moduleRequestReceiver = null
+        moduleAckReceiver = null
+        moduleRegCtx = null
+        runCatching {
+            val l = moduleWriteListener
+            val p = modulePrefs
+            if (l != null && p != null) p.unregisterOnSharedPreferenceChangeListener(l)
+        }.onFailure { HLog.w(TAG, "write listener unregister failed: ${it.message}") }
+        moduleWriteListener = null
+        moduleRegistered = false
+        // ===== 模块进程侧的另外两条 util 通道 =====
+        // 它俩的唯一调用点就是本对象的 [sendSync]（`CornerGeomBridge.push`/`pushBand`/
+        // `ensureRotationWatch`、`NativeGateBridge.push`），所以由这里统一停：
+        // CornerGeomBridge 要摘 Application 上的旋转监听并停 su 执行器，NativeGateBridge 要停
+        // 写 marker 的执行器——两条都是"旧代闭包/线程钉住旧 classloader"。
+        // 重挂不需要专门入口：它们的下一次 `sendSync`（设置页任一写入/绑定完成）会重建执行器
+        // 并重挂旋转监听（`rotationWatchArmed`/`lastWish` 都已在释放时复位）。
+        runCatching { CornerGeomBridge.releaseForReload() }
+            .onFailure { HLog.w(TAG, "corner geom release failed: ${it.message}") }
+        runCatching { NativeGateBridge.releaseForReload() }
+            .onFailure { HLog.w(TAG, "native gate release failed: ${it.message}") }
+        HLog.i(TAG, "releaseForReload: hook/module receivers dismissed (cache kept: ${cache.size} keys)")
     }
 }
 

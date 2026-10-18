@@ -5,7 +5,6 @@ import android.content.SharedPreferences
 import com.lsp.hypersidebar.hook.GestureThresholds
 import com.lsp.hypersidebar.prefs.LayoutDefaults
 import com.lsp.hypersidebar.prefs.PrefKeys
-import java.util.concurrent.Executors
 
 /**
  * 手势几何跨进程桥（2026-10-11 引入时只服务底角；2026-10-12 起兼负侧滑触发带）：
@@ -63,14 +62,33 @@ object CornerGeomBridge {
     const val PROP_W_RATIO = "persist.hsb.corner.w_ratio"
     const val PROP_HOT_PCT = "persist.hsb.corner.hot_pct"
 
-    /** 单线程串行：避免设置页快速连拖滑条时并发起一堆 su */
-    private val executor = Executors.newSingleThreadExecutor { r ->
-        Thread(r, "CornerGeomBridge").apply { isDaemon = true }
+    /**
+     * 底角"斜滑独占"开关（2026-10-17）：`1` = 抑制系统同时响应（native 侧在 action 桩里按它判），
+     * `0` = 回到"系统与模块同时判"。由设置项 `PrefKeys.CORNER_SUPPRESS_ENABLED` 驱动。
+     *
+     * 为什么是 `persist.` 而不是 `debug.`：`debug.*` 重启即清 ⇒ 开关等于每次重启失效；抑制是
+     * "默认开"的产品行为，必须跨重启有效。（native 读法仍是 1 秒缓存 ⇒ 改动 ≤1s 生效。）
+     */
+    const val PROP_CORNER_SUPP = "persist.hsb.corner.supp"
+
+    /** 单线程串行：避免设置页快速连拖滑条时并发起一堆 su。
+     *  ⚠ 可重建（不是 `val`）：热重载要把旧代这条线程**停掉**（线程的 Runnable 是旧代 lambda，
+     *  不 join/shutdown 旧 classloader 就被它钉住），停完之后同代内再用必须能重建。 */
+    private val executorLock = Any()
+    @Volatile private var single: java.util.concurrent.ExecutorService? = null
+
+    /** 取（必要时重建）串行执行器。 */
+    private fun exec(): java.util.concurrent.ExecutorService {
+        single?.let { return it }
+        return synchronized(executorLock) {
+            single ?: java.util.concurrent.Executors.newSingleThreadExecutor { r ->
+                Thread(r, "CornerGeomBridge").apply { isDaemon = true }
+            }.also { single = it }
+        }
     }
 
     /** 最近一次写入值（仅去重用；跨进程真值在属性里） */
     @Volatile private var lastW: String? = null
-    @Volatile private var lastHot: String? = null
 
     /**
      * 按当前配置推一次。幂等：值没变则跳过（滑条拖动会高频触发）。
@@ -97,14 +115,32 @@ object CornerGeomBridge {
         // 值与上次相同就不重复起 su
         val wStr = String.format(java.util.Locale.US, "%.4f", ratio)
         val hStr = String.format(java.util.Locale.US, "%.4f", hotPercent)
-        if (wStr == lastW && hStr == lastHot) return
-        lastW = wStr
-        lastHot = hStr
+        // 底角独占开关（2026-10-17）：与几何同批推；开关变化也要触发一次推送（见 changeKey）
+        val suppOn = prefs.getBoolean(
+            com.lsp.hypersidebar.prefs.PrefKeys.CORNER_SUPPRESS_ENABLED,
+            com.lsp.hypersidebar.prefs.LayoutDefaults.CORNER_SUPPRESS_ENABLED
+        )
+        val suppStr = if (suppOn) "1" else "0"
+        val changeKey = "$wStr|$hStr|$suppStr"
+        if (changeKey == lastW) return
+        lastW = changeKey
 
-        executor.execute {
+        // 免 root 那一路先写（真机更正：/data/local/tmp 对 app 是 EACCES ⇒ 这里内部走 su；
+        // 好处仍是不受属性长度限制 + 原子替换），写完哪怕 setprop 失败，native 也能从文件读到同一份值
+        ConfigFileBridge.pushScalars(
+            linkedMapOf(
+                PROP_W_RATIO to wStr,
+                PROP_HOT_PCT to hStr,
+                PROP_CORNER_SUPP to suppStr,
+            ),
+            context
+        )
+
+        exec().execute {
             val ok = runCatching {
-                // 一次 su 写两个属性（每条 su 都有进程开销，合并省一半）。命令是纯数字，无注入面。
-                val cmd = "setprop $PROP_W_RATIO $wStr; setprop $PROP_HOT_PCT $hStr"
+                // 一次 su 写三个属性（每条 su 都有进程开销，合并省开销）。命令是纯数字/0-1，无注入面。
+                val cmd = "setprop $PROP_W_RATIO $wStr; setprop $PROP_HOT_PCT $hStr; " +
+                    "setprop $PROP_CORNER_SUPP $suppStr"
                 val p = ProcessBuilder("su", "-c", cmd).start()
                 val finished = p.waitFor(SU_TIMEOUT_MS, java.util.concurrent.TimeUnit.MILLISECONDS)
                 if (!finished) {
@@ -136,8 +172,18 @@ object CornerGeomBridge {
                 one(PROP_W_RATIO) to one(PROP_HOT_PCT)
             }.getOrNull()
 
+            val suppRead = runCatching {
+                val q = ProcessBuilder("getprop", PROP_CORNER_SUPP).start()
+                val v = q.inputStream.bufferedReader().use { it.readText() }.trim()
+                q.waitFor(SU_TIMEOUT_MS, java.util.concurrent.TimeUnit.MILLISECONDS)
+                v
+            }.getOrNull()
+
             if (readBack != null && readBack.first == wStr && readBack.second == hStr) {
-                HLog.i(TAG, "pushed corner geom: w_ratio=$wStr hot_pct=$hStr")
+                HLog.i(
+                    TAG,
+                    "pushed corner geom: w_ratio=$wStr hot_pct=$hStr supp=$suppStr(读回=$suppRead)"
+                )
             } else {
                 HLog.w(
                     TAG,
@@ -277,7 +323,7 @@ object CornerGeomBridge {
         if (key == lastBand) return
         lastBand = key
 
-        executor.execute {
+        exec().execute {
             val cmd = values.joinToString("; ") { "setprop ${it.first} ${it.second}" }
             val ok = runCatching {
                 val p = ProcessBuilder("su", "-c", cmd).start()
@@ -315,6 +361,12 @@ object CornerGeomBridge {
 
     @Volatile private var rotationWatchArmed = false
 
+    /** 旋转监听回调 + 注册它的 Application：注销必须用**同一实例**（ComponentCallbacks 无
+     *  equals 语义）。**原先匿名注册（无处注销）**——它挂在长期存活的 Application 上，
+     *  旧代 classloader 因此回收不了。 */
+    private var rotationCallbacks: android.content.ComponentCallbacks? = null
+    private var rotationApp: Context? = null
+
     /**
      * 挂一次旋转监听（幂等）：横竖切换时重推一次触发带，让 [PROP_BAND_LANDSCAPE] 跟上。
      *
@@ -328,7 +380,7 @@ object CornerGeomBridge {
         rotationWatchArmed = true   // 先置位：注册失败也不反复重试（本进程内一次性）
         runCatching {
             val app = ctx.applicationContext ?: return
-            app.registerComponentCallbacks(object : android.content.ComponentCallbacks {
+            val callbacks = object : android.content.ComponentCallbacks {
                 override fun onConfigurationChanged(newConfig: android.content.res.Configuration) {
                     val landscape =
                         newConfig.orientation == android.content.res.Configuration.ORIENTATION_LANDSCAPE
@@ -340,8 +392,39 @@ object CornerGeomBridge {
                 // 走旧签名是有意为之）：抑制这条告警，别给编译留新噪声。
                 @Suppress("OVERRIDE_DEPRECATION")
                 override fun onLowMemory() {}
-            })
+            }
+            app.registerComponentCallbacks(callbacks)
+            rotationCallbacks = callbacks
+            rotationApp = app
             HLog.i(TAG, "rotation watch armed（横竖切换重推触发带方向位）")
         }.onFailure { HLog.w(TAG, "rotation watch 未挂上: ${it.message}") }
+    }
+
+    /**
+     * API 102 热重载释放（旧代退休前调用；幂等）。
+     *
+     * 为什么必须：本 object 持有两样**宿主长期存活**的东西——
+     *  ① 挂在 Application 上的旋转监听（ComponentCallbacks）：匿名注册时无处注销，
+     *     旧代 classloader 被这个回调钉住；新代再挂一份就会横竖切换时重推两遍；
+     *  ② 单线程 su 执行器：线程的 Runnable 就是旧代 lambda，不停掉旧代同样回收不了。
+     * 另外把去重快照（[lastW]/[lastBand]）清空，使释放后同代内再 push 真能写一次
+     * （否则会以为"值没变"而跳过）。
+     * 任一步失败只记日志（属性通道本就是 fail-open 的兜底通道）。
+     */
+    fun releaseForReload() {
+        runCatching {
+            val app = rotationApp
+            val cb = rotationCallbacks
+            if (app != null && cb != null) app.unregisterComponentCallbacks(cb)
+        }.onFailure { HLog.w(TAG, "rotation watch unregister failed: ${it.message}") }
+        rotationCallbacks = null
+        rotationApp = null
+        rotationWatchArmed = false
+        runCatching { single?.shutdownNow() }
+            .onFailure { HLog.w(TAG, "executor shutdown failed: ${it.message}") }
+        single = null
+        lastW = null
+        lastBand = null
+        HLog.i(TAG, "releaseForReload: rotation watch removed, su executor stopped")
     }
 }

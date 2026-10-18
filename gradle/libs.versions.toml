@@ -7,8 +7,8 @@ junit = "4.13.2"
 junitVersion = "1.1.5"
 espressoCore = "3.5.1"
 miuixUi = "0.9.4"
-xposed-api = "101.0.1"
-xposed-service = "101.0.0"
+xposed-api = "102.0.0"
+xposed-service = "102.0.0"
 composeBom = "2024.02.00"
 # miuix 0.9.4 的 WindowDialog/MiuixPopupHost 会调 NavigationBackHandler，要求 activity ≥1.13
 # 提供 LocalNavigationEventDispatcherOwner；缺则弹窗必崩、miuix-nav 预测返回静默失效

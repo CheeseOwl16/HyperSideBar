@@ -320,6 +320,14 @@ private fun LayoutSheetContent(
                     checked = repo.cornerSwipeEnabled(),
                     onCheckedChange = { repo.putDraft(PrefKeys.CORNER_SWIPE_ENABLED, it) }
                 )
+                // 独占开关（2026-10-17）：底角斜滑时不再让系统同时判（防"三连"：系统 Home + 扇形 + 应用启动）。
+                // 默认开；推 persist.hsb.corner.supp，native 1 秒缓存读 ⇒ 改动 ≤1s 生效，无需重启宿主。
+                SwitchPreference(
+                    title = stringResource(R.string.corner_suppress_title),
+                    summary = stringResource(R.string.corner_suppress_summary),
+                    checked = repo.cornerSuppressEnabled(),
+                    onCheckedChange = { repo.putDraft(PrefKeys.CORNER_SUPPRESS_ENABLED, it) }
+                )
             }
         }
 
@@ -377,6 +385,30 @@ private fun LayoutSheetContent(
                 valueRange = spec.outerCountRange,
                 steps = spec.outerCountSteps,
                 onValueChange = { putOuterCount(it.toInt()) },
+                onValueChangeFinished = {}
+            )
+            // 压暗过渡时长（2026-10-17）：不随方向变化 ⇒ 不走 spec；draft-aware ⇒ 拖滑条即时预览，
+            // 下次呼出生效（scrim 时长在呼出时由 ComposeFanHost 读一次）。
+            val scrimFade = repo.fanScrimFadeMs()
+            val scrimStep = LayoutDefaults.FAN_SCRIM_FADE_STEP_MS
+            SliderPreference(
+                title = stringResource(R.string.fan_scrim_fade_title),
+                summary = stringResource(R.string.fan_scrim_fade_summary),
+                valueText = "$scrimFade ms",
+                value = scrimFade.toFloat().coerceIn(
+                    LayoutDefaults.FAN_SCRIM_FADE_MIN_MS.toFloat()..
+                        LayoutDefaults.FAN_SCRIM_FADE_MAX_MS.toFloat()
+                ),
+                valueRange = LayoutDefaults.FAN_SCRIM_FADE_MIN_MS.toFloat()..
+                    LayoutDefaults.FAN_SCRIM_FADE_MAX_MS.toFloat(),
+                steps = (LayoutDefaults.FAN_SCRIM_FADE_MAX_MS - LayoutDefaults.FAN_SCRIM_FADE_MIN_MS) /
+                    scrimStep - 1,
+                onValueChange = {
+                    val v = (kotlin.math.round(it / scrimStep) * scrimStep).toInt().coerceIn(
+                        LayoutDefaults.FAN_SCRIM_FADE_MIN_MS, LayoutDefaults.FAN_SCRIM_FADE_MAX_MS
+                    )
+                    repo.putDraft(PrefKeys.FAN_SCRIM_FADE_MS, v)
+                },
                 onValueChangeFinished = {}
             )
         }

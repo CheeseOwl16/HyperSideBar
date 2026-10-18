@@ -53,10 +53,21 @@
     <string name="theme_dark">深色</string>
     <string name="system_colors">系统配色</string>
     <string name="system_colors_summary">使用 HyperOS 系统动态颜色</string>
-    <string name="invoke_section">呼出设置</string>
+    <string name="invoke_section">操作设置</string>
     <string name="invoke_settings_summary">滑动距离 %1$d dp · 呼出停顿 %2$d ms</string>
     <string name="trigger_swipe_distance_title">滑动距离</string>
     <string name="trigger_swipe_distance_summary">内滑达此距离进确认线，停顿后呼出；太浅易误触、太深难触发；改动下次手势生效</string>
+    <string name="freeform_section">小窗</string>
+    <string name="freeform_blank_tap_title">点击空白处缩小/关闭小窗</string>
+    <string name="freeform_blank_tap_summary">小窗打开时，在小窗之外的空白处轻点一下即执行动作；默认关（这是系统原本没有的行为）</string>
+    <string name="freeform_mode_title">空白处点击的动作</string>
+    <string name="freeform_mode_mini">缩小（最小化）</string>
+    <string name="freeform_mode_mini_summary">把点到的小窗缩成小窗挂起态——三代 ROM 同一个接口，兼容性最好</string>
+    <string name="freeform_mode_close">关闭</string>
+    <string name="freeform_mode_close_summary">关闭点到的小窗。HyperOS 2 没有"关闭单个小窗"的系统接口，会退化成"退出小窗"（效果接近缩小）</string>
+    <string name="freeform_takeover_title">点空白时不穿透</string>
+    <string name="freeform_takeover_summary">空白处按下即抢走触摸：判定为轻点就吞掉（背后 app 收不到），一旦变成拖动/多指就立刻把手势原样还回去（含已缓冲部分，实时转发）。注入被系统拒绝时本开关会自动失效以保护整机</string>
+    <string name="freeform_blank_tap_footnote">判定"空白"= 该点不落在任何可见、未固定的在册小窗内；拖拽与长按不算轻点，在小窗内部轻点也不触发。</string>
     <string name="fan_background_section">扇形背景</string>
     <string name="fan_background_summary">材质 %1$d%% · 压暗%2$s</string>
     <string name="state_on">开</string>
@@ -67,10 +78,14 @@
     <string name="fan_persistent_summary">松手后扇形不自动收起：点图标启动、点空白收起；10 秒无操作自动收起</string>
     <string name="corner_swipe_title">底角斜滑呼出</string>
     <string name="corner_swipe_summary">从屏幕左下/右下角斜向内上滑，直接呼出扇形（仅竖屏）；与停顿呼出并存，默认关闭</string>
+    <string name="corner_suppress_title">底角斜滑独占</string>
+    <string name="corner_suppress_summary">底角斜滑时让系统不再同时响应（只出扇形，不弹 Home/最近任务）；关掉后回到"系统与模块同时判"。改动 ≤1 秒生效，无需重启</string>
     <string name="fan_fog_title">板材质浓度</string>
     <string name="fan_fog_summary">统一驱动板的混色、提亮与颗粒（0 = 板材质全关，只剩弧线与图标；若背景模糊来源已开启，模糊本身仍在，板不会变透明）；改动下次呼出生效</string>
     <string name="fan_dim_title">背景压暗</string>
     <string name="fan_dim_summary">呼出扇形时全屏压暗 24%，突出菜单；改动下次呼出生效</string>
+    <string name="fan_scrim_fade_title">压暗过渡时长</string>
+    <string name="fan_scrim_fade_summary">压暗淡入/淡出的时长（毫秒）：短=干脆利落，长=柔和渐显；改动下次呼出生效</string>
     <string name="fan_blur_source_title">背景模糊来源</string>
     <string name="fan_blur_source_auto">自动</string>
     <string name="fan_blur_source_wallpaper">采样壁纸</string>

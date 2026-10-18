@@ -30,6 +30,12 @@
 #include <pthread.h> /* 心跳线程（补丁完整性巡检，见 §5.2 G1） */
 #include <sys/system_properties.h>
 #include "launcher_profiles.h"
+/* 结构性身份校验底座（2026-10-16，来自参考工程 MiuiBackGestureHook，Apache-2.0；
+ * 见 hsb_elf_view.h 的头注释）。只被 hsb_locate 的锚点结构校验用。 */
+#include "hsb_elf_view.h"
+#include "hsb_import_got.h"
+#include "hsb_a64_decode.h"
+#include "hsb_config.h"   /* 配置读取：文件 /data/local/tmp/hsb.conf 优先 → 系统属性 → 缺省 */
 
 /*
  * 编译期总闸（2026-10-08，替代做不了的"OS3 装机回归"，见测试清单 §7）：
@@ -245,6 +251,9 @@ static void probe_dtor(void) {
  * 已证数据（2026-10-15，36 个真人采样点）：系统热区只在横向中段 x∈[400,760] y≈2380，
  * 与我们角窗（x≤130 或 x≥950、y≥2328）**0 重叠** ⇒ 角区内压制热区是空操作。 */
 #define HSB_ANCHOR3_PROP "debug.hsb.native.anchor3"
+/* 底角"斜滑独占"开关（抑制）：由模块 App 设置项推（`persist.` ⇒ 重启后仍在；读法 1 秒缓存）。
+ * 定义在这里是因为 [hsb_chosen_anchor3] 的缺省值要用它（抑制开 ⇒ 自动挂 action_probe）。 */
+#define HSB_CORNER_SUPP_PROP "persist.hsb.corner.supp"
 
 /*
  * 可换的挂点白名单（2026-10-08 加，2026-10-09 第 2 步扩容）：装机轮稀缺，
@@ -312,11 +321,18 @@ static const char *hsb_chosen_anchor2(void) {
  * 空/其它值 = 不装第三锚点（不猜）。 */
 static const char *hsb_chosen_anchor3(void) {
     char v[64] = {0};
-    if (__system_property_get(HSB_ANCHOR3_PROP, v) <= 0 || !v[0]) return NULL;
-    if (strcmp(v, "nav_hot_zone") == 0) return "nav_hot_zone";
-    if (strcmp(v, "judge_probe") == 0) return "judge_probe";
-    if (strcmp(v, "pilfer_probe") == 0) return "pilfer_probe";
-    if (strcmp(v, "action_probe") == 0) return "action_probe";
+    if (__system_property_get(HSB_ANCHOR3_PROP, v) > 0 && v[0]) {
+        if (strcmp(v, "nav_hot_zone") == 0) return "nav_hot_zone";
+        if (strcmp(v, "judge_probe") == 0) return "judge_probe";
+        if (strcmp(v, "pilfer_probe") == 0) return "pilfer_probe";
+        if (strcmp(v, "action_probe") == 0) return "action_probe";
+        return NULL;
+    }
+    /* 缺省（2026-10-17）：抑制开关开 ⇒ 自动挂 `action_probe`（抑制的落点）。
+     * 这样"底角斜滑独占"在设置里打开即生效，不再依赖 debug 属性（重启即失）。
+     * 抑制开关本身也在 action 桩里按同一属性读（1 秒缓存）。 */
+    char s[8] = {0};
+    if (__system_property_get(HSB_CORNER_SUPP_PROP, s) > 0 && s[0] == '1') return "action_probe";
     return NULL;
 }
 
@@ -639,16 +655,9 @@ static float g_corner_w_px;
 static float g_corner_hot_px;
 static uint64_t g_geom_checked_s;
 
-/* 读一个 [lo, hi] 内的浮点属性；缺失/非法/越界/NaN 一律返回 dflt（不猜） */
-static float hsb_prop_float(const char *key, float lo, float hi, float dflt) {
-    char v[16] = {0};
-    if (__system_property_get(key, v) <= 0 || !v[0]) return dflt;
-    char *end = NULL;
-    float f = strtof(v, &end);
-    if (end == v) return dflt;
-    if (!(f >= lo && f <= hi)) return dflt;   /* NaN 也会落进这里 */
-    return f;
-}
+/* 读一个 [lo, hi] 内的浮点配置；缺失/非法/越界/NaN 一律返回 dflt（不猜）。
+ * 2026-10-17：读取源换成 [hsb_cfg_float]（文件 `/data/local/tmp/hsb.conf` 优先、系统属性次之、最后 dflt），
+ * 原 `hsb_prop_float`（只读属性）已删除——同一语义，只是多了一路免 root 的来源。 */
 
 /*
  * 刷新角区几何（属性驱动）并打一行。返回 0 = self 的 w/h 读不出来。
@@ -686,8 +695,8 @@ static void hsb_corner_ratio(float *wr, float *hp) {
         g_crn_ratio_s = now;
         /* 比例取 [0.02, 0.50] / [1, 50]：越界或非数字一律回落兜底（不猜）。
          * 上限同时挡住"属性写坏把整个屏幕变成角区"。 */
-        g_crn_ratio = hsb_prop_float(HSB_CORNER_W_PROP, 0.02f, 0.50f, HSB_CORNER_W_FALLBACK_RATIO);
-        g_crn_hot_pct = hsb_prop_float(HSB_CORNER_HOT_PROP, 1.0f, 50.0f, HSB_CORNER_HOT_FALLBACK_PCT);
+        g_crn_ratio = hsb_cfg_float(HSB_CORNER_W_PROP, 0.02f, 0.50f, HSB_CORNER_W_FALLBACK_RATIO);
+        g_crn_hot_pct = hsb_cfg_float(HSB_CORNER_HOT_PROP, 1.0f, 50.0f, HSB_CORNER_HOT_FALLBACK_PCT);
     }
     *wr = g_crn_ratio;
     *hp = g_crn_hot_pct;
@@ -1128,26 +1137,26 @@ static int hsb_suppress_value(void) {
 
 /* 停顿阈值 / 速度门（无缓存：每条事件最多读一次，1µs 级；换来运行时可调） */
 static float hsb_strip_dwell_ms(void) {
-    return hsb_prop_float(HSB_STRIP_DWELL_PROP, 50.0f, 2000.0f, HSB_STRIP_DWELL_FALLBACK_MS);
+    return hsb_cfg_float(HSB_STRIP_DWELL_PROP, 50.0f, 2000.0f, HSB_STRIP_DWELL_FALLBACK_MS);
 }
 static float hsb_strip_stall_speed(void) {
-    return hsb_prop_float(HSB_STRIP_SPEED_PROP, 0.0f, 100000.0f, HSB_STRIP_SPEED_FALLBACK);
+    return hsb_cfg_float(HSB_STRIP_SPEED_PROP, 0.0f, 100000.0f, HSB_STRIP_SPEED_FALLBACK);
 }
 /* min 下限取到 0.5px 级：用户把"滑动距离"拉到最小时确认门就该跟着变窄 */
 static float hsb_strip_confirm_px(void) {
-    return hsb_prop_float(HSB_STRIP_CONFIRM_PROP, 0.5f, 2000.0f, HSB_STRIP_CONFIRM_FALLBACK);
+    return hsb_cfg_float(HSB_STRIP_CONFIRM_PROP, 0.5f, 2000.0f, HSB_STRIP_CONFIRM_FALLBACK);
 }
 static float hsb_strip_reset_px(void) {
-    return hsb_prop_float(HSB_STRIP_RESET_PROP, 0.0f, 2000.0f, HSB_STRIP_RESET_FALLBACK);
+    return hsb_cfg_float(HSB_STRIP_RESET_PROP, 0.0f, 2000.0f, HSB_STRIP_RESET_FALLBACK);
 }
 static float hsb_strip_max_tan(void) {
-    return hsb_prop_float(HSB_STRIP_MAXTAN_PROP, 0.01f, 100.0f, HSB_STRIP_MAXTAN_FALLBACK);
+    return hsb_cfg_float(HSB_STRIP_MAXTAN_PROP, 0.01f, 100.0f, HSB_STRIP_MAXTAN_FALLBACK);
 }
 /* 速度窗长（ms）：默认 = 已验证的 150ms（与 :ui 的 STALL_SPEED_WINDOW_MS 同值）；
  * 调大只影响 native 这一侧（:ui 仍按 eventTime 走自己的窗），用于验证"到达时刻压缩 ⇒ 速度高估"
  * 这条假设，见 HSB_STRIP_WINDOW_PROP 的注释。 */
 static uint64_t hsb_strip_window_ms(void) {
-    float v = hsb_prop_float(HSB_STRIP_WINDOW_PROP, 50.0f, 2000.0f, (float) HSB_STRIP_SPEED_WINDOW_MS);
+    float v = hsb_cfg_float(HSB_STRIP_WINDOW_PROP, 50.0f, 2000.0f, (float) HSB_STRIP_SPEED_WINDOW_MS);
     return (uint64_t) v;
 }
 
@@ -1188,15 +1197,15 @@ static int hsb_band_geom(void) {
     uint64_t now = hsb_now_s();
     if (g_band_checked_s != now) {
         g_band_checked_s = now;
-        float w  = hsb_prop_float(HSB_BAND_W_PX_PROP,   1.0f,   2000.0f, 0.0f);
-        float h  = hsb_prop_float(HSB_BAND_H_PX_PROP,   1.0f, 100000.0f, 0.0f);
+        float w  = hsb_cfg_float(HSB_BAND_W_PX_PROP,   1.0f,   2000.0f, 0.0f);
+        float h  = hsb_cfg_float(HSB_BAND_H_PX_PROP,   1.0f, 100000.0f, 0.0f);
         /* top 的合法值含 0 ⇒ 用 dflt=-1 区分"属性缺失"与"top=0" */
-        float t  = hsb_prop_float(HSB_BAND_TOP_PX_PROP, 0.0f, 100000.0f, -1.0f);
-        float sw = hsb_prop_float(HSB_BAND_SW_PX_PROP,  1.0f, 100000.0f, 0.0f);
-        float sh = hsb_prop_float(HSB_BAND_SH_PX_PROP,  1.0f, 100000.0f, 0.0f);
+        float t  = hsb_cfg_float(HSB_BAND_TOP_PX_PROP, 0.0f, 100000.0f, -1.0f);
+        float sw = hsb_cfg_float(HSB_BAND_SW_PX_PROP,  1.0f, 100000.0f, 0.0f);
+        float sh = hsb_cfg_float(HSB_BAND_SH_PX_PROP,  1.0f, 100000.0f, 0.0f);
         /* 方向位（dflt=-1 区分"属性缺失"与"竖屏=0"）：缺失时下面仍会按几何比一次，
          * 但那条恒假（sw/sh 是竖屏归一值）⇒ 缺属性 = 只靠 hsb_band_in 的越界兜底。 */
-        float land = hsb_prop_float(HSB_BAND_LAND_PROP, 0.0f, 1.0f, -1.0f);
+        float land = hsb_cfg_float(HSB_BAND_LAND_PROP, 0.0f, 1.0f, -1.0f);
         int landscape_geo = (sw > 0.0f && sh > 0.0f && sw >= sh);
         int landscape_prop = (land >= 0.5f);
         int landscape = landscape_geo || landscape_prop;
@@ -1914,8 +1923,12 @@ static uintptr_t hsb_stub_pilferprobe(uintptr_t a0, uintptr_t a1, uintptr_t a2, 
  * 2026-10-11 已经为这个付过一次代价（见 hsb_corner_ratio 的注释）。
  *
  * ## 观测
- * 命中抑制必打一行（带 edge/band 便于回溯阈值），透传每 50 行 + 第 1 行打一条采样。 */
-#define HSB_ACTION_SUPP_PROP "debug.hsb.native.corner.supp"
+ * 命中抑制必打一行（带 edge/band 便于回溯阈值），透传每 50 行 + 第 1 行打一条采样。
+ *
+ * 属性（2026-10-17 改）：`persist.hsb.corner.supp`（原来是 `debug.hsb.native.corner.supp`）。
+ * 原因：debug.* 重启即清 ⇒ 抑制默认不生效；现在由模块 App 的设置开关（"底角斜滑独占"）推送，
+ * 用户随时可关，且重启后仍在（读法仍是 1 秒缓存 ⇒ 改动 ≤1s 生效，无需重启宿主）。 */
+#define HSB_ACTION_SUPP_PROP HSB_CORNER_SUPP_PROP
 
 static int g_act_supp_on;
 static uint64_t g_act_supp_s;
@@ -1942,8 +1955,8 @@ static void hsb_action_screen(float *w, float *h) {
     uint64_t now = hsb_now_s();
     if (g_act_scr_s != now) {
         g_act_scr_s = now;
-        g_act_scr_w = hsb_prop_float(HSB_BAND_SW_PX_PROP, 1.0f, 100000.0f, 0.0f);
-        g_act_scr_h = hsb_prop_float(HSB_BAND_SH_PX_PROP, 1.0f, 100000.0f, 0.0f);
+        g_act_scr_w = hsb_cfg_float(HSB_BAND_SW_PX_PROP, 1.0f, 100000.0f, 0.0f);
+        g_act_scr_h = hsb_cfg_float(HSB_BAND_SH_PX_PROP, 1.0f, 100000.0f, 0.0f);
     }
     *w = g_act_scr_w;
     *h = g_act_scr_h;
@@ -2354,6 +2367,67 @@ static void hsb_install_at(const HsbLauncherAnchor *a, uintptr_t at, uintptr_t b
     }
 }
 
+/*
+ * 结构校验需要"扫描命中地址所属的那一段的基址"（ELF 视图的 base）。
+ * sigscan 返回的是 base+k（base 为某条可执行段起点）⇒ 从 g_xsegs 里反查包含它的那条。
+ * 找不到返回 0（调用方按失败处理）。
+ */
+static uintptr_t hsb_xseg_base_of(uintptr_t addr) {
+    for (unsigned i = 0; i < g_xseg_count; i++) {
+        if (addr >= g_xsegs[i].start && addr < g_xsegs[i].end) return g_xsegs[i].start;
+    }
+    return 0u;
+}
+
+/*
+ * ===== 锚点结构校验（D2，2026-10-16）=====
+ * prologue 逐字节/掩码匹配只能证明"这 32 字节像那个函数"，不能证明"这就是那个函数"。
+ * 这里再加一层更强的身份证据：**该函数体内确有 bl/blr 落到该锚点声明的导入的 GOT 槽**
+ * （底座 hsb_elf_view / hsb_import_got / hsb_a64_decode 由参考工程 MiuiBackGestureHook
+ * 迁入，见 hsb_elf_view.h 头注释）。
+ *
+ * 只在锚点声明了 `required_imports` 时生效（NULL = 跳过，行为与引入前完全一致）。
+ * 返回 1 = 通过（或未声明）；0 = 不符，*which_out 指向失败的那条导入符号名。
+ * 任何解析失败都算"不符"——但调用方**不因此拒装**：打 `struct-mismatch` 后继续走特征
+ * 扫描路，保留既有的兜底能力（fail-closed 的是"这一条候选"，不是整个锚点）。
+ */
+static int hsb_anchor_import_ok(const HsbLauncherAnchor *a, uintptr_t base, uintptr_t at,
+                                const char **which_out) {
+    HsbElfView view;
+    uintptr_t fn_off;
+    if (which_out) *which_out = NULL;
+    if (a->required_imports == NULL) return 1;
+    if (!hsb_elf_parse((const uint8_t *) base, &view)) {
+        if (which_out) *which_out = "(elf parse failed)";
+        return 0;
+    }
+    if (at < base) {
+        if (which_out) *which_out = "(target below base)";
+        return 0;
+    }
+    fn_off = at - base;
+    for (const char *const *p = a->required_imports; p && *p; ++p) {
+        uintptr_t got = 0u;
+        uintptr_t off;
+        int found = 0;
+        if (!hsb_import_find_got(&view, *p, &got)) {
+            if (which_out) *which_out = *p;
+            return 0;
+        }
+        for (off = 0u; off + 4u <= (uintptr_t) a->size; off += 4u) {
+            if (hsb_a64_call_targets_import(&view, fn_off + off, got)) {
+                found = 1;
+                break;
+            }
+        }
+        if (!found) {
+            if (which_out) *which_out = *p;
+            return 0;
+        }
+    }
+    return 1;
+}
+
 /* 定位一个锚点（主/副/附共用）。返回 0 = 没找到。
  * 命中时 *base_out = 采纳的 load bias（sigscan 命中为 0），how = "offset"/"sigscan"。
  * 两路都 fail-closed：可执行段边界校验（hsb_in_exec）+ 32B prologue 校验（逐字节 → PC 相对掩码）。
@@ -2382,6 +2456,17 @@ static uintptr_t hsb_locate(const HsbLauncherAnchor *a, uintptr_t *base_out, cha
         uint32_t bad = HSB_PROLOGUE_BYTES;
         int masked = 0;
         if (hsb_pl_match(p, a->prologue, &bad, &masked)) {
+            /* 结构校验（D2）：prologue 过了还要证明"体内确实调用声明的导入"。
+             * 不符 → 打 struct-mismatch 并继续找下一个候选/走特征扫描，不直接拒装。 */
+            const char *bad_imp = NULL;
+            if (!hsb_anchor_import_ok(a, base, at, &bad_imp)) {
+                g_hook.prologue_mismatch++;
+                snprintf(g_hook.reason, sizeof(g_hook.reason),
+                         "%s cand=%p struct-mismatch %s", a->name, (void *) base,
+                         bad_imp ? bad_imp : "?");
+                LOGI("cand rejected: %s", g_hook.reason);
+                continue;
+            }
             snprintf(how, how_sz, "%s", "offset");
             if (masked) {
                 g_hook.prologue_masked++;
@@ -2408,6 +2493,18 @@ static uintptr_t hsb_locate(const HsbLauncherAnchor *a, uintptr_t *base_out, cha
     }
     g_hook.sig_hits = hits;
     if (sig) {
+        /* 结构校验同样适用于扫描路：命中地址若过不了"必调导入"证明，就不能当这个锚点用
+         * （宁可不装也不装错——错误的地址上挂 inline hook 会崩桌面）。 */
+        const char *bad_imp = NULL;
+        uintptr_t sig_base = (uintptr_t) hsb_xseg_base_of(sig);
+        if (!hsb_anchor_import_ok(a, sig_base, sig, &bad_imp)) {
+            g_hook.prologue_mismatch++;
+            snprintf(g_hook.reason, sizeof(g_hook.reason),
+                     "%s sigscan@%p struct-mismatch %s", a->name, (void *) sig,
+                     bad_imp ? bad_imp : "?");
+            LOGI("hook refused: %s", g_hook.reason);
+            return 0u;
+        }
         if (masked) g_hook.prologue_masked++;
         LOGI("sigscan%s found %s at=%p (offsets stale, hits=1)", masked ? "(masked)" : "", a->name,
              (void *) sig);
@@ -2755,22 +2852,35 @@ static void hsb_publish_evoke(const char *payload) {
  *   · 为什么不直接再调一次 hook_func：若某版框架是链式 hook，backup 会指回我们自己的桩
  *     ⇒ 每次事件递归爆栈。先 unhook 摘掉旧注册就没有这个歧义。
  * 封顶：最多 HSB_PATCH_HEAL_MAX 次，超过只报警不再自愈（fail-closed，等用户重启桌面）。
- * 只由心跳线程调用（单线程），不碰任何流状态。 */
-#define HSB_PATCH_HEAL_MAX 5u
-static uint32_t g_patch_heals;      /* 自愈成功次数 */
+ * 只由心跳线程调用（单线程），不碰任何流状态。
+ *
+ * ## 与 Java 侧热重载（LSPosed API 102）的关系：**互不干涉**
+ * 2026-10-16 起 module.prop 开 `autoHotReload=true`。Java 侧热重载只换模块 APK 的
+ * classloader，**不会**重装本 .so：`System.loadLibrary` 只在 `onModuleLoaded`（且热重载
+ * 不重放该回调）调用一次，inline/PLT hook 绑在宿主 spawner 世代上——框架文档与参考工程
+ * MiuiBackGestureHook 的 AGENTS.md 都把"热重载期间卸载/重建 APK native 入口"列为禁止操作。
+ * 所以热重载后本文件的补丁与巡检**照旧**：被抹仍由本线程 5s 一拍自愈，与 Java 侧重装无关。
+ * 反向亦然：本文件的失败路径只打日志（封顶后等用户重启桌面），不参与 Java 侧生命周期。 */
+/* 2026-10-17 改：**不再硬封顶**。ROM 的内存压力策略约每 8 分钟抹一次 .text（真机实测：
+ * `LowMemDetector` + `ScenarioStub`），5 次封顶 ⇒ 挂机 ~40 分钟后侧条静默失效、直到用户
+ * 重启桌面——比"多自愈几次"糟得多。现在改用**指数退避**：每次自愈成功后等待翻倍
+ * （5s→10s→…，上限 300s）；巡检连续 3 拍读到 `patch=ok` 则回落 5s（说明这轮擦除过去了）。
+ * 心跳里的 `heal=N/M` 随之改语义：N = 已自愈次数，M = 当前退避秒数。 */
+static uint32_t g_patch_heals;      /* 自愈成功次数（心跳 heal 的第一个数） */
 static uint32_t g_patch_heal_fail;  /* 自愈失败/中止次数 */
-static int      g_patch_heal_stop;  /* 封顶后置 1：不再自愈 */
+static uint32_t g_heal_backoff_ms = 5000u;  /* 下一次自愈的等待（指数退避） */
+static unsigned g_heal_clean_ticks;         /* 巡检连续读到 ok 的拍数（≥3 ⇒ 退避回落） */
+
+/** 巡检间隔：退避值的下限 5s（心跳线程用它做睡眠长度）。 */
+static uint32_t hsb_heal_interval_ms(void) {
+    return g_heal_backoff_ms < 5000u ? 5000u : g_heal_backoff_ms;
+}
 
 static int hsb_patch_heal(void) {
     if (!g_patch_armed || !g_hook.target) return 0;
     if (!g_api || !g_api->hook_func || !g_api->unhook_func) return 0;
-    if (g_patch_heal_stop) return 0;
-    if (g_patch_heals + g_patch_heal_fail >= HSB_PATCH_HEAL_MAX) {
-        g_patch_heal_stop = 1;
-        LOGI("hook HB patch 自愈封顶（已试 %u 次）⇒ 停止自愈、只报警；恢复=重启桌面重装 hook",
-             g_patch_heals + g_patch_heal_fail);
-        return 0;
-    }
+    /* 2026-10-17：这里原来有"5 次封顶 ⇒ g_patch_heal_stop=1 不再自愈"。现在不封顶——
+     * 节奏由心跳线程的睡眠长度（[hsb_heal_interval_ms]，指数退避）控制，本函数每次被调就尝试。 */
 
     /* ① 摘掉旧注册（把目标页还原成原始字节；被抹时这步等于"本来就已是原始"） */
     g_api->unhook_func((void *) g_hook.target);
@@ -2807,6 +2917,16 @@ static int hsb_patch_heal(void) {
     }
     g_patch_wiped = 0;
     g_patch_heals++;
+    /* 指数退避：这次刚自愈成功 ⇒ 下一次的等待翻倍（上限 300s），避免"ROM 连抹、我们连装"打表。
+     * 巡检连续 3 拍 ok 会把退避回落（见心跳循环）——擦除是**周期性**的，不是一直发生。 */
+    g_heal_clean_ticks = 0;
+    g_heal_backoff_ms = (g_heal_backoff_ms < 300000u) ? (g_heal_backoff_ms * 2u) : 300000u;
+    if (g_heal_backoff_ms > 300000u) g_heal_backoff_ms = 300000u;
+    if (g_patch_heals == 8u) {
+        LOGI("hook HB：已自愈 8 次 —— 本机 ROM 在频繁回收桌面 .text（内存压力策略）。"
+             "功能仍在自愈（当前退避 %us 一拍），但若手势偶发失联，建议重启桌面。",
+             g_heal_backoff_ms / 1000u);
+    }
     LOGI("hook HB patch RE-ARMED (G3) #%u：装上后 %llus 被抹、本轮重装成功 target=%p backup=%p；"
          "下一事件起重新走本桩（命中/发布/抑制/arrowfix 恢复）%s",
          g_patch_heals,
@@ -2830,7 +2950,7 @@ static int hsb_patch_heal(void) {
 static int hsb_hook3_heal(void) {
     if (!g_hook3_installed || !g_hook3_target || !g_hook3_name[0]) return 0;
     if (!g_api || !g_api->hook_func || !g_api->unhook_func) return 0;
-    if (g_hook3_heals + g_hook3_heal_fail >= HSB_PATCH_HEAL_MAX) return 0;
+    /* 2026-10-17：与主锚点同步取消硬封顶（节奏由心跳线程的指数退避控制） */
 
     g_api->unhook_func((void *) g_hook3_target);
 
@@ -2887,10 +3007,12 @@ static void *hsb_heartbeat_thread(void *arg) {
     uint8_t live[32];
     const char *last_state = "ok";
     unsigned ticks = 0;
+    uint64_t last_sum_s = 0;   /* 摘要行节流（时间基，2026-10-17：退避后拍间隔可变） */
     for (;;) {
         struct timespec ts;
-        ts.tv_sec = 5;
-        ts.tv_nsec = 0;
+        uint32_t iv = hsb_heal_interval_ms();   /* 指数退避：5s 起，最多 300s（2026-10-17） */
+        ts.tv_sec = (time_t) (iv / 1000u);
+        ts.tv_nsec = (long) ((iv % 1000u) * 1000000u);
         nanosleep(&ts, NULL);
         if (!g_patch_armed || !g_hook.target) continue;
         ticks++;
@@ -2899,6 +3021,11 @@ static void *hsb_heartbeat_thread(void *arg) {
         if (memcmp(live, g_patch_snapshot, sizeof(live)) == 0) {
             state = "ok";
             g_patch_wiped = 0;
+            /* 连续 3 拍 ok ⇒ 这一轮擦除过去了 ⇒ 退避回落 5s（指数退避的另一半，2026-10-17） */
+            if (++g_heal_clean_ticks >= 3u) {
+                g_heal_clean_ticks = 0;
+                g_heal_backoff_ms = 5000u;
+            }
         } else if (memcmp(live, g_patch_orig, sizeof(live)) == 0) {
             /* WIPED ⇒ 先自愈；自愈成功这一拍就当 ok（下一拍自然会读到新快照） */
             if (hsb_patch_heal()) {
@@ -2915,8 +3042,8 @@ static void *hsb_heartbeat_thread(void *arg) {
             if (state[0] == 'W') {
                 LOGI("ARCHIVE REMAP DETECTED %s：目标页 32B 已还原成原始序言 ⇒ 手势链路静默失效"
                      "（此后不会再出现 hook HIT / chanpublish / back SUPPRESS）；"
-                     "G3 自愈未成功（heal=%u fail=%u stop=%d），恢复=重启桌面重装 hook",
-                     g_hook.anchor, g_patch_heals, g_patch_heal_fail, g_patch_heal_stop);
+                     "G3 自愈未成功（heal=%u fail=%u next=%us），恢复=重启桌面重装 hook",
+                     g_hook.anchor, g_patch_heals, g_patch_heal_fail, g_heal_backoff_ms / 1000u);
             } else if (state[0] == 'C') {
                 LOGI("hook HB patch CHANGED live=%02x%02x%02x%02x… snap=%02x%02x%02x%02x…"
                      " orig=%02x%02x%02x%02x…（第三种扰动，只报不重装）",
@@ -2960,14 +3087,15 @@ static void *hsb_heartbeat_thread(void *arg) {
                      g_hook3_heals, g_hook3_heal_fail, (void *) g_hook3_target);
             }
         }
-        if (ticks % 12u == 0u) {   /* 每 60s 一条摘要（含计数，给判词表用） */
+        if (hsb_now_s() >= last_sum_s + 60u) {   /* 摘要 60s 一条（退避后每拍间隔可能 >60s ⇒ 每拍都打） */
+            last_sum_s = hsb_now_s();
             LOGI("hook HB main=%s alive=%llus patch=%s hits=%u seen=%u inband=%u dw=%u sw=%u af=%u ac=%u pub=%u/%u heal=%u/%u",
                  g_hook.anchor[0] ? g_hook.anchor : "-",
                  (unsigned long long) (hsb_now_s() >= g_hook.installed_at_s
                                            ? hsb_now_s() - g_hook.installed_at_s : 0),
                  state, g_hook.hits, g_supp.seen, g_supp.in_band, g_supp.dwelled,
                  g_supp.swallow, g_supp.arrow_fix, g_supp.arrow_clean, g_pub_ok, g_pub_fail,
-                 g_patch_heals, g_patch_heal_fail);
+                 g_patch_heals, g_heal_backoff_ms / 1000u);
         }
     }
     return NULL;

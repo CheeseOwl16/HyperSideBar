@@ -75,8 +75,41 @@ class XposedInit : XposedModule() {
 
         val procName = currentProcessName()
         HLog.i(TAG, "onPackageReady: pkg=${param.packageName} proc=$procName")
-        when {
-            param.packageName == HostPackages.UI_HOST && procName.endsWith(HostPackages.UI_PROCESS_SUFFIX) -> {
+        val host = hostFor(procName)
+        if (host == null) {
+            HLog.w(TAG, "Skip package/process: pkg=${param.packageName} proc=$procName")
+            return
+        }
+        installFor(host)
+    }
+
+    /**
+     * 宿主身份。**只按进程名判**，不看 `packageName`。
+     *
+     * 为什么：两条调用路径的入参不同——`onPackageReady` 两者都有，而 API 102 的
+     * `HotReloadedParam` **只有 processName**（它继承 ModuleLoadedParam，没有 packageName）。
+     * 若把 host 判定写进 `when` 的 packageName 条件里，热重载路径就没法复用同一套装配。
+     *
+     * 子进程保护不丢：SystemUI 的截图等子进程进程名带后缀（`com.android.systemui:screenshot`）
+     * ⇒ 不等 `HostPackages.SYSTEM_UI` ⇒ 仍然跳过（原注释的意图——子进程注册有序广播接收器会
+     * 抢答 resultCode 覆盖主进程结果）。
+     */
+    private enum class Host { UI, HOME, SYSTEM_UI }
+
+    private fun hostFor(procName: String): Host? = when {
+        procName.endsWith(HostPackages.UI_PROCESS_SUFFIX) -> Host.UI
+        procName == HostPackages.HOME -> Host.HOME
+        procName == HostPackages.SYSTEM_UI -> Host.SYSTEM_UI
+        else -> null
+    }
+
+    /**
+     * 按宿主装 Java hooks。幂等（每个 hook 字段 `if (… == null)` 守 + `initHooks` 的
+     * `isInit` 守），所以 `onPackageReady` 与 `onHotReloaded` 共用它。
+     */
+    private fun installFor(host: Host) {
+        when (host) {
+            Host.UI -> {
                 // 横屏 B 路线触发端 + 竖屏小白条隐藏穿透宿主 + 执行端（fan 选中动作本进程直执行）
                 // SyncedPrefs 包装（同 home 端批次 2）：总开关/横屏 dwell 等读取走同步广播
                 // 缓存命中，实时性不再单靠 LSPosed push 订阅
@@ -97,7 +130,7 @@ class XposedInit : XposedModule() {
                 // 而 fail-open 下"写 1"本来就是空操作 ⇒ 总闸现在只由模块 App 写文件 marker 关断。
                 initHooks(turboLayoutHook!!, freeformRelayHook!!, sidebarOverlayProbe!!)
             }
-            param.packageName == HostPackages.HOME && procName == HostPackages.HOME -> {
+            Host.HOME -> {
                 // 竖屏边缘手势通道（内滑+停顿零干扰透传；横屏触发已移交 :ui B 路线）
                 if (edgeGestureHook == null) {
                     // SyncedPrefs 包装（批次 2）：配置同步广播缓存命中优先——
@@ -109,9 +142,7 @@ class XposedInit : XposedModule() {
                 }
                 initHooks(edgeGestureHook!!)
             }
-            // 仅主进程：SystemUI 子进程（截图等）若也注册接收器，有序广播可能被
-            // 子进程抢答 resultCode=0 覆盖主进程的点击结果
-            param.packageName == HostPackages.SYSTEM_UI && procName == HostPackages.SYSTEM_UI -> {
+            Host.SYSTEM_UI -> {
                 // 批次 3：QS 磁贴数据层直点桥（click-tile 门禁在回调层，QSTile.click 无约束）
                 if (systemUiHook == null) {
                     systemUiHook = SystemUiHook(
@@ -123,9 +154,159 @@ class XposedInit : XposedModule() {
                 if (backGestureSignalProbe == null) backGestureSignalProbe = BackGestureSignalProbe()
                 initHooks(systemUiHook!!, backGestureSignalProbe!!)
             }
-            else -> HLog.w(TAG, "Skip package/process: pkg=${param.packageName} proc=$procName")
         }
     }
+
+    /**
+     * API 102 热重载 · 第一拍：**旧代**被退休前（框架要求显式返回 true 才放行）。
+     *
+     * 做什么：把旧代持有的模块资源全部释放（否则旧 classloader 无法回收，且新代再装一遍
+     * 会得到两份 monitor / 两份接收器）。逐个 hook 走 `BaseHook.releaseForReload()`。
+     *
+     * 不做什么：不碰 native（见 onHotReloaded）；不写 `setSavedInstanceState`
+     * ——本模块没有必须跨代继承的状态：`CircuitBreaker` / `DataDeadState` 这些单例
+     * 在新代是从零开始，而它们的语义是"本进程本世代内的熔断/判死"，重置是正确行为
+     * （旧代若已熔断，新代码本身就是一次可用的重新尝试）。日志 ring buffer 同理：新代从空开始，
+     * 旧代内容已通过 logcat / LogDumpBridge 落过盘。
+     */
+    override fun onHotReloading(param: HotReloadingParam): Boolean {
+        // ⚠ HotReloadingParam 只有 getExtras()/setSavedInstanceState()，**没有** getProcessName()
+        // （API 102 的 HotReloadedParam 才继承 ModuleLoadedParam）⇒ 这里自己取进程名。
+        HLog.i(TAG, "hot reload: onHotReloading proc=${currentProcessName()}")
+        for ((n, h) in reloadTargets()) {
+            runCatching { h.releaseForReload() }
+                .onFailure { HLog.w(TAG, "releaseForReload [${n}] failed: ${it.message}") }
+        }
+        return true
+    }
+
+    /**
+     * API 102 热重载 · 第二拍：**新代**接手。
+     *
+     * ⚠ 框架**不会**重放 `onModuleLoaded` / `onPackageLoaded` / `onPackageReady`
+     * ⇒ 所有 Java hook 必须在这里重装，否则新代等于没装（表现为"改完代码装包后功能消失，
+     * 重启宿主才回来"）。
+     *
+     * 顺序：① 摘掉旧代句柄（`unhook`）→ ② 钩子字段与 isInit 复位 → ③ 按进程名重装 Java hooks
+     * （`installFor`）→ ④ 重起 SystemUiInputSpy（它是 `object` 单例，不挂在 XposedModule
+     * 生命周期上，onPackageReady 那条路不会再来）。
+     *
+     * **不得**重装 native：`System.loadLibrary("hypersidebar_native")` 只在 `onModuleLoaded`
+     * 调；APK native 入口的 inline/PLT hook 绑在宿主 spawner 世代上，热重载期间卸载/重建
+     * 它按框架文档属于禁用操作（参考工程 AGENTS.md 同款纪律）。native 侧在自己的进程内
+     * 由 G3 巡检自愈，与本 Java 重载无关。
+     */
+    override fun onHotReloaded(param: HotReloadedParam) {
+        HLog.i(TAG, "hot reload: onHotReloaded proc=${param.processName}")
+        param.oldHookHandles.forEach { h ->
+            runCatching { h.unhook() }
+                .onFailure { HLog.w(TAG, "old hook unhook failed: ${it.message}") }
+        }
+        turboLayoutHook = null
+        freeformRelayHook = null
+        edgeGestureHook = null
+        systemUiHook = null
+        sidebarOverlayProbe = null
+        backGestureSignalProbe = null
+        earlyBridgeHooked = false   // 新代要重新武装日志桥（旧代的 attach hook 已随旧代作废）
+
+        val procName = param.processName
+        val host = hostFor(procName)
+        if (host == null) {
+            HLog.w(TAG, "hot reload: no host for proc=$procName（本进程不装 hooks）")
+            return
+        }
+        val ctx = appContextOrNull()
+        // ← 必须在 installFor 之前：不恢复 ezxhelper 状态，installFor 里每个 hook 的 init 都会抛
+        // （base 未设 / 宿主类找不到），2026-10-16 真机实测如此。见 restoreEzXposedAfterReload。
+        restoreEzXposedAfterReload(ctx, procName)
+        installFor(host)
+        // 宿主侧通道重挂（B3 补口，见 BaseHook.rearmHostSide 的注释）：
+        // 这些注册体原本挂在 Application.attach 的钩子里，而热重载不重放 attach ⇒
+        // 上一步 releaseForReload 摘掉之后必须在**新代**显式重挂，否则它们一直死到宿主重启。
+        if (ctx == null) {
+            HLog.w(TAG, "hot reload: no app context ⇒ 宿主侧通道未能重挂（重启宿主可恢复）")
+        } else {
+            for (h in reloadTargets().map { it.second }) {
+                runCatching { h.rearmHostSide(ctx) }
+                    .onFailure { HLog.w(TAG, "rearmHostSide [${h.name}] failed: ${it.message}") }
+            }
+        }
+        // spy 是纯 object 单例，不由 initHooks 驱动 ⇒ 单独重起（它内部对重复 start 幂等）。
+        // ⚠ prefs 必须用 SyncedPrefs 包装（与冷启动路径 SystemUiHook.hookClickReceiver 一致）：
+        // 传裸 hookSidePrefs()（=LSPosed remotePrefs）时，读到的是一次性拉取的**死快照**，
+        // ConfigSync 的推送只进 override 缓存 ⇒ spy 永远看不到设置页改动。
+        // 2026-10-16 真机实测：热重载后 `blank-tap armed=false` 而模块侧已推送，根因即此。
+        if (host == Host.SYSTEM_UI && ctx != null) {
+            runCatching {
+                com.lsp.hypersidebar.hook.SystemUiInputSpy.start(
+                    ctx, com.lsp.hypersidebar.util.SyncedPrefs(hookSidePrefs())
+                )
+            }
+                .onFailure { HLog.w(TAG, "hot reload: spy restart failed: ${it.message}") }
+        }
+        HLog.i(TAG, "hot reload: reinstalled for $procName (host=$host)")
+    }
+
+    /**
+     * 热重载后恢复 ezxhelper 的进程级状态（**必备**，2026-10-16 真机实测）。
+     *
+     * 为什么：热重载**不重放** `onModuleLoaded` / `onPackageLoaded` / `onPackageReady`，而
+     * ezxhelper 的三份状态正是在那三个回调里设的：
+     *  - `EzXposed.base`（XposedInterface）← `onModuleLoaded` ⇒ 不补则 `MethodFinder` /
+     *    `HookFactory` 抛 `UninitializedPropertyAccessException: lateinit property base has
+     *    not been initialized`；
+     *  - `EzXposed.modulePath` / `moduleRes` ← `initModuleResources()`（同样在 onModuleLoaded
+     *    调用）⇒ 不补则 `NativeLibLoader` 报 "EzXposed.modulePath 未初始化"，DexKit 起不来；
+     *  - `EzXReflection` 的宿主 ClassLoader ← `onPackageReady` ⇒ 不补则宿主类全部
+     *    `ClassNotFoundException`（实测 `com.miui.home.recents.GestureStubView` 找不到）。
+     * 三条都命中过：`onHotReloaded` 里第一次跑到 `installFor` 时每个 hook 都失败。
+     *
+     * 用的全是 ezxhelper 的公开入口，不是反射进去的；`ModuleLoadedParam` 只是形参（实现里
+     * 只读 `base`，不读 param），所以这里给它一个最小实现即可。
+     * 宿主 ClassLoader 优先取 `Application.attach` 记下的 context，退到
+     * `ActivityThread.currentApplication()`；两处都拿不到就只打 W 继续（hook 会各自失败但
+     * 不崩，重启宿主可恢复）。
+     */
+    private fun restoreEzXposedAfterReload(ctx: Context?, procName: String) {
+        runCatching {
+            EzXposed.initOnModuleLoaded(this, object : ModuleLoadedParam {
+                override fun isSystemServer(): Boolean = false
+                override fun getProcessName(): String = procName
+            })
+        }.onFailure { HLog.w(TAG, "hot reload: EzXposed.base 恢复失败: ${it.message}") }
+        runCatching { EzXposed.initModuleResources() }
+            .onFailure { HLog.w(TAG, "hot reload: initModuleResources 失败: ${it.message}") }
+        val hostCl = (ctx ?: appContextOrNull())?.classLoader
+        if (hostCl != null) {
+            runCatching {
+                io.github.kyuubiran.ezxhelper.core.EzXReflection.init(hostCl)
+            }.onFailure { HLog.w(TAG, "hot reload: EzXReflection.init 失败: ${it.message}") }
+        } else {
+            HLog.w(TAG, "hot reload: 拿不到宿主 ClassLoader ⇒ 宿主类解析会失败（重启宿主可恢复）")
+        }
+        if (ctx != null) {
+            runCatching { EzXposed.initAppContext(ctx, false) }
+                .onFailure { HLog.w(TAG, "hot reload: initAppContext 失败: ${it.message}") }
+        }
+    }
+
+    /** 当前已装的 hook 实例（名字用于日志；只含已创建的）。 */
+    private fun reloadTargets(): List<Pair<String, BaseHook>> = listOfNotNull(
+        turboLayoutHook?.let { "TurboLayout" to it },
+        freeformRelayHook?.let { "FreeformRelay" to it },
+        edgeGestureHook?.let { "EdgeGesture" to it },
+        systemUiHook?.let { "SystemUiHook" to it },
+        sidebarOverlayProbe?.let { "SidebarOverlayProbe" to it },
+        backGestureSignalProbe?.let { "BackGestureSignalProbe" to it },
+    )
+
+    /** spy 重起要 context：从任意已装 hook 拿不到，直接取全局 app context（SystemUI 常驻）。 */
+    private fun appContextOrNull(): Context? = runCatching {
+        val clz = Class.forName("android.app.ActivityThread")
+        val m = clz.getMethod("currentApplication")
+        m.invoke(null) as? Context
+    }.getOrNull()
 
     /** 单次守卫：attach hook 每进程只装一份（各 hook 自己的 attach hook 独立共存） */
     @Volatile

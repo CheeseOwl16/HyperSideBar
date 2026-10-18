@@ -12,7 +12,16 @@ if(HSB_NATIVE_SPIKE)
     add_compile_definitions(HSB_NATIVE_SPIKE=1)
 endif()
 
-add_library(hypersidebar_native SHARED hypersidebar_native.c)
+# 源列表：主文件 + native 结构校验「底座」三件（迁移自参考工程
+# MiuiBackGestureHook/miui-home-hyos-native/runtime_profile_resolver.cpp，
+# Apache-2.0，见各文件头注释）。底座只提供 ELF 视图/导入 GOT/A64 解码，
+# 不参与 hook 决策；谁用它由 hypersidebar_native.c 决定。
+add_library(hypersidebar_native SHARED
+    hypersidebar_native.c
+    hsb_config.c
+    hsb_elf_view.c
+    hsb_import_got.c
+    hsb_a64_decode.c)
 
 # 纯 C、不用 STL；日志走 liblog
 target_link_libraries(hypersidebar_native PRIVATE log)

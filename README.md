@@ -84,7 +84,7 @@
 - 更新模块版本后，请再次重启上述三个应用（桌面 / 系统界面 / 手机管家），否则部分功能可能不生效；
 - 本项目只在 `HyperOS 3.300` 上实机验证过，其他机型或系统不保证可用性（`com.miui.securitycenter` 版本为 12.2.8，`com.miui.home` 版本为 6.01.05，`com.android.systemui` 版本为16.03.251211）；
 - `HyperOS 2` 已完成离线静态适配（`adapt/hyperos2` 分支，**尚未实机验证**），详见下方「适配进度」；
-- LSPosed 框架必须支持 API 101 及以上；
+- LSPosed 框架必须支持 API 102 及以上；
 - 扇形应用展示的应用源于系统的 `getFreeformSuggestionList`，因此并不会展示所有应用；
 - 连续失败会触发熔断，hook 将不再主动生效（可在设置页查看通道状态并手动重试，或重启手机）；
 - 本项目非官方模块、与小米无关，使用风险自负。
@@ -142,9 +142,10 @@
 | 组件 | 版本 | 许可 | 说明 |
 |---|---|---|---|
 | DexKit | `org.luckypray:dexkit:2.3.0` | **Apache-2.0**（除 `Core/`）+ **LGPL-3.0**（`Core/`，即 `libdexkit.so` 内的 C++ 引擎） | 精确源码见 [GitHub tag 2.3.0](https://github.com/LuckyPray/DexKit/tree/2.3.0) 与 Maven 坐标 `org.luckypray:dexkit:2.3.0` |
-| libxposed API / service | 101.x | Apache-2.0 | 编译期依赖（`compileOnly`），不随 APK 分发 |
+| libxposed API / service | 102.x | Apache-2.0 | 编译期依赖（`compileOnly`），不随 APK 分发 |
 | EzXHelper | 3.2.0-preview1 | Apache-2.0 | — |
 | miuix | 0.9.x | Apache-2.0 | — |
+| MiuiBackGestureHook（源码衍生） | — | Apache-2.0 | native 结构校验「底座」`app/src/main/cpp/hsb_elf_view.{h,c}`、`hsb_import_got.{h,c}`、`hsb_a64_decode.{h,c}` 自上游 `miui-home-hyos-native/runtime_profile_resolver.cpp` 逐函数移植（`ElfView`/`AddOverflows`/`Contains`/`ReadInstruction`/`NormalizeDynamicPointer`/`ParseElf`/`BoundedStringEquals`/`FindImportGot`/`ResolveImports`/`Decode*`/`MatchesWords`/`InstructionEquals`）；每个文件头标注来源与许可，边界检查未删减 |
 
 关于 DexKit 的 LGPL-3.0 部分（`libdexkit.so`）：
 
@@ -158,11 +159,11 @@
 - 完整文本：LGPL-3.0 <https://www.gnu.org/licenses/lgpl-3.0.html>、Apache-2.0 <https://www.apache.org/licenses/LICENSE-2.0>；
 - 若后续版本修改了 DexKit 源码，修改部分将按 LGPL-3.0 单独提供。
 
-### 参考项目（未分发其代码，致谢与出处）
+### 参考项目（致谢与出处）
 
 | 项目 | 许可 | 参考内容 |
 |---|---|---|
-| [MiuiBackGestureHook](https://github.com/wxxsfxyzm/MiuiBackGestureHook) | Apache-2.0 | HyperOS 4（Rust 桌面）native hook 路线的可行性论证与技术思路：LSPosed native entry 打包方式、`RTLD_NOLOAD` 回放已加载库、`madvise(MADV_DONTNEED)` 守卫模型、per-version launcher profile 机制。截至 native 探针（adapt/hyperos4 5af37b2）未复制其源码行；`NativeAPIEntries` 等 ABI 定义取自 LSPosed 官方 wiki《Native Hook》 |
+| [MiuiBackGestureHook](https://github.com/wxxsfxyzm/MiuiBackGestureHook) | Apache-2.0 | HyperOS 4（Rust 桌面）native hook 路线的可行性论证与技术思路：LSPosed native entry 打包方式、`RTLD_NOLOAD` 回放已加载库、`madvise(MADV_DONTNEED)` 守卫模型、per-version launcher profile 机制。截至 native 探针（adapt/hyperos4 5af37b2）未复制其源码行；`NativeAPIEntries` 等 ABI 定义取自 LSPosed 官方 wiki《Native Hook》。**自 spike/os4-native 的 native 结构校验「底座」起，`app/src/main/cpp/hsb_*` 三个文件为其源码衍生（Apache-2.0 允许，逐函数保留来源说明），见上表** |
 
 ## 开源协议
 

@@ -408,6 +408,43 @@ class FanMenuController(
         host = null
     }
 
+    /**
+     * API 102 热重载释放（旧代退休前由宿主 hook 的 `releaseForReload` 调用；幂等）。
+     *
+     * 为什么必须：本控制器持有两处**宿主长期存活**的资源——活动 `host` 与池化 `idleHost`
+     * （各自是 `ComposeFanHost`：`WindowManager` 悬浮窗 + Compose composition + lifecycle，
+     * 全绑在当前代 classloader 上），外加主线程上的看门狗/收拢兜底回调（旧代闭包）。
+     * 只 `dismiss()` 不够：池化 host 故意保留 composition（那就是旧代对象），必须 destroy。
+     *
+     * 与 `dismiss()` 同款串行化：跨线程调用时投递到主线程队列执行（View/WindowManager 操作
+     * 只能在主线程），所以不返回"已释放"的同步承诺——但 `host`/`idleHost` 在同一主线程队列上
+     * 先被清空，后续事件转发（[dispatchTouchEvent]）读到 null 即自然失效。
+     */
+    fun releaseForReload() {
+        if (android.os.Looper.myLooper() == android.os.Looper.getMainLooper()) {
+            releaseInternal()
+        } else {
+            mainHandler.post { releaseInternal() }
+        }
+    }
+
+    private fun releaseInternal() {
+        cancelWatchdog()
+        releasedOnArrival = false
+        exitAfterLaunch = false
+        // 活动窗口：不走收拢动画（旧代正在退役，动画回调本身也可能丢），直接全量销毁
+        host?.let { h ->
+            runCatching { h.releaseForReload() }
+                .onFailure { HLog.w(TAG, "active host release failed: ${it.message}") }
+        }
+        host = null
+        isShowing = false
+        evictIdleHost()
+        activeContext = null
+        mainHandler.removeCallbacksAndMessages(null)
+        HLog.i(TAG, "releaseForReload: fan hosts destroyed, watchdog cancelled")
+    }
+
     fun getStats(): String =
         "fanMenu=${host != null}, isShowing=$isShowing, watchdogFires=$watchdogFires"
 

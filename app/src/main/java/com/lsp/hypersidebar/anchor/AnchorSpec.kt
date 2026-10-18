@@ -151,6 +151,26 @@ object AnchorRoles {
     private const val SIDEBAR = "com.miui.dock.sidebar"
     private const val NEWBOX = "com.miui.gamebooster.windowmanager.newbox"
 
+    /**
+     * 小窗所在的 WM Shell **根包**。
+     *
+     * 为什么用根包而不是精确包：OS3/OS4 的 WM Shell 在 `…shell.multitasking.*`，而 OS2
+     * （merlin / HyperOS 2.1.1，2026-10-16 设备 dexdump 实证）是 `…shell.miuifreeform` /
+     * `…shell.miuimultiwinswitch.*` —— **少一段 `multitasking.`**，类名也是另一族
+     * （`MiuiWindowDecorViewModel` vs `MulWinSwitchDecorViewModel`）。
+     * 精确包会让下面三条 freeform role 在 OS2 上永远 NOT_FOUND（自检里看起来像缺陷）。
+     * 根包 + `ownAll` 指纹 + L0 hint 仍然精确（hint 命中后还要过指纹才认）；结构扫若
+     * 真的多命中，现有 AMBIGUOUS 路径照样 fail-closed。
+     */
+    private const val WM_SHELL = "com.android.wm.shell"
+
+    /** 精确包（仅作 hint 用；两族命名都列上，OS2 走后者） */
+    private const val FREEFORM_OS34 = "com.android.wm.shell.multitasking.miuifreeform"
+    private const val FREEFORM_OS2 = "com.android.wm.shell.miuifreeform"
+    private const val MULTIWIN_DECOR_OS34 =
+        "com.android.wm.shell.multitasking.miuimultiwinswitch.muiwindowdecor"
+    private const val MULTIWIN_DECOR_OS2 = "com.android.wm.shell.miuimultiwinswitch.muiwindowdecor"
+
     private val ON_TOUCH = MethodSpec.of(
         "onTouch", listOf("android.view.View", "android.view.MotionEvent"), "boolean"
     )
@@ -159,6 +179,23 @@ object AnchorRoles {
         "dispatchTouchEvent", listOf("android.view.MotionEvent"), "boolean"
     )
     private val SET_VISIBILITY = MethodSpec.of("setVisibility", listOf("int"), "void")
+
+    /** 小窗动作：缩小/最小化（三代同名同签名，见 docs/adaptation/freeform-blank-tap-scheme.md §6.3） */
+    private val FROM_FREEFORM_TO_MINI = MethodSpec.of(
+        "fromFreeformToMini", listOf("int"), "void"
+    )
+
+    /** OS3/OS4 的事件入口（`MulWinSwitchEventHandler`，jadx 实证 `public void onEvent(MotionEvent, InputMonitor)`） */
+    private val ON_EVENT = MethodSpec.of(
+        "onEvent", listOf("android.view.MotionEvent", "android.view.InputMonitor"), "void"
+    )
+
+    /** OS2 的事件入口（OS2 没有 Handlert/EventController，整个路由在 DecorViewModel；
+     *  jadx 实证 `public void handleReceivedMotionEvent(MotionEvent, InputMonitor)`） */
+    private val HANDLE_RECEIVED_MOTION = MethodSpec.of(
+        "handleReceivedMotionEvent",
+        listOf("android.view.MotionEvent", "android.view.InputMonitor"), "void"
+    )
 
     /** 侧边栏触摸监听：监听器语义 ⇒ super 必是 Object（View 有 onTouch 会另算一类） */
     val SIDEBAR_TOUCH = RoleSpec(
@@ -267,10 +304,41 @@ object AnchorRoles {
     val HOME: List<RoleSpec> = listOf(HOME_GESTURE_STUB, HOME_NAV_STUB, HOME_SWIPE_STOP)
 
     /**
-     * SystemUI。磁贴链路的类名/契约校验由 `SystemUiHook` 的候选表负责（P0-1），
-     * 这里留空表：SystemUI 没有侧边栏类 role，跑了也只是噪声。
+     * SystemUI。磁贴链路的类名/契约校验由 `SystemUiHook` 的候选表负责（P0-1）。
+     *
+     * 这里放**小窗「点击空白处」**的三条 role（2026-10-16 加，设计见
+     * `docs/adaptation/freeform-blank-tap-scheme.md` §6.1/§6.3/§6.4）：
+     * - `freeform_controller`（三代）：动作入口，缩小/最小化。**功能硬依赖**——
+     *   NOT_FOUND ⇒ 功能静默关闭（fail-closed，写 anchor 表日志），不抛异常；
+     * - `freeform_event_handler`（OS3/OS4）/ `freeform_input_router`（OS2）：只作
+     *   **ROM 形态自证**——把"OS2 在哪个 / OS3·4 在哪个"的漂移暴露到自检报告。
+     *   检测本身走 `SystemUiInputSpy` 的全局 monitor 通道（它已无条件启动），
+     *   所以这两条 NOT_FOUND **不关功能**。
+     *
+     * 为什么用 hint 而不是只靠结构扫：`MiuiFreeformModeController` 里存在**内部类**也声明
+     * 同名 `fromFreeformToMini(int):void`，纯结构扫会命中 ≥2 个类 ⇒ AMBIGUOUS；
+     * L0 的 hint 是"候选名 + 必须过 ownAll 指纹"（见 `resolve()`），既精确又保留漂移检测。
      */
-    val SYSTEM_UI: List<RoleSpec> = emptyList()
+    val SYSTEM_UI: List<RoleSpec> = listOf(
+        RoleSpec(
+            "freeform_controller", WM_SHELL, listOf(FROM_FREEFORM_TO_MINI), SuperRule.Any,
+            listOf("$FREEFORM_OS34.MiuiFreeformModeController", "$FREEFORM_OS2.MiuiFreeformModeController")
+        ),
+        RoleSpec(
+            "freeform_event_handler", WM_SHELL, listOf(ON_EVENT), SuperRule.Any,
+            listOf(
+                "$MULTIWIN_DECOR_OS34.MulWinSwitchEventHandler",
+                "$MULTIWIN_DECOR_OS2.MulWinSwitchEventHandler"
+            )
+        ),
+        RoleSpec(
+            "freeform_input_router", WM_SHELL, listOf(HANDLE_RECEIVED_MOTION), SuperRule.Any,
+            listOf(
+                "$MULTIWIN_DECOR_OS34.MulWinSwitchDecorViewModel",
+                "$MULTIWIN_DECOR_OS2.MiuiWindowDecorViewModel"
+            )
+        ),
+    )
 
     /** 按宿主包名选表；未知宿主 = 空表（不解析、不加载 DexKit） */
     fun forHost(pkg: String?): List<RoleSpec> = when (pkg) {

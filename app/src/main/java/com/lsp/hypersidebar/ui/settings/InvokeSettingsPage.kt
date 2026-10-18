@@ -25,12 +25,17 @@ import com.lsp.hypersidebar.util.RemotePrefsBridge
 import kotlin.math.roundToInt
 import top.yukonga.miuix.kmp.basic.Card
 import top.yukonga.miuix.kmp.basic.SmallTitle
+import top.yukonga.miuix.kmp.basic.Text
 import top.yukonga.miuix.kmp.preference.SliderPreference
 import top.yukonga.miuix.kmp.preference.SwitchPreference
+import top.yukonga.miuix.kmp.theme.MiuixTheme
 import top.yukonga.miuix.kmp.utils.overScrollVertical
 
 /**
- * 呼出设置二级页（0913 用户拍板，首页交互区入口进入）。
+ * **操作设置**二级页（2026-10-17 由"呼出设置"改名并并入小窗段；0913 用户拍板建页，首页交互区入口进入）。
+ *
+ * 本页 = 一切的"操作"开关：呼出类（滑动距离 / 呼出停顿 / 呼出后常驻）+ 小窗类
+ * （点击空白处缩小/关闭 + 动作档）。2026-10-17 用户要求把小窗设置并进来，避免二级页碎片化。
  *
  * - 滑动距离 = 呼出确认线（PrefKeys.TRIGGER_MIN_DISTANCE，dp）：hook 侧两通道 DOWN 换算
  *   px 缓存，下次手势生效；滑回重置=确认距离一半（GestureThresholds.SWIPE_RESET_RATIO 滞回）
@@ -116,5 +121,73 @@ internal fun InvokeSettingsPage(prefs: SharedPreferences, modifier: Modifier = M
                 }
             }
         }
+        item { SmallTitle(text = stringResource(R.string.freeform_section)) }
+        item {
+            Card(modifier = Modifier.fillMaxWidth()) {
+                Column {
+                    var enabled by remember(effectivePrefs, repo.revision) {
+                        mutableStateOf(repo.freeformBlankTapEnabled())
+                    }
+                    SwitchPreference(
+                        title = stringResource(R.string.freeform_blank_tap_title),
+                        summary = stringResource(R.string.freeform_blank_tap_summary),
+                        checked = enabled,
+                        onCheckedChange = {
+                            enabled = it
+                            repo.save(PrefKeys.FREEFORM_BLANK_TAP_ENABLED, it)
+                        }
+                    )
+                    // "吞掉触摸（不穿透）"（2026-10-17，**默认关**）：真机反馈抢流会干扰正常拖动/缩小，
+                    // 所以只在用户明确需要"点空白不漏给背后 app"时才开（回退=关掉即可，改完重启 SystemUI 生效）。
+                    var takeover by remember(effectivePrefs, repo.revision) {
+                        mutableStateOf(repo.freeformTakeoverEnabled())
+                    }
+                    SwitchPreference(
+                        title = stringResource(R.string.freeform_takeover_title),
+                        summary = stringResource(R.string.freeform_takeover_summary),
+                        checked = takeover,
+                        onCheckedChange = {
+                            takeover = it
+                            repo.save(PrefKeys.FREEFORM_BLANK_TAP_TAKEOVER, it)
+                        }
+                    )
+                    // 动作档：取值顺序 = 契约 LayoutDefaults.FREEFORM_BLANK_TAP_MODE_VALUES，
+                    // 下标映射不得内联（与「背景模糊来源」同款约束）
+                    val modeValues = LayoutDefaults.FREEFORM_BLANK_TAP_MODE_VALUES
+                    val modeOptions = listOf(
+                        stringResource(R.string.freeform_mode_mini),
+                        stringResource(R.string.freeform_mode_close)
+                    )
+                    val modeSummaries = listOf(
+                        stringResource(R.string.freeform_mode_mini_summary),
+                        stringResource(R.string.freeform_mode_close_summary)
+                    )
+                    var mode by remember(effectivePrefs, repo.revision) {
+                        mutableStateOf(repo.freeformBlankTapMode())
+                    }
+                    val modeIndex = modeValues.indexOf(mode).coerceAtLeast(0)
+                    OverlayDropdownMenu(
+                        title = stringResource(R.string.freeform_mode_title),
+                        options = modeOptions,
+                        selectedIndex = modeIndex,
+                        summary = modeSummaries[modeIndex],
+                        onSelectedIndexChange = { index ->
+                            val value = modeValues[index]
+                            mode = value
+                            repo.save(PrefKeys.FREEFORM_BLANK_TAP_MODE, value)
+                        }
+                    )
+                }
+            }
+        }
+        item {
+            Text(
+                text = stringResource(R.string.freeform_blank_tap_footnote),
+                color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                style = MiuixTheme.textStyles.footnote1,
+                modifier = Modifier.padding(horizontal = 4.dp, vertical = 2.dp)
+            )
+        }
+
     }
 }

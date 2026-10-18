@@ -100,7 +100,7 @@ class TurboLayout(private val remotePrefs: SharedPreferences) : BaseHook() {
     private val mainHandler = android.os.Handler(android.os.Looper.getMainLooper())
     @Volatile private var lastDrawableLogTime = 0L
 
-    private val fanController: FanMenuController by lazy {
+    private val fanLazy: Lazy<FanMenuController> = lazy {
         FanMenuController(
             remotePrefs,
             launchStrategy = DirectLaunchStrategy(remotePrefs),
@@ -110,6 +110,9 @@ class TurboLayout(private val remotePrefs: SharedPreferences) : BaseHook() {
             }
         )
     }
+
+    /** [fanLazy] 的取值入口；释放路径要先判 `isInitialized()`，不能顺手把它初始化出来。 */
+    private val fanController: FanMenuController get() = fanLazy.value
 
     /** 熔断器（1C 轮二）：本进程机制性失败连续 5 次 → 恢复原生侧边栏（走降级动作） */
     private val breaker = CircuitBreaker(PrefKeys.CIRCUIT_OPEN_UI, remotePrefs)
@@ -919,6 +922,15 @@ class TurboLayout(private val remotePrefs: SharedPreferences) : BaseHook() {
                         // DOWN+UP 一次到达）。落地转点选态：点图标直启、点空白/看门狗收。
                         fanController.markReleasedOnArrival()
                     } else {
+                        // 判据（2026-10-17 用户口径）：极快抡（实测 24–40ms）本来就可能是误触 ⇒
+                        // 保持"不落地"的现状，但留一行能对账的证据（与 hook 侧 early-release 同文案）。
+                        val durMs = ev.eventTime - ev.downTime
+                        if (durMs < 120L) {
+                            HLog.i(
+                                TAG,
+                                "k#$cornerSeq early-release dur=${durMs}ms（视为误触：抬手早于扇形落地）"
+                            )
+                        }
                         cancelPendingStripShow()
                     }
                 }
@@ -1100,6 +1112,63 @@ class TurboLayout(private val remotePrefs: SharedPreferences) : BaseHook() {
         )
         // 扇形 UI 类族后台预载（同 EdgeGestureHook）：:ui 侧横屏首呼出同样受益
         com.lsp.hypersidebar.util.FanUiWarmup.warm()
+    }
+
+    /**
+     * API 102 热重载释放（旧代退休前由 `XposedInit.onHotReloading` 调用；幂等）。
+     *
+     * 为什么必须：本 hook（:ui 进程）持有的东西全都由宿主/系统长期持有，不会随旧代消失：
+     *  ① 扇形悬浮窗——`ComposeFanHost` 的 `WindowManager` 窗口 + Compose composition +
+     *     lifecycle 都绑在旧代 classloader 上（只摘窗不销毁 composition 仍会钉住旧代）；
+     *  ② 条上/底角状态机的三个定时器与待呼出 show——都是**旧代闭包**，尤其停顿定时器到点会
+     *     去 `fanController.show(...)`：即"旧代窗口复活"，必须撤；
+     *  ③ `RelayGestureSink` 的 spy 流转发接收器（不注销则旧代继续被喂流）；
+     *  ④ `WallpaperSampler` 的壁纸变更接收器；
+     *  ⑤ 主线程上排队的回调（native retry / 预热装配 / 照壁纸等）。
+     *
+     * 只释放资源，**不动 native**（:ui 无 native hook；见 `XposedInit.onHotReloaded`）。
+     * 任一步失败只 `HLog.w`。
+     */
+    override fun releaseForReload() {
+        // 定时器与排队回调先撤（避免释放过程中旧代回调又开一次窗口）
+        runCatching {
+            cancelPendingStripShow()
+            cancelStallTimer()
+            cancelAuthPoll()
+            mainHandler.removeCallbacksAndMessages(null)
+        }.onFailure { HLog.w(TAG, "timer cleanup failed: ${it.message}") }
+        runCatching { RelayGestureSink.releaseForReload() }
+            .onFailure { HLog.w(TAG, "sink release failed: ${it.message}") }
+        runCatching { com.lsp.hypersidebar.util.WallpaperSampler.releaseForReload() }
+            .onFailure { HLog.w(TAG, "wallpaper release failed: ${it.message}") }
+        // 扇形窗口：控制器从未初始化过就不要在这里把它初始化出来（isInitialized 判定）
+        runCatching {
+            if (fanLazy.isInitialized()) fanLazy.value.releaseForReload()
+        }.onFailure { HLog.w(TAG, "fan controller release failed: ${it.message}") }
+        // 内部状态机复位（释放后同代内若再被喂流，从干净状态开始；热重载路径上新代是全新实例）
+        runCatching {
+            resetStripGesture()
+            cornerTrigger.reset()
+        }.onFailure { HLog.w(TAG, "state reset failed: ${it.message}") }
+        HLog.i(TAG, "releaseForReload: fan window/timers/sink released (:ui)")
+    }
+
+    /**
+     * 热重载重挂（API 102；与 [releaseForReload] 对称）。
+     *
+     * 本类**自己没有** attach 期注册：它释放掉的两样东西挂在别处——
+     * ① `RelayGestureSink` 的流接收器（它自挂 attach 钩子，热重载不重放 ⇒ 必须显式重挂）；
+     * ② `WallpaperSampler` 的壁纸变更监听（注册点在本类 init 的 `DataLoader.onReady` 里，
+     *    异步且依赖数据源就绪 ⇒ 释放后不能指望它"早晚再跑一次"）。
+     * 其余（本类自己的 Java hooks、`RelayGestureSink.arm` 的 owner、DataLoader 预热）由新代的
+     * `init()` 自然重做 —— `installFor(UI)` 会重新调它。
+     */
+    override fun rearmHostSide(ctx: Context) {
+        runCatching { RelayGestureSink.rearmHostSide(ctx) }
+            .onFailure { HLog.w(TAG, "sink rearm failed: ${it.message}") }
+        runCatching { com.lsp.hypersidebar.util.WallpaperSampler.rearmHostSide(ctx) }
+            .onFailure { HLog.w(TAG, "wallpaper rearm failed: ${it.message}") }
+        HLog.i(TAG, "rearmHostSide: sink stream receiver + wallpaper watch restored (:ui)")
     }
 
     // ===== 小白条视觉隐藏（EDGE 模式） =====

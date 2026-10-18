@@ -61,7 +61,19 @@ class ComposeFanHost(
     private var lastSelectedFanIndex = -1
     private var lastSelectedQuickIndex = -1
     private var selectedSince = 0L
+    /** 当前"连续悬停"的起点（手指第一次落到任一图标/快捷项的时刻）。换项不清零。 */
+    private var streakSince = 0L
     private val DWELL_MS = 150L
+    /**
+     * 最后一个图标的最小停留（连续悬停语义的防误触半环）。
+     *
+     * 2026-10-17 真机实测（OS2 侧滑停顿通道）：手指沿弧轻微漂移会在图标间反复换项
+     * （`sel change: 4->3->2->1`，间隔 648/100/85ms），而旧逻辑"每次换项都重置
+     * selectedSince"⇒ 150ms 门要等手指**完全停稳**才起算 ⇒ 观感"要比角滑停更久才能打开"。
+     * 现改为：换项只重置 [selectedSince]（本项停留），[streakSince] 持续累计 ⇒
+     * 只要整体悬停够 150ms 且最终项停留 ≥ 本值即启动（快速扫过多项仍被这一项拦住）。
+     */
+    private val FINAL_MIN_MS = 60L
 
     // ===== 池化复用（1C P2，方案对比后选"池=1 实例重配"）=====
     // composition/lifecycle/视图树跨呼出存活（只摘窗口），把暖呼出从 ~250-300ms
@@ -399,6 +411,9 @@ class ComposeFanHost(
                             dimEnabled = readBoolean(
                                 PrefKeys.FAN_DIM_ENABLED, LayoutDefaults.FAN_DIM_ENABLED
                             ),
+                            scrimFadeMs = readInt(
+                                PrefKeys.FAN_SCRIM_FADE_MS, LayoutDefaults.FAN_SCRIM_FADE_MS
+                            ),
                             source = blurSource,
                             wallpaper = if (blurSource == FanBackdropSource.WALLPAPER) wallpaperBitmap else null,
                             wallpaperOffset = wallpaperOffset,
@@ -481,6 +496,7 @@ class ComposeFanHost(
                         lastSelectedFanIndex = -1
                         lastSelectedQuickIndex = -1
                         selectedSince = 0L
+                        streakSince = 0L
                         // 采集层 v2：DOWN 即起点，位移从这一刻开始累加
                         StatsRecorder.onFanMove(x, y)
                         val (fanSel, quickSel) = resolveSelection(
@@ -496,7 +512,9 @@ class ComposeFanHost(
                             return true
                         }
                         if (fanSel != -1 || quickSel != -1) {
-                            selectedSince = SystemClock.uptimeMillis()
+                            val t = SystemClock.uptimeMillis()
+                            selectedSince = t
+                            streakSince = t
                             StatsRecorder.onFanPreselected()
                         }
                         touchState.value = FanTouchState(x, y, 0, fanSel, quickSel)
@@ -517,6 +535,8 @@ class ComposeFanHost(
                         if (inCancelZone && (prevFan != -1 || prevQuick != -1)) {
                             lastSelectedFanIndex = -1
                             lastSelectedQuickIndex = -1
+                            selectedSince = 0L
+                            streakSince = 0L
                             touchState.value = FanTouchState(x, y, 0, -1, -1)
                             Log.d(TAG, "touch CLEAR by cancel zone (inner=${innerCancelPx.toInt()}, outer=${outerCancelPx.toInt()})")
                             return true
@@ -531,9 +551,23 @@ class ComposeFanHost(
                         }
 
                         val anySelected = fanSel != -1 || quickSel != -1
-                        if (anySelected && (fanSel != prevFan || quickSel != prevQuick)) {
-                            selectedSince = SystemClock.uptimeMillis()
-                            StatsRecorder.onFanPreselected()
+                        val prevSelected = prevFan != -1 || prevQuick != -1
+                        when {
+                            !anySelected -> {      // 选中变空 ⇒ 整段连续悬停结束
+                                selectedSince = 0L
+                                streakSince = 0L
+                            }
+                            !prevSelected -> {     // 从空白进入图标：新一段连续悬停
+                                val t = SystemClock.uptimeMillis()
+                                selectedSince = t
+                                streakSince = t
+                                StatsRecorder.onFanPreselected()
+                            }
+                            fanSel != prevFan || quickSel != prevQuick -> {
+                                // 换项：只重置"本项停留"，连续悬停总计时继续累计
+                                selectedSince = SystemClock.uptimeMillis()
+                                StatsRecorder.onFanPreselected()
+                            }
                         }
 
                         touchState.value = FanTouchState(x, y, 0, fanSel, quickSel)
@@ -559,7 +593,9 @@ class ComposeFanHost(
                         // selectedSince==0 = 手势期间从未预选过（快速扫过即松手），dwell 按 0 计——
                         // 顺带修真 bug：此前 uptime−0 为巨大垃圾值，会让 <150ms 快速松手也通过
                         // 预选时长检查（违反 PRD"预选不足 150ms 松手不启动"）
-                        val dwellMs = if (selectedSince == 0L) 0L else SystemClock.uptimeMillis() - selectedSince
+                        val nowUp = SystemClock.uptimeMillis()
+                        val dwellMs = if (selectedSince == 0L) 0L else nowUp - selectedSince
+                        val streakMs = if (streakSince == 0L) 0L else nowUp - streakSince
                         val hitItem = geometry.items.getOrNull(fanSel)
                         HLog.i(
                             TAG,
@@ -568,25 +604,28 @@ class ComposeFanHost(
                                 (hitItem?.let {
                                     " [${it.app.packageName} ang=${"%.1f".format(it.angle)} rad=${it.radius.toInt()} ctr=(${it.centerX.toInt()},${it.centerY.toInt()})]"
                                 } ?: "") +
-                                " quick=$quickSel dwell=$dwellMs"
+                                " quick=$quickSel dwell=$dwellMs streak=$streakMs"
                         )
 
-                        val dwellTime = if (selectedSince == 0L) 0L else SystemClock.uptimeMillis() - selectedSince
+                        val dwellTime = dwellMs
                         val anySelected = fanSel in geometry.items.indices
                         val anyQuick = quickSel in geometry.quickApps.indices
-                        // 常驻点选态：跳过 150ms 预选门——点按的 DOWN→UP 间隔远小于滑选
-                        // 预选时长，门槛会把"明明点中了"判成"dwell too short"拒启动
+                        // 常驻点选态：跳过预选门——点按的 DOWN→UP 间隔远小于滑选预选时长，
+                        // 门槛会把"明明点中了"判成"dwell too short"拒启动
                         val commitGate = if (released) 0L else DWELL_MS
+                        val finalGate = if (released) 0L else FINAL_MIN_MS
+                        val passedDwell = dwellTime >= commitGate && streakMs >= commitGate &&
+                            dwellTime >= finalGate
 
                         when {
                             !anySelected && !anyQuick -> {
                                 handleQuickBarTap(x, y, geometry, config, density)
                             }
-                            anySelected && dwellTime < commitGate -> {
-                                Log.d(TAG, "dwell too short: ${dwellTime}ms, not launching")
+                            anySelected && !passedDwell -> {
+                                Log.d(TAG, "dwell too short: item=${dwellTime}ms streak=${streakMs}ms (need $commitGate/$finalGate), not launching")
                             }
-                            anyQuick && dwellTime < commitGate -> {
-                                Log.d(TAG, "dwell too short: ${dwellTime}ms, not launching")
+                            anyQuick && !passedDwell -> {
+                                Log.d(TAG, "dwell too short: item=${dwellTime}ms streak=${streakMs}ms (need $commitGate/$finalGate), not launching")
                             }
                             anySelected -> {
                                 HLog.i(TAG, "selected fan: ${geometry.items[fanSel].app.packageName}")
@@ -702,6 +741,24 @@ class ComposeFanHost(
         currentParams = null
         built = false
         pendingInput = null
+    }
+
+    /**
+     * API 102 热重载释放（由 [FanMenuController.releaseForReload] 在主线程调用；幂等）。
+     *
+     * 为什么必须：本对象是热重载里最"重"的资源持有者——`WindowManager` 悬浮窗、Compose
+     * composition、lifecycleOwner、视图树全部绑在本代 classloader 上。**只摘窗口不够**
+     * （池化复用的前提正是"composition 跨呼出存活"），必须走 [destroy] 把 composition 与
+     * lifecycle 一起释放；主线程 Handler 上还挂着收拢兜底回调（`teardownIfCurrent`）与预热
+     * 摘窗回调，它们是旧代闭包，也要一并撤。
+     * 释放后本实例**不得再用**（池化语义作废——controller 会清空 host/idleHost，
+     * 新代下次呼出重新构造）。
+     */
+    fun releaseForReload() {
+        runCatching { mainHandler.removeCallbacksAndMessages(null) }
+            .onFailure { HLog.w(TAG, "handler cleanup failed: ${it.message}") }
+        runCatching { destroy() }
+            .onFailure { HLog.w(TAG, "release destroy failed: ${it.message}") }
     }
 
     fun dispatchTouchEvent(event: MotionEvent): Boolean {

@@ -7,7 +7,7 @@ AI-assistant-oriented guide to `hyperSidebar`. Read this before editing anything
 LSPosed/Xposed module that replaces the HyperOS/MIUI native sidebar with a **dual-ring semicircle fan joystick menu**: edge-hold / bottom-corner swipe gesture → fan overlay → app launched in freeform (小窗). Kotlin + Jetpack Compose on the **miuix KMP** UI kit. Hooks three Xiaomi system hosts — it does not run as a normal app except for its own settings process.
 
 - Verified only on **HyperOS 3.300** (marble), Android 13+. OS2 = offline-adapted; OS4 = native spike in progress.
-- Requires root + LSPosed (API 101+). Scopes: `com.miui.securitycenter`, `com.android.systemui`, `com.miui.home` (`app/src/main/resources/META-INF/xposed/scope.list`).
+- Requires root + LSPosed (API 102+). Scopes: `com.miui.securitycenter`, `com.android.systemui`, `com.miui.home` (`app/src/main/resources/META-INF/xposed/scope.list`).
 - **Identity split (easy to break):** `namespace = com.lsp.hypersidebar` (source tree, class paths, resources) vs `applicationId = io.github.mikudayoooooooo.hypersidebar` (APK/process identity, LSPosed-repo requirement). When addressing components cross-process: package part → applicationId, class part → namespace.
 - HyperOS 3.300 only in README; adaptation matrix: `docs/adaptation/adaptation-checklist.md`.
 
@@ -38,6 +38,17 @@ Hard-won architectural constraints — do not "fix" these:
 - **`RemotePreferences` in hook processes is a dead snapshot** (no prefs push over AIDL; change listeners only fire in-process and are weak). Config reachability is solved by own channels: `ConfigSync` + `SyncedPrefs` + `ConfigPullBridge`, and **system properties** (`persist.hsb.*`) for anything native.
 - **OS4 launcher is pure Rust/C++ with no dex, no ART.** LSPosed can only `dlopen` `libhypersidebar_native.so` (`native_init`); native gets no Java-side data → properties only (`CornerGeomBridge.push/pushBand`, read-back verified).
 - **Hook targets are never hard-coded.** Obfuscated names drift; `anchor/` resolves them structurally at runtime: L0 disk hint → L1 reflection fingerprint verify → L2 DexKit structural scan, fail-closed per role, disk-cached per host version.
+- **`pilferPointers()` 不可回滚，抢了就必须消费/转发**（2026-10-17 血案）：曾为"点空白不穿透"在 DOWN 对"功能开+有小窗+判空白"的手势抢流，但没有消费 ⇒ 背后 UI 收不到任何触摸 ⇒ **整机像卡死**，且每个新手势都会再抢一次。⇒ 想"吞掉某一下点击"必须换**输入消费通道**（SystemUI 系统 uid 下的 `InputFilter`：消费 + 按需转发），不能靠 monitor 抢流。**且重放不能等到抬手**：整条攒到 UP 再 `injectInputEvent` ⇒ 一次拖动被还原成"起点的一次点击"（真机"拖动被吞"）。正确做法 = **边收边转**：一旦越过轻点阈值（位移/时长/多指）立刻按序注入缓冲并转入实时转发；注入被拒 ⇒ 立刻永久关掉该机制（见 `SystemUiInputSpy` takeover 段）。
+- **改设置项只能走 App 的写入路径**：hook 侧读的是 `ConfigSync` 下发的快照，root 直接改 `shared_prefs/hyperSidebar_prefs.xml` **不生效**（实测：文件 `close`、hook 读到 `mini`）。
+- **LSPosed 的模块 dex 可能跨安装陈旧**：`adb install -r` + 重启宿主进程后新代码的独有日志**不出现**，重启设备才生效 ⇒ 排查以"新代码独有日志"为判据，别信"进程重启了"。
+- **装机后先验注入**：`install -r` 换了 APK 路径会让 LSPosed 库里记录的路径失效 ⇒ 模块**完全静默不注入**（功能像坏了，但模块 App 能开、`modules_config.db` 里 `enabled=1`/scope 都正常）。先 `grep hypersidebar /data/adb/lspd/log/modules_*.log` 确认有行，再谈功能；修法见 `docs/adaptation/freeform-blank-tap-scheme.md` §7.8(d)。
+- **IME（软键盘）位置：这台 ROM 的 insets 全不可信 ⇒ 用 `dumpsys` 地面真值**（2026-10-17 逐条实测）：`IWindowManager.getWindowInfos` 不存在、`InputMethodManager.getInputMethodWindowVisibleHeight` 取不到、display 级 `getCurrentWindowMetrics().getWindowInsets()` 键盘收起后**仍报旧值**（缓存 ✗）、自建 overlay（2038/2003）与 SystemUI 视图钩子收到的 IME insets **恒 0**、`isActive()` 从 SystemUI 恒 false。⇒ `hook/InsetProbe.kt` 后台每 2s `su -c 'dumpsys window windows | grep -A40 InputMethod'` 解析 `mFrame` 高度（**没有窗口=0、有窗口无 mFrame=未知(null)，绝不当 0**），并配两条铁律：带 TTL 10s 但**每次成功读数续期**；"从未拿到读数"时屏幕下部 45% **一律不动作、不抢流**（宁可少一个动作，也绝不吃键盘）。
+- **IME（软键盘）位置只能靠 `WindowInsets` 公开 API**：这台 ROM 上 `IWindowManager$Stub$Proxy` 没有 `getWindowInfos`（framework.jar 里 0 次），`InputMethodManager.getInputMethodWindowVisibleHeight()` 也反射不到 ✗ ⇒ 用 `hook/InsetProbe.kt`：**主路径 = 轮询 `WindowManager.getCurrentWindowMetrics().getWindowInsets()` 的 `Type.ime().bottom`**（不需要加窗），辅路径 = 满宽 1px 透明 overlay 的 insets 回调（**1×1 窗口收不到 IME insets** ✗）。任何"小窗外=空白"的判定都必须先减掉这条带，否则打字点键盘会触发动作。⚠ 这个类里的诊断必须用 `android.util.Log`：`HLog` 在 `Application.attach` 极早期可能还没就绪，真机上会出现"探针明明跑了却零日志"。
+- **抢流（pilfer）必须与"谁来消费"同一道门**：OS2 的角区扇形是 **launcher 自己**（`EdgeGestureHook` 走 ROM NavStubView 流）起的，OS4 才是 spy→`:ui` 转发（`b2Enabled()`）。所以 `SystemUiInputSpy` 的同进程抢流只在 OS4（`com.miui.sidebar.ISidebarOverlay` 存在）开——否则 launcher 的流被抢、转发侧又没人消费，角区彻底不出（2026-10-17 实测 `EdgeGesture … shown=false`）。
+- **绝不在 hook 安装期触碰 ROM 的单例**（2026-10-17 OS4 血案，严重级）：`com.android.wm.shell.dagger.MultiTaskingControllerStub` 的 `sInstance` 是 `static final = MiuiStubUtil.getInstance(...)`——**谁先碰这个类就永久决定单例是 bare stub 还是真 Impl**。在 WMShell/Dagger 注册实现之前调 `MultiTaskingControllerImpl.getInstance()` 会把它钉成 stub，之后 ROM 自己的 `SoScSplitScreenController.onInit` cast 必抛 `ClassCastException` ⇒ **SystemUI 崩溃循环**，进而触发 **LSPosed SafeMode**（`System UI crashed too many times, stop all modules and enter safe mode`，本 boot 内所有模块不再注入 SystemUI，**只能重启手机**）。⇒ 这类句柄一律**推迟到首次真正使用**（那时 UI 已起）再解析，且用 `ClassLoader.loadClass`（不初始化）+ `runCatching` 兜住。
+- **ROM 句柄优先向 Dagger 组件按需取，别等 UI 触发构造**：QS 宿主适配器在 OS2 是懒提供的（首次打开控制中心才 new），所以"面板没下拉过就点磁贴"必失败；正解是 `SystemUIAppComponentFactoryBase.systemUIInitializer`（static）→ `getSysUIComponent()` → 名字含 `HostAdapter…Provider` 的字段 → `get()`。这类组件在启动时已构建完成，**可以安全地提前查**（与 WMShell 静态单例那种"提前触碰即污染"恰好相反，见上一条）。
+- **ROM 的过渡类动作必须跑在它自己的 Handler 线程上**（不是主线程）：`MiuiFreeformModeAnimation.*`/`Transitions.startTransition` 会断言 `must be called on Handler {…}`（WMShell 的 HandlerThread）⇒ 一律通过 `controller.mMainExecutor`（`ShellExecutor`）投递；投主线程会被拒（2026-10-17 实测）。
+- **ROM 的小窗动作要在主线程调**：`MiuiFreeformModeController.fromFreeformToMini` 在 spy 的输入回调线程上必抛（`InvocationTargetException`，cause=NPE），投 `Handler(main)` 后成功。
 - **`:ui` silently fake-succeeds** `startActivityAsUser` on unlaunchable targets (no exception) → non-exported targets go through module-process root relay (`ShortcutRelayReceiver`).
 - **Component class names must be absolute** (`ComponentName` two-arg ctor does not expand leading dot).
 
@@ -55,7 +66,7 @@ Hard-won architectural constraints — do not "fix" these:
 | `anchor/` | Structured hook-target resolution (hint + reflection + DexKit) |
 | `theme/` | `HyperSidebarTheme` over `MiuixTheme` |
 | `app/src/main/cpp/` | `hypersidebar_native.c` (OS4 native entry, `HSB_NATIVE_SPIKE` gated), `launcher_profiles.h` (generated), CMake + export map |
-| `app/src/main/resources/META-INF/xposed/` | `module.prop` (minApiVersion 101, staticScope=false), `scope.list`, `java_init.list`, `native_init.list` |
+| `app/src/main/resources/META-INF/xposed/` | `module.prop` (minApiVersion 102, staticScope=false), `scope.list`, `java_init.list`, `native_init.list` |
 | `hidden-api/` | Compile-only `@hide` stubs (`InputChannel`, `InputEventReceiver`) — **compileOnly, no keep rules** |
 | `docs/`, `tools/`, `PROJECT_NOTES.md`, `.workbuddy/`, `.zcode/`, `.mimosa/`, `.ota-extract/`, `_apk/`, `_repos/` | **Git-ignored local research workspace.** Editing them never shows in `git status` |
 
