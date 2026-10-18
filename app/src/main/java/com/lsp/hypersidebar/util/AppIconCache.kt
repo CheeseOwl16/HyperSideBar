@@ -33,6 +33,16 @@ object AppIconCache {
     }
 
     /** 仅查缓存，不触发 binder（主线程组合路径用）。 */
+
+    /** 热重载释放（2026-10-18）：旧代的线程池跨代存活（守护线程不会自己退），
+     *  钉死旧 classloader；新代是全新 object 自带新池。未起过 = 空操作。 */
+    fun releaseForReload() {
+        runCatching { loader.shutdownNow() }
+            .onFailure { HLog.w(TAG, "executor shutdown failed: ${it.message}") }
+        runCatching { cache.evictAll() }
+            .onFailure { HLog.w(TAG, "cache evict failed: ${it.message}") }
+        runCatching { HLog.i(TAG, "releaseForReload: done") }
+    }
     fun peek(pkg: String): Bitmap? = cache.get(pkg)
 
     /** 查缓存 + miss 时 binder 加载解码。必须在后台线程调用。 */

@@ -177,6 +177,19 @@ class XposedInit : XposedModule() {
             runCatching { h.releaseForReload() }
                 .onFailure { HLog.w(TAG, "releaseForReload [${n}] failed: ${it.message}") }
         }
+        // 进程级共享单例（非 BaseHook，但同样持有跨代资源：常驻线程/线程池/overlay 窗）。
+        // 全部幂等（未起过 = 空操作）；旧代自清 ⇒ 旧 classloader 才能被回收。
+        // 2026-10-18 依 libxposed skill 03 的清理清单补：Java 线程 / 外部回调 / 宿主侧引用。
+        for ((n, block) in listOf(
+            "InsetProbe(overlay)" to { com.lsp.hypersidebar.hook.InsetProbe.releaseForReload() },
+            "ConfigPullBridge(HandlerThread)" to { com.lsp.hypersidebar.util.ConfigPullBridge.releaseForReload() },
+            "UnfreezeBridge(HandlerThread)" to { com.lsp.hypersidebar.util.UnfreezeBridge.releaseForReload() },
+            "AppIconCache(pool)" to { com.lsp.hypersidebar.util.AppIconCache.releaseForReload() },
+            "DataLoader(pool)" to { com.lsp.hypersidebar.util.DataLoader.releaseForReload() },
+            "FanPrewarmer(pool)" to { com.lsp.hypersidebar.util.FanPrewarmer.releaseForReload() },
+        )) {
+            runCatching { block() }.onFailure { HLog.w(TAG, "release [$n] failed: ${it.message}") }
+        }
         return true
     }
 

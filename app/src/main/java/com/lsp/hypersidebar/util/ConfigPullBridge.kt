@@ -72,8 +72,27 @@ object ConfigPullBridge {
         }, "ConfigPull").apply { isDaemon = true }.start()
     }
 
+    /**
+     * 热重载释放（2026-10-18）：旧代的常驻应答线程必须退出，否则它跨代存活
+     * （HandlerThread 的 looper 持有本代 classloader ⇒ 旧代永远回收不掉）。
+     *
+     * ⚠ 释放后旧代若还有在途回调调 [refreshIfStale]（已开始的 hook 调用会继续跑完），
+     * `Handler(replyThread.looper)` 会在**死 looper** 上抛——那个调用跑在自建线程上、
+     * 没人兜底 ⇒ 不接住就是崩宿主。所以 [pullBlocking] 必须整体 runCatching。
+     */
+    fun releaseForReload() {
+        runCatching { replyThread.quitSafely() }
+            .onFailure { HLog.w(TAG, "replyThread quit failed: ${it.message}") }
+    }
+
     /** 后台线程调用：bind 模块 App 拉全量配置，应答落 ConfigSync 缓存。 */
     private fun pullBlocking(appCtx: Context) {
+        // 整体兜底：见 [releaseForReload] 的注释（死 looper 上建 Handler 会抛）
+        runCatching { pullBlockingInner(appCtx) }
+            .onFailure { HLog.w(TAG, "pull aborted: ${it.message}") }
+    }
+
+    private fun pullBlockingInner(appCtx: Context) {
         val t0 = SystemClock.elapsedRealtime()
         val latch = CountDownLatch(1)
         var gotMap: Map<String, Any>? = null

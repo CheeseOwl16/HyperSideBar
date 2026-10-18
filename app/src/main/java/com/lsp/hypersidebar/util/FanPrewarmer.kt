@@ -47,6 +47,14 @@ object FanPrewarmer {
      *   用于图标缓存预灌
      * @param token      remotePrefs 令牌（relay 防伪，与点击同款）
      */
+
+    /** 热重载释放（2026-10-18）：旧代的线程池跨代存活（守护线程不会自己退），
+     *  钉死旧 classloader；新代是全新 object 自带新池。未起过 = 空操作。 */
+    fun releaseForReload() {
+        runCatching { executor.shutdownNow() }
+            .onFailure { HLog.w(TAG, "executor shutdown failed: ${it.message}") }
+        runCatching { HLog.i(TAG, "releaseForReload: done") }
+    }
     fun onFanShown(context: Context, tileTargets: List<Pair<String, String>>, fanAppPkgs: List<String>, token: String?) {
         val appCtx = context.applicationContext
         // 图标预热：扇形固定应用+快捷栏宿主优先 + AllApps 首屏（进程级 LruCache ≈2-3MB，无进程语义）

@@ -58,7 +58,28 @@ object UnfreezeBridge {
      * 须在后台线程调用。返回 true=su 解冻已执行成功；false=失败/超时
      * （调用方照常发点击——目标未必冻结，解冻只是尽力而为的防线）。
      */
+    /**
+     * 热重载释放（2026-10-18）：同 [ConfigPullBridge]——常驻应答线程跨代存活会钉死旧
+     * classloader；释放后旧代在途回调在死 looper 上建 Handler 会抛 ⇒ 整体 runCatching
+     * 兜底（调用方语义本来就是"尽力而为"，false = 失败照常发点击）。
+     */
+    fun releaseForReload() {
+        runCatching { replyThread.quitSafely() }
+            .onFailure { HLog.w(TAG, "replyThread quit failed: ${it.message}") }
+    }
+
     fun unfreezeBlocking(context: Context, pkg: String, token: String?, trace: String? = null): Boolean {
+        if (isFresh(pkg)) return true
+        // 整体兜底：见 [releaseForReload]（死 looper ⇒ Handler 创建抛 ⇒ 不接住会崩宿主）
+        return try {
+            unfreezeBlockingInner(context, pkg, token, trace)
+        } catch (t: Throwable) {
+            HLog.w(TAG, "unfreeze aborted: ${t.message}")
+            false
+        }
+    }
+
+    private fun unfreezeBlockingInner(context: Context, pkg: String, token: String?, trace: String? = null): Boolean {
         if (isFresh(pkg)) return true
         val appCtx = context.applicationContext
         val t0 = SystemClock.elapsedRealtime()

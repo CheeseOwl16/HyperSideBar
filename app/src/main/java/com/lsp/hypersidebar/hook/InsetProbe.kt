@@ -509,6 +509,8 @@ object InsetProbe {
 
     @Volatile private var ctxRef: Context? = null
     @Volatile private var added = false
+    @Volatile private var overlayView: View? = null
+    @Volatile private var overlayWm: WindowManager? = null
     private var lastLogged = -1
 
     /** 冷启动时调用一次（可失败/可不调用，见 [ensure]）。 */
@@ -532,6 +534,37 @@ object InsetProbe {
             installWmShellImeHooks()
             addOverlay(ctx)
         }
+    }
+
+    /**
+     * 热重载释放（2026-10-18）：**摘掉本代加的 overlay 探针窗**，否则——
+     * 每次热重载，新代是全新 object（`added=false`）⇒ 再加一个 1px 窗；旧窗没人摘 ⇒
+     * 窗数量随重载次数线性涨；且旧窗的 insets 监听器闭包握着旧代 object ⇒
+     * 旧 classloader 永远回收不掉（skill 03 的"必须清理：外部回调/宿主侧引用"）。
+     *
+     * 不碰 `wmShellHooked`：WMShell 钩子的摘除归框架（onHotReloaded 的 oldHookHandles
+     * → unhook），这里只管**我们自己加的窗**与本代状态。
+     */
+    fun releaseForReload() {
+        val v = overlayView
+        val wm = overlayWm
+        if (v != null && wm != null) {
+            runCatching { wm.removeView(v) }
+                .onFailure { HLog.w(TAG, "overlay remove failed: ${it.message}") }
+        }
+        overlayView = null
+        overlayWm = null
+        added = false
+        ctxRef = null
+        overlaySeen = false
+        // 键盘带状态一并清（旧代不再读写；新代从零开始，避免旧值被误当"已知"）
+        imeBottomRaw = 0
+        imeBottomAt = 0L
+        imeKnown = false
+        imeRectRaw = null
+        lastLogged = -1
+        source = "none"
+        HLog.i(TAG, "releaseForReload: overlay removed, probe state reset")
     }
 
     private fun addOverlay(ctx: Context) {
@@ -563,6 +596,8 @@ object InsetProbe {
                 lp.gravity = Gravity.BOTTOM or Gravity.START
                 lp.softInputMode = WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE
                 wm.addView(v, lp)
+                overlayView = v
+                overlayWm = wm
                 // 主动请求一次 insets 派发：否则监听器要等到下一次 insets 变化才回调
                 // （键盘在加窗前就弹着的话，永远等不到 ⇒ 探针读不到值 ✗）。
                 v.post { runCatching { v.requestApplyInsets() } }

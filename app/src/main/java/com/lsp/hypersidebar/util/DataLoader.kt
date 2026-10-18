@@ -63,6 +63,14 @@ object DataLoader {
     }
     private val mainHandler = android.os.Handler(android.os.Looper.getMainLooper())
 
+
+    /** 热重载释放（2026-10-18）：旧代的线程池跨代存活（守护线程不会自己退），
+     *  钉死旧 classloader；新代是全新 object 自带新池。未起过 = 空操作。 */
+    fun releaseForReload() {
+        runCatching { executor.shutdownNow() }
+            .onFailure { HLog.w(TAG, "executor shutdown failed: ${it.message}") }
+        runCatching { HLog.i(TAG, "releaseForReload: done") }
+    }
     fun loadApps(context: Context): List<String> {
         val appContext = context.applicationContext
         startBackstop(appContext)

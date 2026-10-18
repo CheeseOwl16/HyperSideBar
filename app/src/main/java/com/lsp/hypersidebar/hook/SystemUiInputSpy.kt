@@ -501,10 +501,15 @@ object SystemUiInputSpy {
         }
         // 抢流与"能否动作"同门（2026-10-17）：没有可动作的目标 ⇒ 不抢，让点击照常落到背后 app。
         // 档位敏感：close 档下 mini/挂起窗也可关 ⇒ 允许（mini 档下对 mini 窗再缩是空操作 ⇒ 不抢）。
-        val p = prefs
-        // 2026-10-17 用户口径：mini 态**不作为目标** ⇒ 抢流也只认正常态小窗（与动作层同门）。
-        if (!h.hasActionTarget()) {
-            HLog.i(TAG, "takeover: 无正常态小窗（mini/挂起）⇒ 不抢流，点击照常落给系统")
+        // 2026-10-18：档位现在**真的传进动作层**了——此前 `hasActionTarget()` 内部无条件跳过
+        // mini，与这条注释相反 ⇒ 小窗收成角落图标后点空白既不动作也不接管，点击漏给桌面
+        // （用户实测"空白处几乎无法正常使用"）。
+        val mode = prefs?.getString(
+            com.lsp.hypersidebar.prefs.PrefKeys.FREEFORM_BLANK_TAP_MODE,
+            com.lsp.hypersidebar.prefs.LayoutDefaults.FREEFORM_BLANK_TAP_MODE_DEFAULT
+        ) ?: com.lsp.hypersidebar.prefs.LayoutDefaults.FREEFORM_BLANK_TAP_MODE_DEFAULT
+        if (!h.hasActionTarget(mode)) {
+            HLog.i(TAG, "takeover: 无可动作小窗（mode=$mode；mini 档下 mini 窗是空操作）⇒ 不抢流")
             return@runCatching false
         }
         HLog.i(TAG, "takeover armed at (${x.toInt()},${y.toInt()}) wins=${wins.size}")

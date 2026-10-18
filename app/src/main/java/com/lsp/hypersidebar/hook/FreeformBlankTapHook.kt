@@ -510,10 +510,24 @@ class FreeformBlankTapHook(private val prefs: SharedPreferences) : BaseHook() {
      * 否则两处判断可能对不上。
      */
     private fun boundsOf(info: Any): FreeformBlankTest.Window? {
+        // ⚠ 绝不把 `getBounds()` 当**必要条件**（2026-10-18 真机踩到）：
+        // ROM 的 `getBounds() = getBaseAnimTarget().getCurrentBounds()`（jadx 实证），
+        // 小窗被缩成 mini/挂起后 base anim target 不在 ⇒ 抛 ⇒ 返回 null。若 raw 是必要条件，
+        // 这个窗会**整个从几何表消失**：`windowsInZOrder()`/`takeoverRects()` 双空 ⇒
+        // isBlank 退化成只信 ROM 谓词、抢流也判"no window geometry"，用户现象＝
+        // "小窗收成角落图标后空白处几乎无法正常使用"（既不动作也不接管，点击漏给背后）。
+        // 而可见命中区 `getScaledBounds()`（本函数本来就优先用它）在 mini 态是**有效**的
+        //（ROM 的 mini 目的地几何）⇒ 只在两者都拿不到时才放弃。
+        // 只做这一处放宽：`getBounds()` 从"必要条件"变成"scaled 的备胎"。
+        // **不加**其它几何访问器的猜测性回退——它们大多语义不明（例如 `getRestoreMiniBounds`
+        // 是"mini **之前**的矩形"），一旦被当成命中区，会把大片**已经是空白**的旧窗口区域
+        // 判成"非空白" ⇒ 那片区域点什么都不动作，比"拿不到几何（点击照常穿透）"更糟。
+        // 若真机证明 `getScaledBounds()` 在 mini 态也不可用，再按实测数据补特定访问器。
         val scaled = info.getOrNull("getScaledBounds") as? Rect
-        val raw = info.getOrNull("getBounds") as? Rect ?: return null
+        val raw = info.getOrNull("getBounds") as? Rect
+        if (scaled == null && raw == null) return null
         val scale = (info.getOrNull("getFreeformScale") as? Number)?.toFloat() ?: 1f
-        val b = scaled ?: raw
+        val b = scaled ?: raw ?: return null
         val pinned = info.getOrNull("isInPinMode") as? Boolean ?: false
         val exiting = info.getOrNull("isExiting") as? Boolean ?: false
         val mini = info.getOrNull("isMiniState") as? Boolean ?: false
@@ -641,8 +655,8 @@ class FreeformBlankTapHook(private val prefs: SharedPreferences) : BaseHook() {
      * 2026-10-17 用户口径：**mini 态不作为目标**（缩成 mini 之后点空白不再动作、点击照常落给系统）。
      * 抢流与动作共用本入口，所以不会出现"吞了却动不了"或"能动却不吞"。
      */
-    fun hasActionTarget(): Boolean =
-        runCatching { pickTargetTaskId() != null }.getOrDefault(false)
+    fun hasActionTarget(mode: String): Boolean =
+        runCatching { pickTargetTaskId(mode) != null }.getOrDefault(false)
 
     private fun desktopModeActive(context: Context?): Boolean {
         val ctx = context ?: return false
@@ -832,8 +846,8 @@ class FreeformBlankTapHook(private val prefs: SharedPreferences) : BaseHook() {
             HLog.w(TAG, "perform skipped: controller unavailable ($resolveNote)")
             return false
         }
-        // 2026-10-17 用户口径：**mini 态不作为目标**（只对正常态小窗动作）
-        val taskId = pickTargetTaskId() ?: run {
+        // 档位敏感：close 档下 mini/挂起窗也算目标（见 pickTargetTaskId 的注释）
+        val taskId = pickTargetTaskId(mode) ?: run {
             HLog.i(TAG, "perform skipped: no visible freeform task")
             return false
         }
@@ -885,7 +899,21 @@ class FreeformBlankTapHook(private val prefs: SharedPreferences) : BaseHook() {
      *    取首个未退出项（列表为空/语义变了会整段记日志，方便按实测改正）；
      * 3. `getMiuiFreeformModeTaskInfoList()` 首个未退出项的 `getTaskId()`（OS2 设备实证 public）。
      */
-    private fun pickTargetTaskId(): Int? {
+    /**
+     * 选动作目标。
+     *
+     * **档位敏感（2026-10-18 修正）**：mini（已缩到角落的图标/挂起）窗是否算目标，取决于动作：
+     * - `close` 档：**算**。用户把小窗收成角落图标后，点空白就是要把它关掉；此前无条件跳过
+     *   mini ⇒ 点空白既不动作也不接管，点击直接漏给背后的桌面/应用（用户实测"空白处几乎无法
+     *   正常使用"）。这与 [SystemUiInputSpy.takeoverArmed] 里 2026-10-17 记的原始意图
+     *   （"close 档下 mini/挂起窗也可关 ⇒ 允许"）一致，实现此前漂了。
+     * - `mini` 档：**不算**（对已 mini 的窗再缩是空操作 ⇒ 不接管，点击照常落给背后）。
+     *
+     * 关 mini 窗的执行链是安全的：`closeWithTransition` 对 mini 任务可能静默 no-op（已知），
+     * 但后面有 700ms 回查 + shell 命令 + `exitFreeformTask` + 广播四级降级（见 [doExit]）。
+     */
+    private fun pickTargetTaskId(mode: String): Int? {
+        val allowMini = mode == PrefKeys.FREEFORM_BLANK_TAP_MODE_CLOSE
         val vm = decorVm
         if (vm != null) {
             val id = runCatching {
@@ -894,12 +922,11 @@ class FreeformBlankTapHook(private val prefs: SharedPreferences) : BaseHook() {
                 f.getInt(vm)
             }.getOrNull() ?: 0
             if (id > 0 && !isExiting(id)) {
-                // 2026-10-17：只对**正常态**小窗动作。mini（已缩到边缘/挂起）时点空白去关它不符合
-                // 预期（用户拍板场景：主动挂起的小窗不该被点空白收掉）。
-                if (isMiniState(id)) {
-                    HLog.i(TAG, "target task=$id 处于 mini/挂起态 ⇒ 本次不动作")
+                if (isMiniState(id) && !allowMini) {
+                    HLog.i(TAG, "target task=$id 处于 mini/挂起态 ⇒ 本次不动作（mini 档空操作）")
                 } else {
-                    HLog.i(TAG, "target task=$id (decorVm.mFreeformTaskId)")
+                    if (isMiniState(id)) HLog.i(TAG, "target task=$id（mini 态，close 档允许）")
+                    else HLog.i(TAG, "target task=$id (decorVm.mFreeformTaskId)")
                     return id
                 }
             }
@@ -908,8 +935,16 @@ class FreeformBlankTapHook(private val prefs: SharedPreferences) : BaseHook() {
         val ids = zOrderIds(repo)
         if (ids.isNotEmpty()) {
             HLog.i(TAG, "z-order freeform ids=$ids")
+            // 正常态优先（用户眼前那个）；close 档下退化到"任意未退出的"（含 mini）
             val normal = ids.firstOrNull { !isExiting(it) && !isMiniState(it) }
             if (normal != null) return normal
+            if (allowMini) {
+                val any = ids.firstOrNull { !isExiting(it) }
+                if (any != null) {
+                    HLog.i(TAG, "z-order 只有 mini/挂起窗 ⇒ 取 $any（close 档允许）")
+                    return any
+                }
+            }
             if (ids.any { !isExiting(it) }) {
                 HLog.i(TAG, "z-order 里没有正常态小窗（全是 mini/挂起）⇒ 本次不动作")
             }
@@ -919,7 +954,7 @@ class FreeformBlankTapHook(private val prefs: SharedPreferences) : BaseHook() {
             val exiting = info.getOrNull("isExiting") as? Boolean ?: false
             val mini = info.getOrNull("isMiniState") as? Boolean ?: false
             val id = (info.getOrNull("getTaskId") as? Number)?.toInt()
-            if (exiting || mini || id == null) null else id
+            if (exiting || (mini && !allowMini) || id == null) null else id
         }?.firstOrNull()
         if (id != null) HLog.i(TAG, "target task=$id (info list)")
         return id
