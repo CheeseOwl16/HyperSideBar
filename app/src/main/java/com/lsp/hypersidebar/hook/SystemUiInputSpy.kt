@@ -504,6 +504,13 @@ object SystemUiInputSpy {
         // 2026-10-18：档位现在**真的传进动作层**了——此前 `hasActionTarget()` 内部无条件跳过
         // mini，与这条注释相反 ⇒ 小窗收成角落图标后点空白既不动作也不接管，点击漏给桌面
         // （用户实测"空白处几乎无法正常使用"）。
+        // 动画期间几何不可信（2026-10-18 真机故障：还原动画中点空白，我们的几何还是旧位置
+        // ⇒ isBlank 误判"空白" ⇒ 抢流被 ROM caption 监视器回抢 ⇒ 手势被当 caption 拖拽
+        // ⇒ 窗口被误最大化）。⇒ 窗口动画期间一律不抢流。
+        if (h.anyWindowAnimating()) {
+            HLog.i(TAG, "takeover: 小窗动画中（几何不可信）⇒ 不抢流，点击照常落给系统")
+            return@runCatching false
+        }
         val mode = prefs?.getString(
             com.lsp.hypersidebar.prefs.PrefKeys.FREEFORM_BLANK_TAP_MODE,
             com.lsp.hypersidebar.prefs.LayoutDefaults.FREEFORM_BLANK_TAP_MODE_DEFAULT

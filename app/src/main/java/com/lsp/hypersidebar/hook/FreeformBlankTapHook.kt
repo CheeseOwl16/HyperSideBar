@@ -658,6 +658,30 @@ class FreeformBlankTapHook(private val prefs: SharedPreferences) : BaseHook() {
     fun hasActionTarget(mode: String): Boolean =
         runCatching { pickTargetTaskId(mode) != null }.getOrDefault(false)
 
+    /**
+     * 是否有可见小窗**正在动画/几何未落定**（还原、mini、pin 的过渡期）。
+     *
+     * 用途（2026-10-18 真机故障定位）：**抢流前置检查**。真机实证：还原动画刚起，我们的
+     * 几何（getScaledBounds 路径）还是**还原前的旧位置** ⇒ 用户点在还原后窗口的真实位置上，
+     * isBlank 却误判"空白" ⇒ 抢流 ⇒ 被 ROM 的 caption 监视器回抢（CANCEL）⇒ ROM 把这条
+     * 手势当 caption 拖拽 ⇒ **窗口被误最大化**（endWindowMode=1；用户要的是缩小）。
+     *
+     * 动画期间几何不可信 ⇒ 一律不抢流（点击照常落给窗口/背后——用户本来就在等动画落定）。
+     * 判据复用动作路径的既有两个门（isInAnimating / scaleNotSettled），语义一致。
+     */
+    fun anyWindowAnimating(): Boolean = runCatching {
+        val repo = repository ?: return@runCatching false
+        infoList(repo)?.any { info ->
+            val exiting = info.getOrNull("isExiting") as? Boolean ?: false
+            val visible = info.getOrNull("isNormalState") as? Boolean ?: false
+            val mini = info.getOrNull("isMiniState") as? Boolean ?: false
+            val pinned = info.getOrNull("isInPinMode") as? Boolean ?: false
+            if (exiting || !(visible || mini || pinned)) return@any false
+            val tid = (info.getOrNull("getTaskId") as? Number)?.toInt() ?: return@any false
+            isInAnimating(tid) || scaleNotSettled(tid)
+        } ?: false
+    }.getOrDefault(false)
+
     private fun desktopModeActive(context: Context?): Boolean {
         val ctx = context ?: return false
         return runCatching { desktopActiveMethod?.invoke(null, ctx) as? Boolean ?: false }
@@ -1113,6 +1137,42 @@ class FreeformBlankTapHook(private val prefs: SharedPreferences) : BaseHook() {
     }
 
     /**
+     * caption × 的**原版关闭路径**（2026-10-18，带 ROM 自己的收尾动画）。
+     *
+     * 真机+反编译实证的根因：我们此前的 `closeWithTransition`
+     * （`MiuiFreeformModeAnimation.startExitFreeformShellTransition`）会注册 pending token，
+     * 而 OS4 的过渡分发器（`startBackTransition`）对"2147483545 且带 token"的过渡**固定**
+     * 走 `startMiuiFreeformMaximizeMoveToBackTransition`（`[BUGOS2-809979] bypassing Folme`
+     * ——故意无动画的旁路，真机日志 `NoAnimFinishDeferred`）⇒ 关闭从来没动画。
+     * 有动画的那条（`startCloseAnimation`，原地缩放淡出）要求"2147483545 **无** token"。
+     *
+     * 而 caption × 按钮的关闭走的是**另一族**过渡：`MulWinSwitchAnimStarter
+     * .closeFullOrFreeform(RunningTaskInfo)`（jadx :171）→ `MulWinSwitchTransition
+     * .startCloseFullOrFreeform`（:351，自建 wct + takeTaskSnapshot + 自家类型
+     * ANIMATION_WIN_CTL_CLOSE_FREEFORM=11114 族）⇒ 完全绕开 2147483545 的分发。
+     * starter 是静态入口：`MultiTaskingControllerImpl.getInstance().getMulWinSwitchStarter()`
+     * （caption 监听器自己就是这么拿的，jadx :60）——无需捕获实例。
+     */
+    private fun closeViaCaptionPath(taskId: Int): Boolean = runCatching {
+        val h = holderClass ?: return@runCatching false
+        val inst = h.getMethod("getInstance").invoke(null)
+        val starter = inst.javaClass.methods.firstOrNull {
+            it.name == "getMulWinSwitchStarter" && it.parameterCount == 0
+        }?.invoke(inst) ?: return@runCatching false
+        val repo = repository ?: return@runCatching false
+        val info = repo.javaClass
+            .getMethod("getMiuiFreeformTaskInfo", Int::class.javaPrimitiveType)
+            .invoke(repo, taskId) ?: return@runCatching false
+        val ti = info.javaClass.getMethod("getTaskInfo").invoke(info) ?: return@runCatching false
+        val m = starter.javaClass.methods.firstOrNull {
+            it.name == "closeFullOrFreeform" && it.parameterCount == 1
+        } ?: return@runCatching false
+        m.invoke(starter, ti)
+        true
+    }.onFailure { HLog.w(TAG, "closeViaCaptionPath($taskId) failed: ${causeLine(it)}") }
+        .getOrDefault(false)
+
+    /**
      * 关闭动作本体（在"动画空闲"门之后执行）：优先 ROM 自己的关闭过渡（**带原地缩放淡出动画**），
      * 没有 ROM 执行器时退到同步降级链（OS2 `minimizeTask` → `exitFreeformTask` → 广播）。
      */
@@ -1184,17 +1244,23 @@ class FreeformBlankTapHook(private val prefs: SharedPreferences) : BaseHook() {
      * 验证与降级都在主线程调度；实际调用仍投 ROM 线程（见 [postToRomExecutor]）。
      */
     private fun doExit(taskId: Int, context: Context? = null) {
-        val ok = closeWithTransition(taskId)
-        HLog.i(TAG, "close try#1 shellTransition=$ok task=$taskId")
+        // try#1（2026-10-18 换序）：caption × 的原版路径——**有动画**（见 closeViaCaptionPath
+        // 的注释：我们旧的 closeWithTransition 被 ROM 分发进"故意无动画"旁路）。
+        val ok = closeViaCaptionPath(taskId)
+        HLog.i(TAG, "close try#1 captionPath=$ok task=$taskId")
         verifyGoneThen(taskId, 700L) {
-            val sh = closeViaShellCommand(taskId)
-            HLog.w(TAG, "close try#2 shell-cmd=$sh task=$taskId")
+            val sh = closeWithTransition(taskId)
+            HLog.w(TAG, "close try#2 shellTransition=$sh task=$taskId")
             verifyGoneThen(taskId, 700L) {
-                val ef = closeViaExitFreeform(taskId)
-                HLog.w(TAG, "close try#3 exitFreeformTask=$ef task=$taskId")
-                if (!ef) {
-                    val ctx = context ?: return@verifyGoneThen
-                    broadcastFallback(ctx, "close fallback (task=$taskId)")
+                val ef = closeViaShellCommand(taskId)
+                HLog.w(TAG, "close try#3 shell-cmd=$ef task=$taskId")
+                verifyGoneThen(taskId, 700L) {
+                    val ex = closeViaExitFreeform(taskId)
+                    HLog.w(TAG, "close try#4 exitFreeformTask=$ex task=$taskId")
+                    if (!ex) {
+                        val ctx = context ?: return@verifyGoneThen
+                        broadcastFallback(ctx, "close fallback (task=$taskId)")
+                    }
                 }
             }
         }
