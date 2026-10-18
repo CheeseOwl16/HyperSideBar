@@ -89,6 +89,9 @@ object NativeRootProbe {
         "pilfer_probe" to "ffc301d1fd7b04a9f52b00f9f44f06a9",
         // 2026-10-16：系统"是否处理事件"总闸 should_handle_event（只读观测锚点，prop anchor3 action_probe）
         "action_probe" to "ffc304d1fd7b0da9fc6f0ea9fa670fa9",
+        // 2026-10-18：当前旋转下的屏尺寸 display_api::get_current_rotate_screen_size
+        //（**只调用不挂钩**：侧滑触发带的横屏判据，见 hsb_live_screen_size）
+        "rotate_size" to "ffc302d1fd7b06a9fa6707a9f85f08a9",
     )
 
     /** 导出用的一段文本（诊断页 / 日志页 / 使用数据页三条路径都收口在 `SelfCheck.export`） */

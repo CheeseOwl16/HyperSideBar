@@ -1172,6 +1172,42 @@ static uint64_t hsb_strip_window_ms(void) {
  *   （`CornerGeomBridge.pushBand`，与 spy 同一份 prefs + 同一份 getSystem().displayMetrics）。
  *   也正因如此这里送的是 **px** 而不是比例：native 手里没有 w/h，比例换算无从谈起。
  *   竖屏判定同样交给属性（screenW < screenH），对齐 spy 横屏不转发。 */
+/* ── 当前旋转下的屏尺寸：直接问 ROM（2026-10-18）──────────────────────────────
+ * 为什么需要：侧滑触发带的 `handle_back_gesture` 其 self **不是** GestureInputMonitorImpl
+ * ⇒ 拿不到权威屏宽高（那在 +0x260/+0x244，只有角区锚点的 self 有）；而 Java 侧推的方向位
+ * 属性**只有模块 App 进程活着时才会重推**（转屏时它在才推，不在就没人推）⇒ 横屏左缘底部
+ * 停顿那一类会漏判成竖屏、把竖屏带套到横屏坐标系上。⇒ 这里直接调 ROM 自己的
+ * `display_api::get_current_rotate_screen_size`，拿到的就是当前旋转下的尺寸。
+ *
+ * 出参布局（设备 .so 反汇编实证，2026-10-18，见 gen_launcher_profiles.py 的 WANT 注释）：
+ *   成功路径 `stp w8, w9, [x19]` + `str w21, [x19,#8]` ⇒ **三个 int32**；
+ *   提前返回 `str xzr,[x19]` + `str wzr,[x19,#8]`     ⇒ 清零前 12B；
+ *   ROM 自己的调用方（is_in_navigation_bar_hot_zone @0x6b8184）读的正是前两个当尺寸
+ *   （`ldp w9,w8,[sp,#0x18]` → 两个 `scvtf`）⇒ 照抄：缓冲区 16B 全零，读 out[0]/out[1]。
+ *   （10-17 曾据"提前返回写 8B+4B"判为布局未知而放弃——那条读法不完整。）
+ *
+ * 1 秒粒度缓存：与 hsb_band_geom 的刷新同频，这个判定跑在每个输入事件上，不能每次回调。 */
+static void (*g_rotate_size_fn)(int *out);
+static int g_rotate_size_giveup;     /* 解析失败过 ⇒ 不再每轮巡检重试（日志不刷屏） */
+static int g_rot_w, g_rot_h;         /* 最近一次成功读到的旋转后尺寸 */
+static uint64_t g_rot_at_s;          /* 读取时刻 */
+static int g_rot_seen;               /* 是否至少成功过一次 */
+
+static int hsb_live_screen_size(int *w, int *h) {
+    if (!g_rotate_size_fn) return 0;
+    uint64_t now = hsb_now_s();
+    if (!g_rot_seen || now != g_rot_at_s) {
+        int out[4] = {0, 0, 0, 0};
+        g_rotate_size_fn(out);
+        if (out[0] > 0 && out[1] > 0) { g_rot_w = out[0]; g_rot_h = out[1]; g_rot_seen = 1; }
+        g_rot_at_s = now;
+    }
+    if (!g_rot_seen) return 0;
+    if (w) *w = g_rot_w;
+    if (h) *h = g_rot_h;
+    return 1;
+}
+
 #define HSB_BAND_W_PX_PROP   "persist.hsb.band.w_px"
 #define HSB_BAND_H_PX_PROP   "persist.hsb.band.h_px"
 #define HSB_BAND_TOP_PX_PROP "persist.hsb.band.top_px"
@@ -1201,12 +1237,21 @@ static int hsb_band_geom(void) {
         float h  = hsb_cfg_float(HSB_BAND_H_PX_PROP,   1.0f, 100000.0f, 0.0f);
         /* top 的合法值含 0 ⇒ 用 dflt=-1 区分"属性缺失"与"top=0" */
         float t  = hsb_cfg_float(HSB_BAND_TOP_PX_PROP, 0.0f, 100000.0f, -1.0f);
-        float sw = hsb_cfg_float(HSB_BAND_SW_PX_PROP,  1.0f, 100000.0f, 0.0f);
-        float sh = hsb_cfg_float(HSB_BAND_SH_PX_PROP,  1.0f, 100000.0f, 0.0f);
-        /* 方向位（dflt=-1 区分"属性缺失"与"竖屏=0"）：缺失时下面仍会按几何比一次，
-         * 但那条恒假（sw/sh 是竖屏归一值）⇒ 缺属性 = 只靠 hsb_band_in 的越界兜底。 */
-        float land = hsb_cfg_float(HSB_BAND_LAND_PROP, 0.0f, 1.0f, -1.0f);
-        int landscape_geo = (sw > 0.0f && sh > 0.0f && sw >= sh);
+        /* 当前旋转下的屏尺寸：**先问 ROM**（2026-10-18）。拿到就不再读属性——属性里的屏尺寸是
+         * 竖屏归一值（CornerGeomBridge.bandPx 取 min/max），朝向只有 Java 侧知道且**它不在就
+         * 没人重推**；ROM 这条路与模块 App 死活无关，横屏判据因此不再有陈旧窗口。
+         * ROM 取不到（锚点没解析上 / 返回值非法）才回落到属性（既有行为，fail-closed 到属性）。 */
+        int live_w = 0, live_h = 0;
+        int have_live = hsb_live_screen_size(&live_w, &live_h);
+        float sw = have_live ? (float) live_w
+                             : hsb_cfg_float(HSB_BAND_SW_PX_PROP, 1.0f, 100000.0f, 0.0f);
+        float sh = have_live ? (float) live_h
+                             : hsb_cfg_float(HSB_BAND_SH_PX_PROP, 1.0f, 100000.0f, 0.0f);
+        /* 方向位：有 ROM 实时尺寸 ⇒ 直接由它比出来（活值，永不过期）；否则按属性
+         * （dflt=-1 区分"属性缺失"与"竖屏=0"），并保留那条恒假的几何比作最后兜底。 */
+        float land = have_live ? (live_w >= live_h ? 1.0f : 0.0f)
+                               : hsb_cfg_float(HSB_BAND_LAND_PROP, 0.0f, 1.0f, -1.0f);
+        int landscape_geo = (!have_live && sw > 0.0f && sh > 0.0f && sw >= sh);
         int landscape_prop = (land >= 0.5f);
         int landscape = landscape_geo || landscape_prop;
         int ok = (w > 0.0f && h > 0.0f && t >= 0.0f && sw > w && sh > 0.0f && !landscape);
@@ -1231,10 +1276,12 @@ static int hsb_band_geom(void) {
             g_band_last_land = land;
             /* 横屏时把"凭什么判横屏"也打出来：prop=1（活性位）还是 geometry（恒假的旧判据）。 */
             const char *why = !landscape ? ""
-                            : (landscape_prop ? " (landscape prop=1 ⇒ no suppress)"
-                                              : " (landscape via geometry ⇒ no suppress)");
-            LOGI("band geom %s w_px=%.1f h_px=%.1f top_px=%.1f screen=%.0fx%.0f land=%.0f%s",
-                 ok ? "ok" : "INVALID", w, h, t, sw, sh, land, why);
+                            : (have_live ? " (landscape via ROM ⇒ no suppress)"
+                                         : (landscape_prop ? " (landscape prop=1 ⇒ no suppress)"
+                                                           : " (landscape via geometry ⇒ no suppress)"));
+            LOGI("band geom %s w_px=%.1f h_px=%.1f top_px=%.1f screen=%.0fx%.0f land=%.0f%s "
+                 "src=%s", ok ? "ok" : "INVALID", w, h, t, sw, sh, land, why,
+                 have_live ? "ROM" : "prop");
         }
     }
     return g_band_ok;
@@ -2542,6 +2589,27 @@ static int hsb_install_named(const char *want, int secondary) {
     return 0;
 }
 
+/* ── 只解析、不挂钩（2026-10-18，rotate_size）──────────────────────────────────────
+ * 与 [hsb_install_named] 的区别：不调 hsb_install_at（不写任何字节、不改任何判定），
+ * 只把地址存起来给 hsb_live_screen_size 直接调。候选枚举由 hsb_try_install_hooks 做完，
+ * 所以必须在那之后调用。
+ * 返回 1 = 解析成功（g_rotate_size_fn 已就位）。 */
+static int hsb_resolve_call_only(const char *want) {
+    for (unsigned i = 0; i < HSB_ANCHOR_COUNT; i++) {
+        const HsbLauncherAnchor *a = &kHsbAnchors[i];
+        if (strcmp(a->name, want) != 0) continue;
+        char how[16] = {0};
+        uintptr_t base = 0u;
+        uintptr_t at = hsb_locate(a, &base, how, sizeof(how));
+        if (!at) return 0;
+        g_rotate_size_fn = (void (*)(int *)) at;
+        LOGI("rotate_size resolved @%p via %s（只调用，不挂钩）", (void *) at, how);
+        return 1;
+    }
+    LOGI("rotate_size: profile 里没有这个锚点");
+    return 0;
+}
+
 static void hsb_try_install_hooks(void) {
     const char *want2 = hsb_chosen_anchor2();
     int need2 = want2 != NULL;
@@ -2598,6 +2666,11 @@ static void hsb_try_install_hooks(void) {
     if (need3 && !g_hook3_installed) {
         LOGI("anchor3 selected: %s", want3);
         if (!hsb_install_named(want3, 2)) LOGI("anchor3 install failed (primary stays)");
+    }
+    /* 只调用不挂钩的锚点（当前旋转下的屏尺寸）。失败不致命：侧滑带几何回落属性推送
+     * （既有行为），下轮巡检再试一次；成了就不再进这个分支。 */
+    if (!g_rotate_size_fn && !g_rotate_size_giveup) {
+        if (!hsb_resolve_call_only("rotate_size")) g_rotate_size_giveup = 1;
     }
     /* 安装面汇总：一条可 grep 的"定论行"。真机取证/脚本判词都靠它——Java 侧的
      * NativeProbe.report 在 launcher 域没人调（OS4 没有模块 Java 半侧），别等它。
@@ -2851,7 +2924,10 @@ static void hsb_publish_evoke(const char *payload) {
  *     指令序撕裂（并发线程踩到就是崩桌面）。
  *   · 为什么不直接再调一次 hook_func：若某版框架是链式 hook，backup 会指回我们自己的桩
  *     ⇒ 每次事件递归爆栈。先 unhook 摘掉旧注册就没有这个歧义。
- * 封顶：最多 HSB_PATCH_HEAL_MAX 次，超过只报警不再自愈（fail-closed，等用户重启桌面）。
+ * 不封顶，改指数退避（2026-10-17 修）：原来 5 次硬封顶，而这台 ROM 约每 8 分钟抹一次，
+ * 封顶一到就 heal=5/0 永久静默（用户实测侧条线莫名失效）。现在每次自愈成功后退避翻倍
+ * （5s→10s→…→上限 300s），连续 3 次没再被抹就回落 5s；第 8 次打一行建议重启桌面。
+ * 心跳字段 heal=N/M：N = 累计自愈次数，M = 当前退避秒数。
  * 只由心跳线程调用（单线程），不碰任何流状态。
  *
  * ## 与 Java 侧热重载（LSPosed API 102）的关系：**互不干涉**
