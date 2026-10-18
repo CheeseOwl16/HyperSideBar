@@ -56,6 +56,11 @@ class DirectLaunchStrategy(
             intent.putStringArrayListExtra(
                 com.lsp.hypersidebar.ui.allapps.AllAppsActivity.EXTRA_SUGGESTIONS, list
             )
+            // 2026-10-18 体检 P1：面板是 exported 组件，**必须**带跨进程防伪令牌
+            // （接收端 AllAppsActivity 校验；令牌未下发时按 verifyFan 的宽松语义放行）
+            com.lsp.hypersidebar.util.RelayToken.attach(
+                intent, com.lsp.hypersidebar.util.RelayToken.read(remotePrefs)
+            )
         }
     }
 

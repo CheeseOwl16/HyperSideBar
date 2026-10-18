@@ -74,6 +74,7 @@ import com.lsp.hypersidebar.util.AppMetaCache
 import com.lsp.hypersidebar.util.DataLoader
 import com.lsp.hypersidebar.util.RemotePrefsBridge
 import com.lsp.hypersidebar.util.RelayToken
+import com.lsp.hypersidebar.util.HLog
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
@@ -121,6 +122,7 @@ class AllAppsActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        verifyCaller()
         fallbackPrefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
         // D7 修复：改走进程级绑定桥。原自注册 listener 在"设置页先完成绑定后，
         // 本 Activity 二次注册收不到回调"路径下 remotePrefs 永远为 null——本地
@@ -169,9 +171,44 @@ class AllAppsActivity : ComponentActivity() {
         }
     }
 
+    /**
+     * 调用方校验（2026-10-18 体检 P1）：本 Activity 是 exported 组件（:ui 跨进程拉起它），
+     * 按仓库 ACL 规则必须验调用方 —— 用与 ShortcutRelayReceiver 同款的跨进程防伪令牌
+     * （`RelayToken.verifyFan` 的宽松分档语义：令牌未下发时放行，下发后严格比对）。
+     *
+     * 冷启动细节：模块进程刚拉起时 `RelayToken.current()` 可能还没值（令牌由 remotePrefs
+     * 绑定后同步）⇒ 等桥绑定就绪（复用 `awaitPrefsBind`，3s）再用 remotePrefs 里的令牌复验一次；
+     * 桥始终不可用时按宽松语义放行（与面板自身的 prefs 回落一致：桥不在也不能让面板不可用）。
+     * 校验不通过 ⇒ 立即结束，且**绝不读入参**（伪造的 suggestions 列表一律不采信）。
+     */
+    private fun verifyCaller() {
+        val got = intent.getStringExtra(PrefKeys.RELAY_LAUNCH_EXTRA_TOKEN)
+        val cached = RelayToken.current()
+        if (cached != null) {
+            if (!RelayToken.verifyFan(intent, cached)) rejectPanel()
+            return
+        }
+        Thread {
+            RemotePrefsBridge.awaitPrefsBind(3)
+            val expected = RemotePrefsBridge.prefs?.let { RelayToken.read(it) }
+            if (!expected.isNullOrEmpty() &&
+                !RelayToken.verifyFan(intent, expected)
+            ) {
+                runOnUiThread { rejectPanel() }
+            }
+        }.start()
+    }
+
+    private fun rejectPanel() {
+        HLog.w(TAG, "panel launch rejected: bad token")
+        finishAndRemoveTask()
+    }
+
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
-        // singleTask 重入（上次未关闭）：刷新传入的建议列表
+        setIntent(intent)
+        // singleTask 重入（上次未关闭）：同样先过令牌闸，再刷新传入的建议列表
+        verifyCaller()
         suggestions = intent.getStringArrayListExtra(EXTRA_SUGGESTIONS)
     }
 

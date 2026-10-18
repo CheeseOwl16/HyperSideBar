@@ -109,10 +109,6 @@ object PrefKeys {
     const val FAN_FOG_INTENSITY = "fanFogIntensity"
     /** 呼出扇形时全屏压暗开关（Compose scrim 24% 黑，与菜单同步淡入） */
     const val FAN_DIM_ENABLED = "fanDimEnabled"
-    /** 毛玻璃总开关（0913 用户拍板）：开=窗口收缩包围盒+系统 blur-behind（真模糊身后内容）
-     *  +磨砂板（雾化滑条控浓度，延伸覆盖快捷栏=连体玻璃板）；系统模糊被关
-     *  （isCrossWindowBlurEnabled=false）时自动降级全屏窗口 */
-    const val FAN_FROSTED_ENABLED = "fanFrostedEnabled"
     /** 背景模糊来源（0915 Route D 定稿：单项下拉，取代旧三开关）。
      *  取值见下方 FAN_BLUR_SOURCE_*；auto=按宿主与能力自动选路 */
     const val FAN_BLUR_SOURCE = "fanBlurSource"
