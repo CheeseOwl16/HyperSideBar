@@ -890,9 +890,28 @@ class FreeformBlankTapHook(private val prefs: SharedPreferences) : BaseHook() {
         awaitStable(taskId) {
             val direct = miniTask(taskId)
             val okMini = direct && runCatching { isMiniState(taskId) }.getOrDefault(false)
-            val ok = okMini ||
-                broadcastFallback(context, "fromFreeformToMini no-op/failed (task=$taskId)")
-            HLog.i(TAG, "perform mode=mini task=$taskId ok=$ok")
+            if (okMini) {
+                HLog.i(TAG, "perform mode=mini task=$taskId ok=true")
+                return@awaitStable
+            }
+            // 静默 no-op（2026-10-18 稳定性修）：fromFreeformToMini 有六个静默 return 守卫
+            //（jadx :582——拖拽缩放动画/连续动画/change 过渡/enterState 1,2,5/elude 动画），
+            // 我们的前置门只覆盖了其中一部分 ⇒ 撞上没覆盖的守卫时这次调用什么都没做。
+            // 原来直接掉广播兜底（**天生无动画**）⇒ 用户看到的"缩小有时没动画/不稳定"。
+            // ⇒ 300ms 后重试一次：那时冲突的动画多半已完，ROM 会正常播 startGestureAnimation。
+            // 重试再失败才走广播（兜底的兜底）。
+            android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+                val retried = runCatching {
+                    !isMiniState(taskId) && !isInAnimating(taskId) && miniTask(taskId) &&
+                        isMiniState(taskId)
+                }.getOrDefault(false)
+                if (retried) {
+                    HLog.i(TAG, "perform mode=mini task=$taskId ok=true (retry)")
+                } else {
+                    val ok = broadcastFallback(context, "mini no-op twice (task=$taskId)")
+                    HLog.i(TAG, "perform mode=mini task=$taskId ok=$ok (fallback)")
+                }
+            }, 300L)
         }
         return true
     }
@@ -905,29 +924,26 @@ class FreeformBlankTapHook(private val prefs: SharedPreferences) : BaseHook() {
      * 3. `getMiuiFreeformModeTaskInfoList()` 首个未退出项的 `getTaskId()`（OS2 设备实证 public）。
      */
     /**
-     * 选动作目标。
+     * 选动作目标：**只认正常态小窗**（2026-10-18 用户口径定稿）。
      *
-     * **档位敏感（2026-10-18 修正）**：mini（已缩到角落的图标/挂起）窗是否算目标，取决于动作：
-     * - `close` 档：**算**。用户把小窗收成角落图标后，点空白就是要把它关掉；此前无条件跳过
-     *   mini ⇒ 点空白既不动作也不接管，点击直接漏给背后的桌面/应用（用户实测"空白处几乎无法
-     *   正常使用"）。这与 [SystemUiInputSpy.takeoverArmed] 里 2026-10-17 记的原始意图
-     *   （"close 档下 mini/挂起窗也可关 ⇒ 允许"）一致，实现此前漂了。
-     * - `mini` 档：**不算**（对已 mini 的窗再缩是空操作 ⇒ 不接管，点击照常落给背后）。
-     *
-     * 关 mini 窗的执行链是安全的：`closeWithTransition` 对 mini 任务可能静默 no-op（已知），
-     * 但后面有 700ms 回查 + shell 命令 + `exitFreeformTask` + 广播四级降级（见 [doExit]）。
+     * 历史：早先实现无条件跳过 mini；2026-10-18 我曾按 spy 里 10-17 的旧注释改成"close 档
+     * 放宽到 mini/钉住"，随即被用户实测否决——把窗收成图标之后，点空白要的是背后桌面/app
+     * 的正常操作，不是把图标关掉（"影响正常操作"）。**挂起/钉住都是用户主动收起的状态，
+     * 点空白不碰它们**；要关图标：点图标（系统还原）→ 再点空白。
+     * `mode` 参数保留：pin 档的动作本体是 pinAll（全量钉住），与"选哪只窗"无关。
      */
-    private fun pickTargetTaskId(mode: String): Int? {
-        // 档位 × 状态 的"要不要把这只窗当目标"矩阵（2026-10-18 加 pin 档）：
-        // - close：mini/挂起/**钉住图标**全都可关 ⇒ 全算目标；
-        // - pin  ：normal/mini 都能缩成图标 ⇒ 算目标；**已钉住的不算**（ROM 的 pinAllFreeForm
-        //          会跳过已在钉住态的窗 ⇒ 对它动作是空操作，"吞了却动不了"的反模式）；
-        // - mini ：只有 normal 算（对 mini 再缩 / 对钉住图标再缩都是空操作）。
-        fun allows(mode: String, mini: Boolean, pinned: Boolean): Boolean = when (mode) {
-            PrefKeys.FREEFORM_BLANK_TAP_MODE_CLOSE -> true
-            PrefKeys.FREEFORM_BLANK_TAP_MODE_PIN -> !pinned
-            else -> !mini && !pinned
-        }
+    private fun pickTargetTaskId(mode: String): Int? = pickNormalTaskId()
+
+    /**
+     * 选动作目标：**只认正常态小窗**（2026-10-18 用户口径，覆盖我当天早些时候的 close 档
+     * 放宽——那条被实测否决：挂起/钉住态的点空白关闭会**影响正常操作**——用户把窗收成
+     * 图标之后，点空白要的是背后桌面/app 的正常操作，不是把图标关掉）。
+     *
+     * 挂起（mini）与钉住（pin 图标）都是用户**主动**收起的状态：点空白不碰它们、点击照常
+     * 穿透给背后。要关掉图标：点图标（系统还原成正常态）→ 再点空白关闭。
+     * `mode` 参数保留：pin 档的动作本体是 pinAll（全量钉住），与"选哪只窗"无关。
+     */
+    private fun pickNormalTaskId(): Int? {
         val vm = decorVm
         if (vm != null) {
             val id = runCatching {
@@ -935,31 +951,19 @@ class FreeformBlankTapHook(private val prefs: SharedPreferences) : BaseHook() {
                 f.isAccessible = true
                 f.getInt(vm)
             }.getOrNull() ?: 0
-            if (id > 0 && !isExiting(id)) {
-                val mini = isMiniState(id)
-                val pinned = isPinned(id)
-                if (!allows(mode, mini, pinned)) {
-                    HLog.i(TAG, "target task=$id mini=$mini pinned=$pinned ⇒ 本次不动作（mode=$mode 空操作）")
-                } else {
-                    HLog.i(TAG, "target task=$id (decorVm.mFreeformTaskId) mini=$mini pinned=$pinned mode=$mode")
-                    return id
-                }
+            if (id > 0 && !isExiting(id) && !isMiniState(id) && !isPinned(id)) {
+                HLog.i(TAG, "target task=$id (decorVm.mFreeformTaskId)")
+                return id
             }
         }
         val repo = repository ?: return null
         val ids = zOrderIds(repo)
         if (ids.isNotEmpty()) {
             HLog.i(TAG, "z-order freeform ids=$ids")
-            // 正常态优先（用户眼前那个）；再按档位回退到 mini/钉住
             val normal = ids.firstOrNull { !isExiting(it) && !isMiniState(it) && !isPinned(it) }
             if (normal != null) return normal
-            val fallback = ids.firstOrNull { id -> !isExiting(id) && allows(mode, isMiniState(id), isPinned(id)) }
-            if (fallback != null) {
-                HLog.i(TAG, "z-order 无正常态小窗 ⇒ 取 $fallback（mode=$mode 允许）")
-                return fallback
-            }
             if (ids.any { !isExiting(it) }) {
-                HLog.i(TAG, "z-order 里没有本档位可动作的小窗（mode=$mode）⇒ 本次不动作")
+                HLog.i(TAG, "z-order 只有挂起/钉住态小窗 ⇒ 不作为目标（用户口径：点空白不碰收起态）")
             }
         }
         val infos = infoList(repo)
@@ -967,8 +971,8 @@ class FreeformBlankTapHook(private val prefs: SharedPreferences) : BaseHook() {
             val exiting = info.getOrNull("isExiting") as? Boolean ?: false
             val mini = info.getOrNull("isMiniState") as? Boolean ?: false
             val pinned = info.getOrNull("isInPinMode") as? Boolean ?: false
-            val id = (info.getOrNull("getTaskId") as? Number)?.toInt()
-            if (exiting || !allows(mode, mini, pinned) || id == null) null else id
+            val tid = (info.getOrNull("getTaskId") as? Number)?.toInt()
+            if (exiting || mini || pinned || tid == null) null else tid
         }?.firstOrNull()
         if (id != null) HLog.i(TAG, "target task=$id (info list)")
         return id
