@@ -1223,7 +1223,7 @@ class EdgeGestureHook(
         // "不落地"的现状，但留一行能对账的证据，免得"为什么快滑没反应"只能靠猜。
         if (hadPending && lastDownTime > 0L) {
             val dur = android.os.SystemClock.uptimeMillis() - lastDownTime
-            if (dur < 120L) HLog.i(TAG, "early-release dur=${dur}ms（视为误触：抬手早于扇形落地）")
+            if (dur < 120L) HLog.i(TAG, "early-release dur=${dur}ms（误触过滤）")
         }
     }
 

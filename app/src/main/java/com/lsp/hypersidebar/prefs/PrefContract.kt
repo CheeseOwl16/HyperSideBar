@@ -312,6 +312,21 @@ object PrefsFiles {
     const val STATS = "hyperSidebar_stats"
 }
 
+/** 跨进程系统属性名（native/宿主/模块 App 三方共用；只搬字面量，值一个都不改）。
+ *  `persist.hsb.*` 不在此处——它们在各自的 bridge 对象里（与 native `#define` 镜像配对）。 */
+object PropNames {
+    const val CORNER_SYSJUDGE = "debug.hsb.corner.sysjudge"
+    const val TAKEOVER = "debug.hsb.takeover"
+    const val BGPROBE = "debug.hsb.bgprobe"
+    const val B0_VISIBLE = "debug.hsb.b0.visible"
+    const val NATIVE_STRICT = "debug.hsb.native.strict"
+    const val NATIVE_HOOK = "debug.hsb.native.hook"
+    val EVOKE_PROPS = arrayOf(
+        "debug.hsb.evoke", "sys.hsb.evoke", "vendor.hsb.evoke",
+        "persist.sys.hsb.evoke", "persist.hsb.evoke",
+    )
+}
+
 /** 布局与交互参数默认值（竖屏/横屏独立），与 PRD 参数表对齐。 */
 object LayoutDefaults {
     // 0922 用户定档：三形态图标统一 32dp。只影响新装与关于页「恢复默认值」，已落盘配置不动

@@ -160,7 +160,7 @@ object NativeGateBridge {
             )
         }.getOrDefault(false)
         if (ok) {
-            HLog.i(TAG, "gate marker: ${f.absolutePath} ← \"$value\"（免 root 关断通道：native 读到 \"0\" 即关）")
+            HLog.i(TAG, "gate marker: ${f.absolutePath} ← \"$value\"")
         }
     }
 

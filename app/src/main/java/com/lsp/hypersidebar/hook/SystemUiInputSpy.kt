@@ -6,7 +6,9 @@ import android.view.InputEvent
 import android.view.InputEventReceiver
 import android.view.MotionEvent
 import com.lsp.hypersidebar.hook.CornerTrigger
+import com.lsp.hypersidebar.prefs.PropNames
 import com.lsp.hypersidebar.util.HLog
+import com.lsp.hypersidebar.util.SysProps
 
 /**
  * B1 spy 骨架（os4-trigger-final-plan §6，log-only 零抢占）：
@@ -72,6 +74,8 @@ object SystemUiInputSpy {
      *  原始 15s 的语义是"建得太早的聋 monitor"（那是**永久**聋，15s 内零事件即可识别），
      *  空闲并不等于聋 ⇒ 观察窗不能短于"人自然停顿不摸屏"的时间尺度。 */
     private const val DEAF_CHECK_WINDOW_MS = 15_000L
+    /** 原"重建封顶"（2026-10-18 起不再放弃，见 [deafCheck] 注释）：现仅作日志降频阈值——
+     *  超过此轮次后聋行每 4 轮打一条。 */
     private const val MAX_DEAF_REBUILDS = 12
 
     /** 取证类清单（api dump 用） */
@@ -125,7 +129,11 @@ object SystemUiInputSpy {
         if (started || gaveUp) return
         attempts++
         runCatching {
-            val channel = openSpyChannel(appContext) ?: error("no usable monitorInput candidate")
+            // 2026-10-18 OS3 真机实锤：dispose 后**同名**重建的 monitor 收不到任何事件
+            // （dispatcher 侧同名重注册不重新挂接；OS4 无此问题）⇒ 聋循环永远聋。
+            // 改为每次 build 用唯一名，绕开重注册冲突。
+            val channel = openSpyChannel(appContext, "hypersidebar-spy-$attempts")
+                ?: error("no usable monitorInput candidate")
             channelRef = channel
             receiverRef = object : InputEventReceiver(channel, Looper.getMainLooper()) {
                 override fun onInputEvent(event: InputEvent) {
@@ -168,6 +176,11 @@ object SystemUiInputSpy {
      * 聋 monitor 自愈检查（1005 双时机探针定案的收口实现）：build 成功 ≠ 投递链接通
      * （早建 monitor 注册进 dispatcher 却零事件）。观察窗内零 DOWN ⇒ dispose 全套重建；
      * 有事件 ⇒ armed（此后不再检查——spy 无状态，接通即稳定）。
+     *
+     * 2026-10-18：**删除"12 轮后永久放弃"**——空闲 ≠ 聋：宿主重启（夜里 OTA/系统界面崩溃）
+     * 后 3 分钟内零触摸就把 spy 永久打死，次日全功能静默失效（OS3 真机实测复现：
+     * `spy deaf after 13 rebuilds — giving up (inert)`）。改为永远重建；超过原封顶轮次后
+     * 日志降为每 4 轮一条（≈1/min），避免聋行把 1000 条环形缓冲刷光。
      */
     private fun deafCheck() {
         if (!started || gaveUp || armed) return
@@ -178,12 +191,13 @@ object SystemUiInputSpy {
         }
         deafRebuilds++
         if (deafRebuilds > MAX_DEAF_REBUILDS) {
-            gaveUp = true
-            HLog.w(TAG, "spy deaf after $deafRebuilds rebuilds — giving up (inert)")
-            return
+            if (deafRebuilds % 4 == 0) {
+                HLog.i(TAG, "spy deaf (idle, not giving up) rebuild #$deafRebuilds")
+            }
+        } else {
+            HLog.i(TAG, "spy deaf after ${DEAF_CHECK_WINDOW_MS / 1000}s " +
+                "(monitor built too early, rebuild #$deafRebuilds)")
         }
-        HLog.i(TAG, "spy deaf after ${DEAF_CHECK_WINDOW_MS / 1000}s " +
-            "(monitor built too early, rebuild #$deafRebuilds)")
         disposeSpy()
         started = false
         attemptStart()
@@ -255,7 +269,7 @@ object SystemUiInputSpy {
                         it.parameterTypes[0] == String::class.java &&
                         it.parameterTypes[1] == Int::class.javaPrimitiveType
                 } ?: error("$mn(String,int) missing")
-                val res = m.invoke(inst, "hypersidebar-spy", 0)
+                val res = m.invoke(inst, monitorName, 0)
                 HLog.i(TAG, "global candidate $cn.$mn: result=${res?.javaClass?.name}")
                 monitorRef = res
                 res
@@ -353,15 +367,19 @@ object SystemUiInputSpy {
      * `onMotion` ⇒ 又 arm ⇒ 又 pilfer ⇒ 又注入…（真机日志里同一个 `dt` 循环了 3 次）。
      * 这里记下注入过的 `(downTime,eventTime)`，`onMotion` 见到同指纹的事件直接丢弃。
      * 上限 256 条、命中即删（一次性指纹，不会误伤真正的重复触摸——真实触摸的 eventTime 不会重合）。
+     * 2026-10-18：`HashSet<Long>`（装箱+装箱哈希）换 `LongSparseArray`（原生 long 键，
+     * 逐事件零装箱；onMotion 是每次触摸的必经路）。
      */
-    private val injectedFingerprints = java.util.Collections.synchronizedSet(HashSet<Long>())
+    private val injectedFingerprints = android.util.LongSparseArray<Boolean>(64)
 
     private fun fingerprint(dt: Long, et: Long): Long = (dt shl 20) xor et
 
     /** 记录一个"我已注入"的指纹；超上限就清空（简单、无泄漏）。 */
     private fun rememberInjected(dt: Long, et: Long) {
-        if (injectedFingerprints.size > 256) injectedFingerprints.clear()
-        injectedFingerprints.add(fingerprint(dt, et))
+        synchronized(injectedFingerprints) {
+            if (injectedFingerprints.size() > 256) injectedFingerprints.clear()
+            injectedFingerprints.put(fingerprint(dt, et), true)
+        }
     }
     /** 重放失败计数（自检导出用） */
     @Volatile var takeoverReplayFail = 0L; private set
@@ -409,20 +427,25 @@ object SystemUiInputSpy {
      */
     private val cornerPilferHost: Boolean = runCatching {
         Class.forName(
-            "com.miui.sidebar.ISidebarOverlay", false,
+            Os4Marker.SIDEBAR_ITF, false,
             io.github.kyuubiran.ezxhelper.core.ClassLoaderProvider.safeClassLoader
         )
         true
     }.getOrDefault(false)
 
+    /** 2a 开关 1s TTL 缓存：角区流每个 MOVE 都要过这里，反射+属性读不能逐事件做。 */
+    @Volatile private var sysJudgeCacheAt = 0L
+    @Volatile private var sysJudgeCacheVal = true
+
     private fun sysJudgeEnabled(): Boolean {
         if (!cornerPilferHost) return false
-        val v = runCatching {
-            val c = Class.forName("android.os.SystemProperties")
-            c.getMethod("get", String::class.java).invoke(null, "debug.hsb.corner.sysjudge") as? String
-        }.getOrNull() ?: ""
-        // 显式 '0' 才关；空/异常 = 开（2a 是当前要验证的路径）
-        return v != "0"
+        val now = android.os.SystemClock.uptimeMillis()
+        if (now - sysJudgeCacheAt > 1_000L) {
+            // 显式 '0' 才关；空/异常 = 开（2a 是当前要验证的路径）
+            sysJudgeCacheVal = SysProps.get(PropNames.CORNER_SYSJUDGE) != "0"
+            sysJudgeCacheAt = now
+        }
+        return sysJudgeCacheVal
     }
 
     /** 底角几何/阈值：与 OS2/3（EdgeGestureHook）同一份 GestureThresholds 常量。
@@ -448,21 +471,59 @@ object SystemUiInputSpy {
     /** 同进程 pilfer：命中即抢，无广播往返、无身份竞速（仍失败只记日志，不影响扇形）。 */
     private fun sysPilferNow(reason: String, dt: Long = lastDownTime) {
         if (sysPilfered) return
-        val r = runCatching {
-            monitorRef?.javaClass?.getMethod("pilferPointers")?.invoke(monitorRef)
-        }
-        if (r?.isSuccess == true) {
+        if (pilferPointersNow()) {
             sysPilfered = true
-            HLog.i(TAG, "sys-pilfer ok ($reason) dt=$dt — Rust 判定将收 CANCEL")
+            HLog.i(TAG, "sys-pilfer ok ($reason) dt=$dt")
         } else {
-            HLog.w(TAG, "sys-pilfer failed ($reason): ${r?.exceptionOrNull()?.message}")
+            HLog.w(TAG, "sys-pilfer failed ($reason)")
         }
     }
 
     // ===== 输入接管（防穿透）辅助 =====================================================
 
+    /** `pilferPointers` 的 Method（懒解析一次；反射是热点开销，见 2026-10-18 性能审计）。 */
+    @Volatile private var pilferMethod: java.lang.reflect.Method? = null
+
+    /**
+     * 统一的同进程抢流入口（三处调用点共用；懒解析而非绑定点解析——`monitorRef` 有
+     * candidate ctx 与 global 两条挂接路径，绑定任一赋值点都会漏掉另一条）。
+     * `monitorRef` 为 null（dispose 后）⇒ false，与现状一致。
+     */
+    private fun pilferPointersNow(): Boolean {
+        val m = pilferMethod ?: monitorRef?.let { r ->
+            runCatching { r.javaClass.getMethod("pilferPointers") }.getOrNull()
+                ?.also { pilferMethod = it }
+        } ?: return false
+        return runCatching { m.invoke(monitorRef) }.isSuccess
+    }
+
+    /** `injectInputEvent(InputEvent, int)` 的 Method（懒解析一次；live-forward 每事件都要用）。 */
+    @Volatile private var injectMethod: java.lang.reflect.Method? = null
+    @Volatile private var injectMethodFor: Class<*>? = null
+
+    private fun injectMethodOf(im: Any): java.lang.reflect.Method? {
+        if (injectMethod != null && injectMethodFor === im.javaClass) return injectMethod
+        val m = runCatching {
+            im.javaClass.getMethod(
+                "injectInputEvent",
+                android.view.InputEvent::class.java,
+                Int::class.javaPrimitiveType
+            )
+        }.getOrNull()
+        if (m != null) {
+            injectMethod = m
+            injectMethodFor = im.javaClass
+        }
+        return m
+    }
+
+
     /** 接管总开关：**设置项为准**（默认开）；另有 `debug.hsb.takeover=0` 强制关闭 + 注入连续失败时
      *  60 秒冷却（见 [takeoverBrokenAt]）。 */
+    /** 接管回退闸 1s TTL 缓存（同 [sysJudgeEnabled]：DOWN 频读不划算）。 */
+    @Volatile private var takeoverPropCacheAt = 0L
+    @Volatile private var takeoverPropCacheVal = true
+
     private fun takeoverEnabled(): Boolean {
         val brokenAt = takeoverBrokenAt
         if (brokenAt != 0L) {
@@ -477,11 +538,12 @@ object SystemUiInputSpy {
                 com.lsp.hypersidebar.prefs.LayoutDefaults.FREEFORM_BLANK_TAP_TAKEOVER
             )
         ) return false
-        val v = runCatching {
-            val c = Class.forName("android.os.SystemProperties")
-            c.getMethod("get", String::class.java).invoke(null, "debug.hsb.takeover") as? String
-        }.getOrNull() ?: ""
-        return v != "0"
+        val now = android.os.SystemClock.uptimeMillis()
+        if (now - takeoverPropCacheAt > 1_000L) {
+            takeoverPropCacheVal = SysProps.get(PropNames.TAKEOVER) != "0"
+            takeoverPropCacheAt = now
+        }
+        return takeoverPropCacheVal
     }
 
     /**
@@ -508,7 +570,7 @@ object SystemUiInputSpy {
         // ⇒ isBlank 误判"空白" ⇒ 抢流被 ROM caption 监视器回抢 ⇒ 手势被当 caption 拖拽
         // ⇒ 窗口被误最大化）。⇒ 窗口动画期间一律不抢流。
         if (h.anyWindowAnimating()) {
-            HLog.i(TAG, "takeover: 小窗动画中（几何不可信）⇒ 不抢流，点击照常落给系统")
+            HLog.i(TAG, "takeover: 小窗动画中 ⇒ 不抢流")
             return@runCatching false
         }
         val mode = prefs?.getString(
@@ -516,7 +578,7 @@ object SystemUiInputSpy {
             com.lsp.hypersidebar.prefs.LayoutDefaults.FREEFORM_BLANK_TAP_MODE_DEFAULT
         ) ?: com.lsp.hypersidebar.prefs.LayoutDefaults.FREEFORM_BLANK_TAP_MODE_DEFAULT
         if (!h.hasActionTarget(mode)) {
-            HLog.i(TAG, "takeover: 无可动作小窗（mode=$mode；mini 档下 mini 窗是空操作）⇒ 不抢流")
+            HLog.i(TAG, "takeover: 无可动作小窗（mode=$mode）⇒ 不抢流")
             return@runCatching false
         }
         HLog.i(TAG, "takeover armed at (${x.toInt()},${y.toInt()}) wins=${wins.size}")
@@ -529,17 +591,13 @@ object SystemUiInputSpy {
     /** 抢流：与角区 [sysPilferNow] 同一机制、独立标志（两者可在同一手势上共存，互不干扰）。 */
     private fun takeoverPilferNow(): Boolean {
         if (takeoverPilfered) return true
-        val r = runCatching {
-            monitorRef?.javaClass?.getMethod("pilferPointers")?.invoke(monitorRef)
+        if (!pilferPointersNow()) {
+            HLog.w(TAG, "takeover pilfer failed")
+            return false
         }
-        return if (r?.isSuccess == true) {
-            takeoverPilfered = true
-            HLog.i(TAG, "takeover pilfer ok dt=$lastDownTime — 本手势归我们，抬手续接消费/重放")
-            true
-        } else {
-            HLog.w(TAG, "takeover pilfer failed: ${r?.exceptionOrNull()?.message}")
-            false
-        }
+        takeoverPilfered = true
+        HLog.i(TAG, "takeover pilfer ok dt=$lastDownTime")
+        return true
     }
 
     /**
@@ -582,13 +640,7 @@ object SystemUiInputSpy {
             HLog.w(TAG, "inject failed: no InputManager")
             return 0
         }
-        val inject = runCatching {
-            im.javaClass.getMethod(
-                "injectInputEvent",
-                android.view.InputEvent::class.java,
-                Int::class.javaPrimitiveType
-            )
-        }.getOrNull() ?: run {
+        val inject = injectMethodOf(im) ?: run {
             takeoverReplayFail++
             HLog.w(TAG, "inject failed: injectInputEvent missing")
             return 0
@@ -668,11 +720,7 @@ object SystemUiInputSpy {
         runCatching {
             val im = ctx.getSystemService(android.hardware.input.InputManager::class.java)
                 ?: return
-            val m = im.javaClass.getMethod(
-                "injectInputEvent",
-                android.view.InputEvent::class.java,
-                Int::class.javaPrimitiveType
-            )
+            val m = injectMethodOf(im) ?: return
             val copy = MotionEvent.obtain(ev)
             copy.source = ev.source
             val ok = m.invoke(im, copy, 0) as? Boolean == true
@@ -740,8 +788,9 @@ object SystemUiInputSpy {
                         return
                     }
                     runCatching {
-                        monitorRef?.javaClass?.getMethod("pilferPointers")?.invoke(monitorRef)
-                        HLog.i(TAG, "pilfered stream dt=$dt — Rust 判定将收 CANCEL")
+                        if (pilferPointersNow()) {
+                            HLog.i(TAG, "pilfered stream dt=$dt")
+                        }
                     }.onFailure { HLog.w(TAG, "pilferPointers failed: ${it.message}") }
                 }
             }
@@ -928,7 +977,7 @@ object SystemUiInputSpy {
                     if (takeover.active) {
                         // 已有接管中的手势（多指/两区同起）⇒ 本条不抢（回到穿透），别把前一条
                         // 的记录冲掉——重放需要它完整。
-                        HLog.i(TAG, "takeover busy at DOWN — 本手势不抢流（回到穿透）")
+                        HLog.i(TAG, "takeover busy at DOWN — 不抢流")
                     } else {
                         takeoverPilfered = takeoverPilferNow()
                         takeover.begin(ev.downTime, ev.deviceId, ev.source)
@@ -1035,10 +1084,11 @@ object SystemUiInputSpy {
             // 2a：同进程起一份判定；DOWN 就接管（对齐 OS2/3 的 DOWN 域接管语义）
             sysPilfered = false
             diagMoves = 0; diagFwdMoves = 0; diagHist = 0
-            if (corner && sysJudgeEnabled()) {
+            val judge = sysJudgeEnabled()
+            if (corner && judge) {
                 val claimed = runCatching { sysCornerOnDown(ev.x, ev.y, w, h) }.getOrDefault(false)
                 HLog.i(TAG, "sys-corner DOWN raw=(${ev.x.toInt()},${ev.y.toInt()}) claimed=$claimed " +
-                    "judge=${sysJudgeEnabled()}")
+                    "judge=$judge")
             }
         }
         val tr = tracks[ev.downTime] ?: return // 非转发流的 MOVE/UP（带外起手）——静默忽略
@@ -1125,12 +1175,21 @@ object SystemUiInputSpy {
     private fun onMotion(ev: MotionEvent, w: Int, h: Int) {
         val a = ev.actionMasked
         // 回声过滤（2026-10-17）：这是我们自己注入回去的事件 ⇒ 丢弃，否则 arm/pilfer/注入 会成环。
-        if (injectedFingerprints.remove(fingerprint(ev.downTime, ev.eventTime))) return
+        // ⚠ 2026-10-18 教训：`LongSparseArray.remove(long)` 返回 void（≠ HashSet.remove 的
+        // boolean），`remove(k) != null` 恒真 ⇒ 每个事件都被当回声吞掉（真机全聋实锤）。
+        // 必须 indexOfKey 先判存在。
+        if (synchronized(injectedFingerprints) {
+                val k = fingerprint(ev.downTime, ev.eventTime)
+                val hit = injectedFingerprints.indexOfKey(k) >= 0
+                if (hit) injectedFingerprints.remove(k)
+                hit
+            }
+        ) return
         // 残留复位（2026-10-17，安全性）：若上一条手势的终态没到（流被掐/被系统取消），
         // [takeoverForwarding] 会残留 ⇒ 之后**每个**触摸都会被我们注入一遍（重复触摸、整机手感错乱）。
         // 新手势的 DOWN 一到就地清掉。
         if (a == MotionEvent.ACTION_DOWN && takeoverForwarding) {
-            HLog.w(TAG, "takeover live-forward 残留（上一条手势终态未到）⇒ 新手势重置")
+            HLog.w(TAG, "takeover live-forward 残留 ⇒ 新手势重置")
             takeoverForwarding = false
             takeoverInjected = 0
             takeoverPilfered = false
@@ -1175,7 +1234,7 @@ object SystemUiInputSpy {
                 HLog.i(TAG, "spy armed on first event")
             }
             // 每 DOWN 恒打一行（低频）：判读"流到达 spy"的最小证据
-            HLog.i(TAG, "down (${"%.0f".format(ev.x)},${"%.0f".format(ev.y)}) " +
+            HLog.i(TAG, "down (${ev.x.toInt()},${ev.y.toInt()}) " +
                 "src=${ev.source} dev=${ev.deviceId} edge=${ev.edgeFlags} " +
                 "t=${ev.downTime}/${ev.eventTime} | totals d=$totalDown bottom=$bottomBandDown edge=$edgeBandDown")
         } else if (HLog.verboseEnabled && (a == MotionEvent.ACTION_MOVE ||

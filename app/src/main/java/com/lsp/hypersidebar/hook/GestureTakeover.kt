@@ -46,7 +46,16 @@ class GestureTakeover {
     private var source = 0
     private var startMs = 0L
     private var overflow = false
-    private val samples = ArrayList<Sample>(64)
+
+    // 预分配平行数组（2026-10-18 性能审计：append 在输入线程逐事件跑，原 `ArrayList<Sample>`
+    // 每样本一个对象+扩容；数组化后追加零分配，List 只在 end() 物化一次）。
+    private val sAction = IntArray(MAX_SAMPLES)
+    private val sEventTime = LongArray(MAX_SAMPLES)
+    private val sX = FloatArray(MAX_SAMPLES)
+    private val sY = FloatArray(MAX_SAMPLES)
+    private val sMeta = IntArray(MAX_SAMPLES)
+    private val sSource = IntArray(MAX_SAMPLES)
+    private var count = 0
 
     /** 开始记录。[downTime] 既是身份键也是时间基准。 */
     fun begin(downTime: Long, deviceId: Int, source: Int) {
@@ -55,32 +64,42 @@ class GestureTakeover {
         this.source = source
         this.startMs = downTime
         overflow = false
-        samples.clear()
+        count = 0
         active = true
     }
 
     /** 记录一个采样；超上限/超时长 ⇒ 只置 [overflow]（不抛、不阻塞输入线程）。 */
     fun append(action: Int, eventTime: Long, x: Float, y: Float, metaState: Int, source: Int) {
         if (!active) return
-        if (samples.size >= MAX_SAMPLES || eventTime - startMs > MAX_MS) {
+        if (count >= MAX_SAMPLES || eventTime - startMs > MAX_MS) {
             overflow = true
             return
         }
-        samples.add(Sample(action, eventTime, x, y, metaState, source))
+        sAction[count] = action
+        sEventTime[count] = eventTime
+        sX[count] = x
+        sY[count] = y
+        sMeta[count] = metaState
+        sSource[count] = source
+        count++
     }
 
     /** 结束记录并取快照；无样本 ⇒ null。调用方随后必须 [clear]。 */
     fun end(): Snapshot? {
         if (!active) return null
         active = false
-        if (samples.isEmpty()) return null
-        return Snapshot(downTime, deviceId, source, ArrayList(samples), overflow)
+        if (count == 0) return null
+        val out = ArrayList<Sample>(count)
+        for (i in 0 until count) {
+            out.add(Sample(sAction[i], sEventTime[i], sX[i], sY[i], sMeta[i], sSource[i]))
+        }
+        return Snapshot(downTime, deviceId, source, out, overflow)
     }
 
     fun clear() {
         active = false
         overflow = false
-        samples.clear()
+        count = 0
     }
 
     /**

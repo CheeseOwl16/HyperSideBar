@@ -12,6 +12,7 @@ import com.lsp.hypersidebar.anchor.AnchorResolver
 import com.lsp.hypersidebar.anchor.AnchorRoles
 import com.lsp.hypersidebar.prefs.LayoutDefaults
 import com.lsp.hypersidebar.prefs.PrefKeys
+import com.lsp.hypersidebar.prefs.PropNames
 import com.lsp.hypersidebar.ui.fan.FanMenuController
 import io.github.kyuubiran.ezxhelper.core.finder.ConstructorFinder
 import io.github.kyuubiran.ezxhelper.core.finder.MethodFinder
@@ -25,6 +26,7 @@ import kotlin.math.abs
 import kotlin.math.hypot
 import kotlin.math.sqrt
 import com.lsp.hypersidebar.util.HLog
+import com.lsp.hypersidebar.util.SysProps
 import com.lsp.hypersidebar.util.DismissCause
 import com.lsp.hypersidebar.util.StatsRecorder
 import com.lsp.hypersidebar.util.toastOnMain
@@ -77,7 +79,7 @@ class TurboLayout(private val remotePrefs: SharedPreferences) : BaseHook() {
 
     /** OS4 探测常量（AIDL 名未混淆，跨版本稳定）：类存在 = OS4 的全局侧边栏宿主。
      *  注意：p7 hook 已于 2026-10-13 删除（一律放行给原生），这里只用于 isOs4Sidebar 判定。 */
-    private val EVOKE_ITF = "com.miui.sidebar.ISidebarOverlay"
+    private val EVOKE_ITF = Os4Marker.SIDEBAR_ITF
 
     /** OS4 判据：ISidebarOverlay 存在即 OS4 系（AIDL 稳定名；OS2/OS3 无此类）。
      *  决定 hookOnTouch 走哪套条上语义（OS4=吞事件不跑状态机，见该函数注释）。 */
@@ -518,7 +520,7 @@ class TurboLayout(private val remotePrefs: SharedPreferences) : BaseHook() {
     // 会不断刷新截止点，把回退无限推后（08:49 的 s#29 拖到 DOWN 后 6.0s 才出扇形）。
     // 改用同一条速度窗判据后：回退点 = 最后一次够快的移动 + dwell + 200ms，
     // 而 native 的发布点在 +dwell 附近 ⇒ **native 永远先到**，回退只在它沉默时落地。
-    private val AUTH_STRICT_PROP = "debug.hsb.native.strict"
+    private val AUTH_STRICT_PROP = PropNames.NATIVE_STRICT
 
     /**
      * native 未授权时的回退宽限：回退支在 `dwell + 该值` 之后落地（速度窗判据见上）。
@@ -544,10 +546,7 @@ class TurboLayout(private val remotePrefs: SharedPreferences) : BaseHook() {
     private val AUTH_HANDSHAKE_GRACE_MS = 400L
     /** 本文件代码版本标记：只用来回答"现在跑的 :ui 是哪一版 Kotlin"（装机后重编时手工递增）。 */
     private val BUILD_TAG = "midstate-2026-10-14j"
-    private val AUTH_PROPS = arrayOf(
-        "debug.hsb.evoke", "sys.hsb.evoke", "vendor.hsb.evoke",
-        "persist.sys.hsb.evoke", "persist.hsb.evoke",
-    )
+    private val AUTH_PROPS = PropNames.EVOKE_PROPS
     /** [pollNativeAuth] 的三种结果（见该函数注释）。 */
     private val AUTH_NONE = 0
     /** native 发了 seq=0 握手：它已看到本条流（但停顿还没成立）。 */
@@ -564,40 +563,10 @@ class TurboLayout(private val remotePrefs: SharedPreferences) : BaseHook() {
     private var sAuthDt = 0L
     /** 取证：轮询里见过的**任意**发布（不筛 dt），回退日志用它区分"通道静默"与"覆盖差距"。 */
     private var sAuthLastAny: String? = null
-    private var sPropJniOk = false
-    private var sPropJniWarned = false
     private var sStrictLogged = false
 
-    /**
-     * 读系统属性：**首选模块自己的 .so**（`__system_property_get`，绕开 :ui 里的 hidden API
-     * 限制），失败才回退反射 `android.os.SystemProperties.get`。
-     * 2026-10-14：真机上 `setprop debug.hsb.native.strict 1` 后 :ui 一行 `AUTH` 都没有，
-     * 而"反射被拒"会静默成空串 ⇒ 改成本口优先 + 一次性取证日志。
-     */
-    private fun sysPropGet(key: String): String {
-        val viaJni = runCatching {
-            com.lsp.hypersidebar.util.NativeProbe.nativeGetProp(key)
-        }.onFailure { t ->
-            if (!sPropJniWarned) {
-                sPropJniWarned = true
-                HLog.w(TAG, "nativeGetProp 不可用（本进程未载模块 so）：${t.javaClass.simpleName} ⇒ 属性读取回退反射")
-            }
-        }.getOrNull()
-        if (viaJni != null) {
-            if (!sPropJniOk) {
-                sPropJniOk = true
-                HLog.i(TAG, "属性读取走 nativeGetProp（__system_property_get，绕开 hidden API）")
-            }
-            return viaJni
-        }
-        return try {
-            val m = Class.forName("android.os.SystemProperties")
-                .getMethod("get", String::class.java, String::class.java)
-            (m.invoke(null, key, "") as? String) ?: ""
-        } catch (_: Throwable) {
-            ""
-        }
-    }
+    /** 读系统属性（2026-10-18 收口：实现搬进 `util.SysProps`，本文件只留委托）。 */
+    private fun sysPropGet(key: String): String = SysProps.get(key)
 
     /** strict 档：只在本手势 DOWN 时读一次（属性读取极廉价，但没必要每事件读）。 */
     private fun nativeStrict(): Boolean {
@@ -1174,11 +1143,8 @@ class TurboLayout(private val remotePrefs: SharedPreferences) : BaseHook() {
     // ===== 小白条视觉隐藏（EDGE 模式） =====
 
     /** B0 实验开关（读系统属性，仅实验期存在；结果落 os4-trigger-final-plan 附录） */
-    private fun b0KeepVisible(): Boolean = runCatching {
-        Class.forName("android.os.SystemProperties")
-            .getMethod("get", String::class.java)
-            .invoke(null, "debug.hsb.b0.visible") == "1"
-    }.getOrDefault(false)
+    private fun b0KeepVisible(): Boolean =
+        SysProps.get(PropNames.B0_VISIBLE) == "1"
 
     /**
      * 小白条像素出口封口（2026-08-25 反编译取证定稿）：

@@ -1,7 +1,9 @@
 package com.lsp.hypersidebar.hook
 
 import android.view.MotionEvent
+import com.lsp.hypersidebar.prefs.PropNames
 import com.lsp.hypersidebar.util.HLog
+import com.lsp.hypersidebar.util.SysProps
 import io.github.kyuubiran.ezxhelper.core.ClassLoaderProvider
 import io.github.kyuubiran.ezxhelper.xposed.dsl.HookFactory.`-Static`.createBeforeHook
 
@@ -168,11 +170,8 @@ class BackGestureSignalProbe : BaseHook() {
         HLog.i(TAG, "DisplayHandler fields: $fs")
     }
 
-    private fun enabled(): Boolean = runCatching {
-        Class.forName("android.os.SystemProperties")
-            .getMethod("get", String::class.java)
-            .invoke(null, "debug.hsb.bgprobe") == "1"
-    }.getOrDefault(false)
+    private fun enabled(): Boolean =
+        SysProps.get(PropNames.BGPROBE) == "1"
 
     private fun hookEdge(c: EdgeCls) {
         val cl = ClassLoaderProvider.safeClassLoader

@@ -10,6 +10,9 @@ package com.lsp.hypersidebar.hook
  * - 后续任何需要"当前宿主是否 OS4 侧边栏形态"的判定都从这里读，勿再各自探测。
  */
 object Os4Marker {
+    /** AIDL 稳定接口名（未混淆，与混淆漂移无关）——全仓唯一字面量，探测处统一引用。 */
+    const val SIDEBAR_ITF = "com.miui.sidebar.ISidebarOverlay"
+
     @Volatile
     var sidebarPresent: Boolean = false
 }

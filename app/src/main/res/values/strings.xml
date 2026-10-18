@@ -65,10 +65,10 @@
     <string name="freeform_mode_mini_summary">把点到的小窗缩成小窗挂起态——三代 ROM 同一个接口，兼容性最好</string>
     <string name="freeform_mode_close">关闭</string>
     <string name="freeform_mode_pin">图标（钉住）</string>
-    <string name="freeform_mode_pin_summary">把小窗缩成钉在屏幕边缘的应用图标（ROM 的 pinAllFreeForm，带过渡动画）。点图标还原由系统自己处理；再次缩放/关闭对已钉住的窗是空操作</string>
-    <string name="freeform_mode_close_summary">关闭点到的小窗。HyperOS 2 没有"关闭单个小窗"的系统接口，会退化成"退出小窗"（效果接近缩小）</string>
+    <string name="freeform_mode_pin_summary">点空白把小窗缩成屏幕边缘的应用图标；点图标还原。已钉住的窗再缩/再关是空操作</string>
+    <string name="freeform_mode_close_summary">关闭点到的小窗。HyperOS 2 无"关闭单个小窗"接口，会退化成"退出小窗"（≈缩小）</string>
     <string name="freeform_takeover_title">点空白时不穿透</string>
-    <string name="freeform_takeover_summary">空白处按下即抢走触摸：判定为轻点就吞掉（背后 app 收不到），一旦变成拖动/多指就立刻把手势原样还回去（含已缓冲部分，实时转发）。注入被系统拒绝时本开关会自动失效以保护整机</string>
+    <string name="freeform_takeover_summary">空白处按下即接管：轻点吞掉，拖动/多指原样还给系统；注入失败自动停 60s</string>
     <string name="freeform_blank_tap_footnote">判定"空白"= 该点不落在任何可见、未固定的在册小窗内；拖拽与长按不算轻点，在小窗内部轻点也不触发。</string>
     <string name="fan_background_section">扇形背景</string>
     <string name="fan_background_summary">材质 %1$d%% · 压暗%2$s</string>
@@ -81,9 +81,9 @@
     <string name="corner_swipe_title">底角斜滑呼出</string>
     <string name="corner_swipe_summary">从屏幕左下/右下角斜向内上滑，直接呼出扇形（仅竖屏）；与停顿呼出并存，默认关闭</string>
     <string name="corner_suppress_title">底角斜滑独占</string>
-    <string name="corner_suppress_summary">底角斜滑时让系统不再同时响应（只出扇形，不弹 Home/最近任务）；关掉后回到"系统与模块同时判"。改动 ≤1 秒生效，无需重启</string>
+    <string name="corner_suppress_summary">底角斜滑只出扇形，系统不再同时响应；关闭后两者同时生效。改动 ≤1 秒生效</string>
     <string name="fan_fog_title">板材质浓度</string>
-    <string name="fan_fog_summary">统一驱动板的混色、提亮与颗粒（0 = 板材质全关，只剩弧线与图标；若背景模糊来源已开启，模糊本身仍在，板不会变透明）；改动下次呼出生效</string>
+    <string name="fan_fog_summary">调板的混色、提亮与颗粒；0＝板材质全关。改动下次呼出生效</string>
     <string name="fan_dim_title">背景压暗</string>
     <string name="fan_dim_summary">呼出扇形时全屏压暗 24%，突出菜单；改动下次呼出生效</string>
     <string name="fan_scrim_fade_title">压暗过渡时长</string>
@@ -95,11 +95,11 @@
     <string name="fan_blur_source_transparent">透明</string>
     <string name="fan_blur_source_off">关闭</string>
     <string name="fan_blur_source_summary_auto">按能力自动选路：壁纸就绪时用采样壁纸（横竖屏皆可），否则只出板材质（亚克力）</string>
-    <string name="fan_blur_source_summary_wallpaper">采样壁纸做板内磨砂，材质最完整，横竖屏共用同一张壁纸；桌面上与真实背景对齐，游戏内看到的会是模糊壁纸而非游戏画面</string>
+    <string name="fan_blur_source_summary_wallpaper">用壁纸做板内磨砂，横竖屏共用；游戏内看到的是模糊壁纸而非游戏画面</string>
     <string name="fan_blur_source_summary_behind">FLAG_BLUR_BEHIND 全屏景深：整屏一起模糊，只糊板内做不到；桌面观感佳、游戏慎用</string>
     <string name="fan_blur_source_summary_transparent">既不取背后内容、也不加板材质：只剩弧线与图标，完全透视到后面的画面</string>
     <string name="fan_blur_source_summary_off">不取背后内容：板完全由「板材质浓度」决定，浓度 0 时板为透明（只剩弧线与图标）</string>
-    <string name="fan_frosted_summary">仅扇形与快捷栏区域做系统级背景磨砂（AOSP 背景模糊通道，按板轮廓裁剪）；系统关闭模糊效果或材质引擎不可用时自动降级为纯色板；改动下次呼出生效</string>
+    <string name="fan_frosted_summary">仅扇形与快捷栏区域做背景磨砂；系统不支持时自动降级为纯色板。改动下次呼出生效</string>
     <string name="restore_defaults">恢复默认值</string>
     <string name="restore_defaults_summary">将全部布局与交互参数恢复为默认值，下次呼出生效</string>
     <string name="restore_defaults_confirm">将全部布局与交互参数恢复为默认值，应用选择与快捷方式不受影响。</string>
@@ -167,14 +167,14 @@
     <string name="debug_relay_blackhole">模拟执行端失联</string>
     <string name="debug_relay_blackhole_summary">所有执行广播按失联处理，用于验证熔断链路；测完务必关闭</string>
     <string name="debug_relay_confirm_title">开启模拟执行端失联？</string>
-    <string name="debug_relay_confirm_summary">开启后扇形的所有点击都会被人为拦截：提示"服务不可用"，连续 5 次后触发真实熔断，症状与真实故障完全相同。此设置卸载重装后仍会保留，只能回到本页关闭。</string>
+    <string name="debug_relay_confirm_summary">测试用：拦截扇形点击并提示"服务不可用"，连续 5 次触发真实熔断；卸载重装后仍保留，只能回本页关闭</string>
     <string name="debug_relay_confirm_countdown">%d 秒后可确认</string>
     <string name="debug_relay_confirm_ready">倒计时结束，可以确认了</string>
     <string name="debug_relay_confirm_action">确认开启</string>
     <string name="debug_relay_confirm_action_counting">确认开启（%d）</string>
     <string name="debug_host_restart">重启 hook 宿主</string>
     <string name="debug_host_restart_summary">root 强制结束勾选的宿主进程并由系统拉回，用于模块更新后重载 hook</string>
-    <string name="debug_host_restart_dialog_summary">模块更新后需三个宿主全部重启才会重新加载 hook（漏系统界面=磁贴成功率回退）。勾选后点「重启」：桌面回 HOME，系统界面会黑屏一闪后自动重启（黑屏即重启成功的标志），手机管家下次呼出侧边栏时拉起。</string>
+    <string name="debug_host_restart_dialog_summary">模块更新后三个宿主都要重启才重新加载 hook。桌面回 HOME；系统界面黑屏一闪＝重启成功</string>
     <string name="debug_host_restart_action">重启</string>
     <string name="debug_host_restart_busy">重启中…</string>
     <string name="selfcheck_export">导出自检报告</string>
@@ -184,7 +184,7 @@
 
     <!-- Shortcut -->
     <string name="shortcut_count_format">已添加 %1$d · 启用 %2$d</string>
-    <string name="shortcut_display_overflow">扇形快捷栏最多展示 %2$d 个（含面板占位时再少 1）；当前启用 %1$d 个，上栏按排序取前 %2$d，禁用至 %2$d 个以内可全部显示</string>
+    <string name="shortcut_display_overflow">最多展示 %2$d 个；当前启用 %1$d 个，按排序取前 %2$d，多出的先禁用即可全显</string>
     <string name="shortcut_drag_handle">拖动排序</string>
     <string name="shortcut_selected_count">已选 %d 项</string>
     <string name="shortcut_batch_delete">删除（%d）</string>
@@ -255,7 +255,7 @@
     <string name="qs_tile_item_count">%1$d 个磁贴</string>
     <string name="qs_shortcut_item_count">%1$d 个快捷方式</string>
     <string name="shortcut_qs_tile_target">磁贴组件</string>
-    <string name="shortcut_qs_tile_note">通过 SystemUI 直接触发系统快捷开关（无须加入控制中心）；需 LSPosed 勾选系统界面作用域，否则自动回退 root 兜底</string>
+    <string name="shortcut_qs_tile_note">直接触发系统快捷开关；需 LSPosed 勾选系统界面作用域，否则走 root 兜底</string>
     <string name="all_apps_title">全部应用</string>
     <string name="all_apps_load_failed">应用列表加载失败（数据源不可达）</string>
     <string name="all_apps_retry">重试</string>
@@ -294,7 +294,7 @@
     <string name="stats_avg_response">平均响应时间</string>
     <string name="stats_avg_gap">平均两次呼出间隔</string>
     <string name="stats_all_apps_share">全部应用占比</string>
-    <string name="stats_note">口径：成功率=有确定性结果的启动（不含 :ui 本地直启）；全部应用占比=打开全部应用次数/打开应用次数；样本窗=各进程最近 200 条时长。</string>
+    <string name="stats_note">口径：成功率＝有确定结果的启动；全部应用占比＝其打开次数/打开次数；样本＝最近 200 条</string>
 
     <!-- 误触率口径 v2（PRD §9.3 定稿 / §11.3 采集层 v2）：分通道出数，加权总值仅趋势 -->
     <string name="stats_misclick_title">误触率（口径 v2 · 逐事件）</string>
@@ -306,6 +306,6 @@
     <string name="stats_channel_edge">竖屏边缘</string>
     <string name="stats_channel_strip">横屏热区</string>
     <string name="stats_channel_corner">底角斜滑</string>
-    <string name="stats_misclick_note">主判据=全程未进预选，时长仅分档（L1&lt;350ms、L2&lt;1s）；位移只作「原位/划过」标签，不进判定。阈值按通道各自判：R1&lt;2% 且 R&lt;5%。强制收起只有看门狗可识别，来电/切窗/冻结属已知盲区。样本=各进程最近 500 次展开。</string>
+    <string name="stats_misclick_note">误触＝全程未进预选；时长分 L1/L2/L3 档，位移仅作原位/划过标签。样本＝最近 500 次展开</string>
     <string name="logs_verbose_summary">逐手势明细（g#N/s#N），排查呼出灵敏度时开启；默认关（关闭时零开销），开启后下次手势生效</string>
 </resources>

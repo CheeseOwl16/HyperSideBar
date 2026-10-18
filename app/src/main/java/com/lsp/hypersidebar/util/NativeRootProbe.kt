@@ -1,6 +1,7 @@
 package com.lsp.hypersidebar.util
 
 import android.content.Context
+import com.lsp.hypersidebar.prefs.PropNames
 
 /**
  * native hook 的 root 取证桥（spike/os4-native，2026-10-08/09）。
@@ -236,7 +237,7 @@ object NativeRootProbe {
             z.getInputStream(e).use { ins ->
                 val bytes = ins.readBytes()
                 val txt = String(bytes, Charsets.ISO_8859_1)
-                val hook = txt.contains("debug.hsb.native.hook") &&
+                val hook = txt.contains(PropNames.NATIVE_HOOK) &&
                     txt.contains("try_delegate_back_to_sidebar")
                 (if (hook) "hook 机器已编进（spike 态）"
                  else "⚠ hook 机器不在包里（编译态总闸关着 ⇒ 装机白测；先查 CMakeLists 那两行与 app/.cxx 缓存）") +

@@ -436,14 +436,14 @@ class FreeformBlankTapHook(private val prefs: SharedPreferences) : BaseHook() {
         if (verdict == true && !InsetProbe.imeKnown) {
             val dm0 = android.content.res.Resources.getSystem().displayMetrics
             if (ev.y > dm0.heightPixels * 0.55f) {
-                HLog.i(TAG, "isBlank → false（从未拿到键盘读数 + 位于下部 45% ⇒ 安全阀）")
+                HLog.i(TAG, "isBlank → false（无键盘读数 + 下部45%安全阀）")
                 return false
             }
         }
         // 软键盘（2026-10-17）：① IME 活动但拿不到高度 ⇒ 直接否决（方向安全）；
         // ② 拿得到高度 ⇒ 命中底部键盘带也否决。两者都与"点在小窗内"同向。
         if (verdict == true && InsetProbe.imeActive && InsetProbe.imeBottomPx <= 0) {
-            HLog.i(TAG, "isBlank → false（IME 活动：拿不到键盘高度 ⇒ 不动作）")
+            HLog.i(TAG, "isBlank → false（IME 活动，高度未知）")
             return false
         }
         // ⚠ 必须先调 [imeFrame]（它内含 pull，会把"浮窗键盘/ROM 键盘标志"这些状态刷新），
@@ -542,8 +542,8 @@ class FreeformBlankTapHook(private val prefs: SharedPreferences) : BaseHook() {
 
     /** 某个 taskId 的在册 info（取不到 ⇒ null）。 */
     private fun infoForTask(repo: Any, taskId: Int): Any? = runCatching {
-        repo.javaClass.getMethod("getMiuiFreeformTaskInfo", Int::class.javaPrimitiveType)
-            .invoke(repo, taskId)
+        repo.cachedMethod("getMiuiFreeformTaskInfo", Int::class.javaPrimitiveType!!)
+            ?.invoke(repo, taskId)
     }.getOrNull()
 
     /** 目标窗口当前形态的矩形（取不到 ⇒ null）。 */
@@ -987,7 +987,7 @@ class FreeformBlankTapHook(private val prefs: SharedPreferences) : BaseHook() {
             val normal = ids.firstOrNull { !isExiting(it) && !isMiniState(it) && !isPinned(it) }
             if (normal != null) return normal
             if (ids.any { !isExiting(it) }) {
-                HLog.i(TAG, "z-order 只有挂起/钉住态小窗 ⇒ 不作为目标（用户口径：点空白不碰收起态）")
+                HLog.i(TAG, "z-order 只有挂起/钉住态小窗 ⇒ 不作为目标")
             }
         }
         val infos = infoList(repo)
@@ -1010,7 +1010,7 @@ class FreeformBlankTapHook(private val prefs: SharedPreferences) : BaseHook() {
      */
     private fun zOrderIds(repo: Any): List<Int> {
         runCatching {
-            val m = repo.javaClass.getMethod("getFreeformTasksInZOrder")
+            val m = repo.cachedMethod("getFreeformTasksInZOrder") ?: return emptyList()
             // 空列表当作"这个方法在本题没给出信息"⇒ 继续试字段（避免某代返回空而字段有数据时误判）
             val ids = (m.invoke(repo) as? List<*>)?.mapNotNull { (it as? Number)?.toInt() } ?: emptyList()
             if (ids.isNotEmpty()) return ids
@@ -1033,13 +1033,11 @@ class FreeformBlankTapHook(private val prefs: SharedPreferences) : BaseHook() {
     /** 任务信息列表：先试 z-order 的 id → `getMiuiFreeformTaskInfo(int)`，再试公开的列表 getter。 */
     private fun infoList(repo: Any): List<Any>? {
         val byMethod = runCatching {
-            repo.javaClass.getMethod("getMiuiFreeformModeTaskInfoList").invoke(repo) as? List<*>
+            repo.cachedMethod("getMiuiFreeformModeTaskInfoList")?.invoke(repo) as? List<*>
         }.getOrNull()
         if (!byMethod.isNullOrEmpty()) return byMethod.filterNotNull()
         val ids = zOrderIds(repo)
-        val getInfo = runCatching {
-            repo.javaClass.getMethod("getMiuiFreeformTaskInfo", Int::class.javaPrimitiveType)
-        }.getOrNull()
+        val getInfo = repo.cachedMethod("getMiuiFreeformTaskInfo", Int::class.javaPrimitiveType!!)
         if (!repoDiagLogged) {
             repoDiagLogged = true
             val zField = runCatching {
@@ -1057,9 +1055,8 @@ class FreeformBlankTapHook(private val prefs: SharedPreferences) : BaseHook() {
     /** 当前 scale 与目的地 scale 不一致 = 仍在过渡中（ROM 的 fromFreeformToMini 会按未落定的值算目的地）。 */
     private fun scaleNotSettled(taskId: Int): Boolean = runCatching {
         val repo = repository ?: return false
-        val info = repo.javaClass
-            .getMethod("getMiuiFreeformTaskInfo", Int::class.javaPrimitiveType)
-            .invoke(repo, taskId) ?: return false
+        val info = repo.cachedMethod("getMiuiFreeformTaskInfo", Int::class.javaPrimitiveType!!)
+            ?.invoke(repo, taskId) ?: return false
         val now = (info.getOrNull("getFreeformScale") as? Number)?.toFloat() ?: return false
         val dest = (info.getOrNull("getDestinationScaleX") as? Number)?.toFloat() ?: return false
         dest > 0f && kotlin.math.abs(now - dest) > 0.01f
@@ -1068,31 +1065,30 @@ class FreeformBlankTapHook(private val prefs: SharedPreferences) : BaseHook() {
     /** 目标任务是否正在播放动画（ROM 的状态机在动画期间会吞掉并发的 fromFreeformToMini）。 */
     private fun isInAnimating(taskId: Int): Boolean = runCatching {
         val repo = repository ?: return false
-        val info = repo.javaClass
-            .getMethod("getMiuiFreeformTaskInfo", Int::class.javaPrimitiveType)
-            .invoke(repo, taskId) ?: return false
+        val info = repo.cachedMethod("getMiuiFreeformTaskInfo", Int::class.javaPrimitiveType!!)
+            ?.invoke(repo, taskId) ?: return false
         info.getOrNull("isInAnimating") as? Boolean ?: false
     }.getOrDefault(false)
 
     /** 目标任务当前是否处于 mini（缩小）态——用于校验 ROM 的 void 动作是否真的生效。 */
     private fun isMiniState(taskId: Int): Boolean = runCatching {
         val repo = repository ?: return false
-        val getInfo = repo.javaClass.getMethod("getMiuiFreeformTaskInfo", Int::class.javaPrimitiveType)
-        val info = getInfo.invoke(repo, taskId) ?: return false
+        val info = repo.cachedMethod("getMiuiFreeformTaskInfo", Int::class.javaPrimitiveType!!)
+            ?.invoke(repo, taskId) ?: return false
         info.getOrNull("isMiniState") as? Boolean ?: false
     }.getOrDefault(false)
 
     private fun isPinned(taskId: Int): Boolean = runCatching {
         val repo = repository ?: return false
-        val getInfo = repo.javaClass.getMethod("getMiuiFreeformTaskInfo", Int::class.javaPrimitiveType)
-        val info = getInfo.invoke(repo, taskId) ?: return false
+        val info = repo.cachedMethod("getMiuiFreeformTaskInfo", Int::class.javaPrimitiveType!!)
+            ?.invoke(repo, taskId) ?: return false
         info.getOrNull("isInPinMode") as? Boolean ?: false
     }.getOrDefault(false)
 
     private fun isExiting(taskId: Int): Boolean = runCatching {
         val repo = repository ?: return false
-        val getInfo = repo.javaClass.getMethod("getMiuiFreeformTaskInfo", Int::class.javaPrimitiveType)
-        val info = getInfo.invoke(repo, taskId) ?: return false
+        val info = repo.cachedMethod("getMiuiFreeformTaskInfo", Int::class.javaPrimitiveType!!)
+            ?.invoke(repo, taskId) ?: return false
         info.getOrNull("isExiting") as? Boolean ?: false
     }.getOrDefault(false)
 
@@ -1452,7 +1448,7 @@ class FreeformBlankTapHook(private val prefs: SharedPreferences) : BaseHook() {
         // "收这一个"语义等价）；否则只记日志、把处置权交回用户。
         val n = runCatching { windowsInZOrder().count { it.visible } }.getOrDefault(-1)
         if (n != 1) {
-            HLog.w(TAG, "fallback broadcast skipped ($why)：在册可见小窗=$n ≠ 1（避免连坐与动画打架）")
+            HLog.w(TAG, "fallback broadcast skipped ($why)：可见小窗=$n ≠ 1")
             return false
         }
         context.sendBroadcast(
@@ -1466,8 +1462,21 @@ class FreeformBlankTapHook(private val prefs: SharedPreferences) : BaseHook() {
         false
     }
 
+    /** 反射 Method 缓存（2026-10-18 性能审计：`getOrNull`/`infoForTask` 在 blank-tap 判定与
+     *  `awaitStable` 16ms 轮询里逐调用 `getMethod`——方法表查找+分配，稳定帧窗内约 350 次/动作）。 */
+    private val methodCache = java.util.concurrent.ConcurrentHashMap<String, java.lang.reflect.Method>()
+
+    /** 按「类#名(参数)」缓存 Method；解析失败不缓存（访问器有无按 ROM 构建稳定，成功路径才是热点）。 */
+    private fun Any.cachedMethod(name: String, vararg params: Class<*>): java.lang.reflect.Method? =
+        runCatching {
+            methodCache.getOrPut(javaClass.name + '#' + name +
+                params.joinToString(",", "(", ")") { it.name }) {
+                javaClass.getMethod(name, *params)
+            }
+        }.getOrNull()
+
     /** 反射读一个 getter（没有就 null）——ROM 各构建的访问器有代差，逐个容忍。 */
     private fun Any.getOrNull(method: String): Any? =
-        runCatching { javaClass.getMethod(method).invoke(this) }.getOrNull()
+        cachedMethod(method)?.let { runCatching { it.invoke(this) }.getOrNull() }
 
 }

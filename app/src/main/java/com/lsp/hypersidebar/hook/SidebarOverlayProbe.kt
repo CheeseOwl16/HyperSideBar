@@ -34,7 +34,7 @@ class SidebarOverlayProbe : BaseHook() {
     private val TAG = "SidebarProbe"
 
     /** 接口全名（未混淆，AIDL 稳定） */
-    private val ITF = "com.miui.sidebar.ISidebarOverlay"
+    private val ITF = Os4Marker.SIDEBAR_ITF
 
     /** 实现（binder 服务端）；内含同签名私有主线程转发助手，只挂接口解析出的入口名 */
     private val IMPL = "com.miui.gamebooster.service.DockWindowManagerService\$SidebarOverlayBinder"
