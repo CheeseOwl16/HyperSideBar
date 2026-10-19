@@ -59,9 +59,13 @@ android {
             abiFilters += "arm64-v8a"
         }
 
-        // 注入依赖版本到 BuildConfig，运行时可通过 BuildConfig.XXX 读取
-        buildConfigField("String", "XPOSED_API_VERSION", "\"101.0.1\"")
-        buildConfigField("String", "EZXHELPER_VERSION", "\"3.2.0-preview1\"")
+        // 注入依赖版本到 BuildConfig，运行时可通过 BuildConfig.XXX 读取。
+        // 2026-10-18：XPOSED_API_VERSION 原先写死 "101.0.1"（与实编 libxposed:api:102.0.0 不符，
+        // About 页显示错版本）；现与 EZXHELPER_VERSION 一样从版本目录取 —— 显示的永远是实际编译
+        // 依赖的版本，不可能再漂移。（module.prop 的 minApiVersion=102 是"最低要求"的整数形态，
+        // 与本行展示的库版本不是同一个东西。）
+        buildConfigField("String", "XPOSED_API_VERSION", "\"${libs.versions.xposed.api.get()}\"")
+        buildConfigField("String", "EZXHELPER_VERSION", "\"${libs.versions.ezxhelperVersion.get()}\"")
     }
 
     signingConfigs {
