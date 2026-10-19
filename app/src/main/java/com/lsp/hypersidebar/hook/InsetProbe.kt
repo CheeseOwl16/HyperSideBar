@@ -85,7 +85,28 @@ object InsetProbe {
      * 要么返回陈旧矩形（那正是用户报过的"下半屏永久死"的成因）。
      */
     fun wmShellSaysHidden(): Boolean =
-        wmShellLive && imeBottomAt > 0L && imeRectRaw == null && !floatingIme
+        wmShellLive && imeBottomAt > 0L && imeRectRaw == null && !floatingIme && !imeServiceSaysVisible()
+
+    /**
+     * OS4 实锤（2026-10-19）：SystemUI 的 `PerDisplay` insets 事件只反映 **SystemUI 自己窗口**
+     * 的 IME 状态 —— 键盘是给小窗/其它应用弹的 ⇒ SystemUI 恒报 hidden（真机：键盘开着打字时
+     * 事件仍来 `visible=false`），但它被当成全局权威 → `wmShellSaysHidden()=true` → 安全阀失效
+     * → 键盘触摸被当"空白点击"吃掉（打字失灵 + 误触发动作）。
+     *
+     * 否决闸：`input_method` 服务的可见高度 > 0 = 键盘确实起着（`dumpsys input_method` 读的就是
+     * 它）→ 此刻绝不能说"没键盘"。1 秒 TTL（判定路径别每拍都过 binder）。OS2/OS3 上事件源
+     * 本来就正确（键盘起时 `imeRectRaw != null`，根本走不进 hidden 分支）⇒ 本闸对它们无影响。
+     */
+    @Volatile private var imeSvcCheckedAt = 0L
+    @Volatile private var imeSvcVisibleCache = false
+    private fun imeServiceSaysVisible(): Boolean {
+        val now = android.os.SystemClock.uptimeMillis()
+        if (now - imeSvcCheckedAt > 1_000L) {
+            imeSvcVisibleCache = imeHeightFromService() > 0
+            imeSvcCheckedAt = now
+        }
+        return imeSvcVisibleCache
+    }
 
     /** 供 insets 钩子写入（SystemUI 窗口收到的 IME insets）。 */
     fun setImeBottom(px: Int, src: String) {
