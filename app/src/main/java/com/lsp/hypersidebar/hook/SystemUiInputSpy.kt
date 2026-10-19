@@ -973,7 +973,11 @@ object SystemUiInputSpy {
                 // 点击照旧穿透）。抬手时必然二选一：动作命中=消费，否则=重放（见 UP 分支）。
                 // 上一轮血案的教训（抢了不消费 ⇒ 背后 UI 失联 ⇒ 整机像卡死）就靠"必二选一"
                 // 与"只在圈内抢"两条约束排除。
-                if (h != null && blankAtDown == true && takeoverEnabled() && takeoverArmed(h, ev.x, ev.y)) {
+                val dmB = android.content.res.Resources.getSystem().displayMetrics
+                if (h != null && blankAtDown == true && takeoverEnabled() &&
+                    !GestureThresholds.inSystemGestureBand(ev.x, ev.y, dmB.widthPixels, dmB.heightPixels, dmB.density) &&
+                    takeoverArmed(h, ev.x, ev.y)
+                ) {
                     if (takeover.active) {
                         // 已有接管中的手势（多指/两区同起）⇒ 本条不抢（回到穿透），别把前一条
                         // 的记录冲掉——重放需要它完整。

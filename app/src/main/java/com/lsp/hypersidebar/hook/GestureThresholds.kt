@@ -118,4 +118,22 @@ object GestureThresholds {
      */
     const val TRIGGER_ZONE_TOP_RATIO = 1f / 3f
     const val TRIGGER_ZONE_BOTTOM_RATIO = 2f / 3f
+
+    /**
+     * 系统手势带（dp）：屏幕四边的系统手势识别区 —— 左/右缘 = 返回手势、顶缘 = 通知栏、
+     * 底缘 = 桌面手势（小横条）。这些带子里的触摸**属于系统管线**，输入接管不得抢
+     * （2026-10-19：返回手势起点在边缘空白 ⇒ 被接管抢走后系统的返回识别链断流，
+     * 小窗应用收不到 BACK ⇒ 应用内返回失效；这正是用户要的"小窗获焦时返回手势 =
+     * 应用内返回"的对立面）。
+     *
+     * 取值：Android 返回手势区典型 ≈20–24dp（`systemGestures` insets），取 24dp 留裕量；
+     * 带内**轻点**仍走空白动作（tap 不触发返回识别，两者不冲突），只排除"抢流"。
+     */
+    const val SYSTEM_GESTURE_EDGE_DP = 24f
+
+    /** 纯判据：DOWN 是否落在四边系统手势带内（[density] 换算 dp→px，调用方取 displayMetrics）。 */
+    fun inSystemGestureBand(x: Float, y: Float, w: Int, h: Int, density: Float): Boolean {
+        val e = SYSTEM_GESTURE_EDGE_DP * density
+        return x < e || y < e || x > w - e || y > h - e
+    }
 }
