@@ -151,6 +151,16 @@ object ShortcutStore {
      * 存储不截断（§2.4 解耦）；order 按当前列表序整体重排。
      */
     fun saveUserShortcuts(prefs: SharedPreferences, shortcuts: List<ShortcutAction>) {
+        // 防覆盖闸（2026-10-19 数据事故）：冷启动时桥未绑定，传入的 prefs 可能是本地
+        // 回退（APP_LOCAL，重装后为空）——用它保存=把 remotePrefs 里的完整列表整表覆盖
+        // （真机事故：6 条快捷方式被 1 条覆盖）。平台 SharedPreferencesImpl = 本地回退的
+        // 实现类；remotePrefs 是 LSPosed 的远端实现（类名不同）。本地回退上只允许"没有
+        // 可保存内容"的空操作，真实保存必须落在远端。
+        if (prefs.javaClass.name == "android.app.SharedPreferencesImpl") {
+            HLog.w(TAG, "saveUserShortcuts REFUSED: 桥未绑定（本地回退不可作保存目标，" +
+                "防止覆盖 remotePrefs 完整列表）")
+            return
+        }
         val userItems = shortcuts
             .filter { it.source == ShortcutSource.USER }
             .mapIndexed { index, item -> item.copy(order = index) }
