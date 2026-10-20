@@ -14,6 +14,7 @@ import com.lsp.hypersidebar.prefs.HostPackages
 import com.lsp.hypersidebar.prefs.PrefKeys
 import com.lsp.hypersidebar.prefs.PrefsFiles
 import com.lsp.hypersidebar.util.RelayToken
+import com.lsp.hypersidebar.util.ShortcutRootCatalog
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
@@ -196,6 +197,32 @@ object ManifestShortcutsBridge {
             RelayToken.attach(intent, RelayToken.current())
             context.sendBroadcast(intent)
         }.onFailure { Log.w(TAG, "manifest bridge request failed: ${it.message}") }
+        scheduleRootFallback(context)
+    }
+
+    /** 桥应答去重 + 防重入（request 会被重组反复调）。 */
+    @Volatile private var fallbackScheduled = false
+
+    /**
+     * OS4 兜底（2026-10-20）：桌面被 Rust 重写、无 Java 层 ⇒ 桥结构性缺席，广播无人
+     * 应答 ⇒ 延迟 [ROOT_FALLBACK_DELAY_MS] 后清单仍为空就走 root 枚举
+     * （[ShortcutRootCatalog.refresh]，marble 真机已验证的原语）。OS2/OS3 桥先到，
+     * 兜底自动跳过，零回归。
+     */
+    private const val ROOT_FALLBACK_DELAY_MS = 1_500L
+
+    private fun scheduleRootFallback(context: Context) {
+        if (fallbackScheduled) return
+        fallbackScheduled = true
+        android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+            fallbackScheduled = false
+            if (shortcuts.isEmpty()) {
+                Thread {
+                    runCatching { ShortcutRootCatalog.refresh(context) }
+                        .onFailure { Log.w(TAG, "root catalog refresh failed: ${it.message}") }
+                }.start()
+            }
+        }, ROOT_FALLBACK_DELAY_MS)
     }
 
     fun onReply(context: Context, json: String) {
@@ -223,7 +250,7 @@ object ManifestShortcutsBridge {
                 packageName = pkg,
                 className = cls,
                 label = ob.optString("l").ifEmpty { pkg },
-                appLabel = pkg,
+                appLabel = ob.optString("a").ifEmpty { pkg },
                 shortcutId = sid
             )
         }
