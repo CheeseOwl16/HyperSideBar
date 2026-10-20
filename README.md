@@ -1,9 +1,7 @@
 # HyperSideBar
 一个将 HyperOS系统原生侧边栏替换为双层半圆扇形摇杆菜单的模块，提供多种呼出方式，支持展示全部可打开应用、设置快捷方式。
 
-> 已在 **HyperOS 2**（大致测试）、**HyperOS 3.300** 与 **HyperOS 4**（桌面为 Rust 原生实现）上实机验证；其他机型与系统版本不保证可用。
->
-> HyperOS 4 多数功能的实现都需要依赖 root，建议为该应用授权 root 以获取更好的体验。
+
 
 
 ## 效果展示
@@ -86,9 +84,9 @@
 - 启用快捷方式可能需要root；
 - **游戏 / 视频工具箱开关必须保持开启**，否则横屏状态下无法唤出；
 - 更新模块版本后，请再次重启上述三个应用（桌面 / 系统界面 / 手机管家），否则部分功能可能不生效；
-- 本项目只在 `HyperOS 2`（大致测试）、`HyperOS 3.300` 与 **HyperOS 4** 上实机验证过，其他机型或系统不保证可用性（OS3：`com.miui.securitycenter` 12.2.8、`com.miui.home` 6.01.05、`com.android.systemui` 16.03.251211；OS4：桌面为 `8.01.02.7719` 的 Rust 原生实现）；
-- **HyperOS 4 多数功能的实现都需要依赖 root**，建议为该应用授权 root 以获取更好的体验（快捷方式清单、非导出组件启动、动态快捷方式启动等均走 root 通道）；
-- `HyperOS 2` 只经过大概的测试（`adapt/hyperos2` 分支），**不确保完全可用**；另有 QS 磁贴在**冻结 / 后台受限**场景的已知降级，详见下方「适配进度」；
+- 本项目只在 `HyperOS 2`（大致测试）、`HyperOS 3.300` 与 **HyperOS 4** 上实机验证过，其他机型或系统不保证可用性；
+- **HyperOS 4 多数功能的实现都需要依赖 root**，建议为该应用授权 root 以获取更好的体验；
+- `HyperOS 2` 只经过大概的测试，**不确保完全可用**；另有 QS 磁贴在**冻结 / 后台受限**场景的已知降级，详见下方「适配进度」；
 - LSPosed 框架必须支持 API 102 及以上；
 - 扇形应用展示的应用源于系统的 `getFreeformSuggestionList`，因此并不会展示所有应用；
 - 连续失败会触发熔断，hook 将不再主动生效（可在设置页查看通道状态并手动重试，或重启手机）；
@@ -102,50 +100,7 @@
 - 包括但不限于 GLM5.3、GLM5.3-flash、GLM5.2、DeepSeek-V4-flash、DeepSeek-V4-pro、MIMO V2.5 pro、Kimi K2.7 Code、Qwen3.8-Max、Qwen3.7-Plus 等各类或强或弱的模型精心熬制的一锅屎山代码，；
 - 可能存在的各类 bug 或者不完善的功能、漏洞；
 - 代码含人量较低。
-  
-## 适配进度
-
-| 系统版本 | 状态 | 说明 |
-|---|---|---|
-| **HyperOS 3** | ✅ 已实机验证 | 基线（本仓默认分支） |
-| **HyperOS 2** | 🧪 大致验证 | 仅经过大概测试，不确保完全可用；QS 磁贴在冻结/后台受限场景存在已知降级 |
-| **HyperOS 4** | ✅ 已实机验证 | 桌面为 Rust 原生实现（无 dex），走 native hook 路线；多数功能依赖 root |
-
-### HyperOS 2（`adapt/hyperos2`）
-
-四条通道中三条**零改动** —— 桌面手势、侧边栏、工具箱面板的锚点与 HyperOS 3 完全一致
-（侧边栏解析结果同为 `com.miui.dock.sidebar` 的 `f` / `b` / `c` + `RegionSamplingImageView`）。
-唯一需要适配的是 **SystemUI 磁贴链路**，共三处：
-
-1. QS 宿主适配器：HyperOS 2 无 pipeline 层，类名是 `com.android.systemui.qs.QSHostAdapter`。
-   现改为**候选表 + 契约校验**（必须声明 `interactor` 字段与 `createTile(String):QSTile`，
-   且 interactor 暴露磁贴枚举方法），不凭名字采信。
-2. 当前磁贴枚举：HyperOS 2 无 `getCurrentQSTiles()`，回落 `getCurrentTilesSpecs()` +
-   `getTile(spec)`。**旧路径优先**，HyperOS 3 / 4 行为零变化。
-3. `CustomTileExt`（后台弹出/启动限制豁免）在 HyperOS 2 上**不存在**。改为探测后跳过，
-   不再每次点击抛异常刷日志。
-
-> ⚠️ **已知功能降级**：因第 3 点，HyperOS 2 在**冻结 / 后台受限**场景下磁贴点击可能不生效；
-> 正常状态下不受影响。
-
-此外改为**按宿主分表**解析锚点：侧边栏六个角色是安全中心专属，桌面与 SystemUI 现在不再
-空跑全表（此前会稳定产出 6 行 `NOT_FOUND` 噪声并白白加载 DexKit）。
-
-只经过大概的测试，不确保完全可用（另有上述第 3 点的已知降级）；如遇问题可关闭模块总开关或移除作用域回滚。
-
-### HyperOS 4
-
-桌面（`com.miui.home`）被重写为 Rust/clang 原生实现——没有 dex、也没有可 hook 的 Java 方法，
-因此改走 **native hook** 路线（`libhypersidebar_native.so`，经 LSPosed native entry 载入）：
-
-- 呼出方式：竖屏侧滑+停顿、底角斜滑、横屏左上角，均已在真机验证；
-- 打开方式：小窗启动 / 选择打开、QS 磁贴直点、统计与诊断 / 日志拉取；
-- 快捷方式：桌面没有 Java 层，无法再代查系统快捷方式清单——选择器改由模块以 root 枚举
-  系统 `ShortcutService`，结果与 OS2/OS3 一致；
-- 桌面在内存压力下回收 APK 直映射代码、导致手势偶发失效时，模块会自动恢复。
-
-> ⚠️ **OS4 多数功能的实现都需要依赖 root**，建议为该应用授权 root 以获取更好的体验；未授权 root 时
-> 上述部分功能（尤其快捷方式相关）不可用。
+ 
 
 ## 基于
 
