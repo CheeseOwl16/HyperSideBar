@@ -58,6 +58,11 @@
         <receiver
             android:name=".ShortcutRelayReceiver"
             android:exported="true" />
+        <!-- 配置恢复通道（2026-10-19 数据事故后新增）：令牌严格校验 + 键白名单，
+             只用于把外部备份灌回 remotePrefs；详见 ConfigRestoreReceiver -->
+        <receiver
+            android:name=".ConfigRestoreReceiver"
+            android:exported="true" />
 
         <!-- :ui → 模块 App 解冻 relay（方案 2 bind 唤醒）：bind 本身唤醒冻结/已死的
              模块进程（SmartPower THAW/冷启动），连上后 su 解冻磁贴宿主。

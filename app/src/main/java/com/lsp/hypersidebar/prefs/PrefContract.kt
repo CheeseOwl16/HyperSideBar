@@ -129,6 +129,12 @@ object PrefKeys {
     const val CUSTOM_APPS_ORDER = "customAppsOrder"
     const val SHORTCUT_ACTIONS = "shortcut_actions"   // 用户快捷方式 JSON（权威 key）
 
+    /** 配置恢复通道（ConfigRestoreReceiver）：请求 action 与 extras（2026-10-19 数据事故后新增）。 */
+    const val ACTION_CONFIG_RESTORE = "io.github.mikudayoooooooo.hypersidebar.ACTION_CONFIG_RESTORE"
+    const val RESTORE_EXTRA_KEY = "restoreKey"
+    const val RESTORE_EXTRA_VALUE = "restoreValue"
+    const val RESTORE_EXTRA_PATH = "restoreValuePath"
+
     /** 穿透失效自动降级状态（1C：:ui 写入，设置页读出标注；非用户设置） */
     const val PASSTHROUGH_DEGRADED = "passthroughDegraded"
 
