@@ -1,7 +1,9 @@
 # HyperSideBar
 一个将 HyperOS系统原生侧边栏替换为双层半圆扇形摇杆菜单的模块，提供多种呼出方式，支持展示全部可打开应用、设置快捷方式。
 
-> 目前仅在 **HyperOS 3.300** 上验证通过，其他机型与系统版本不保证可用。
+> 已在 **HyperOS 3.300** 与 **HyperOS 4**（桌面为 Rust 原生实现）上实机验证；其他机型与系统版本不保证可用。
+>
+> HyperOS 4 多数功能的实现都需要依赖 root，建议为该应用授权 root 以获取更好的体验。
 
 
 ## 效果展示
@@ -48,6 +50,8 @@
 
 - 第一位会展示系统自带的活动面板，当前场景没有面板时自动消失、用户项前移；
 - 用于固定展示在快捷栏的快捷应用，可启动 activity / service、qs 磁贴、shortcut 以及 intent 链接；
+- 应用快捷方式的清单：OS2/OS3 由桌面进程代查；OS4 桌面无 Java 层，改由模块以 root 枚举系统
+  `ShortcutService`（该页在 OS4 需要 root）；
 - 最多同时展示六个快捷方式（含系统面板占位）。
 
 ### 展示全部可打开应用
@@ -82,7 +86,8 @@
 - 启用快捷方式可能需要root；
 - **游戏 / 视频工具箱开关必须保持开启**，否则横屏状态下无法唤出；
 - 更新模块版本后，请再次重启上述三个应用（桌面 / 系统界面 / 手机管家），否则部分功能可能不生效；
-- 本项目只在 `HyperOS 3.300` 上实机验证过，其他机型或系统不保证可用性（`com.miui.securitycenter` 版本为 12.2.8，`com.miui.home` 版本为 6.01.05，`com.android.systemui` 版本为16.03.251211）；
+- 本项目只在 `HyperOS 3.300` 与 **HyperOS 4** 上实机验证过，其他机型或系统不保证可用性（OS3：`com.miui.securitycenter` 12.2.8、`com.miui.home` 6.01.05、`com.android.systemui` 16.03.251211；OS4：桌面为 `8.01.02.7719` 的 Rust 原生实现）；
+- **HyperOS 4 多数功能的实现都需要依赖 root**，建议为该应用授权 root 以获取更好的体验（快捷方式清单、非导出组件启动、动态快捷方式启动等均走 root 通道）；
 - `HyperOS 2` 已完成离线静态适配（`adapt/hyperos2` 分支，**尚未实机验证**），详见下方「适配进度」；
 - LSPosed 框架必须支持 API 102 及以上；
 - 扇形应用展示的应用源于系统的 `getFreeformSuggestionList`，因此并不会展示所有应用；
@@ -104,7 +109,7 @@
 |---|---|---|
 | **HyperOS 3** | ✅ 已实机验证 | 基线（本仓默认分支） |
 | **HyperOS 2** | 🧪 已离线适配，待实机验证 | `adapt/hyperos2` 分支 |
-| **HyperOS 4** | 🔬 研究中 | 桌面为 native 进程（无 dex），需 native hook 路线 |
+| **HyperOS 4** | ✅ 已实机验证 | 桌面为 Rust 原生实现（无 dex），走 native hook 路线；多数功能依赖 root |
 
 ### HyperOS 2（`adapt/hyperos2`）
 
@@ -127,6 +132,22 @@
 空跑全表（此前会稳定产出 6 行 `NOT_FOUND` 噪声并白白加载 DexKit）。
 
 **未经实机验证**，尝鲜请自行评估风险；出问题可关闭模块总开关或移除作用域回滚。
+
+### HyperOS 4
+
+桌面（`com.miui.home`）被重写为 Rust/clang 原生实现——没有 dex、也没有可 hook 的 Java 方法，
+因此改走 **native hook** 路线（`libhypersidebar_native.so`，经 LSPosed native entry 载入）：
+
+- 竖屏侧滑+停顿呼出、底角斜滑、横屏左上角 B 路线均已在真机验证；
+- 桌面会在内存压力下回收 APK 直映射的 `.text`，导致 inline hook 被抹（表现为手势链路静默失效）——
+  模块内置巡检 + 自愈（重新安装 hook）；
+- 快捷方式：桌面没有 Java 层，无法再代查系统快捷方式清单，选择器改由模块以 root 枚举
+  系统 `ShortcutService`（`cmd shortcut get-shortcuts` 批查），结果与 OS2/OS3 一致；
+- 已实机验证：竖屏侧滑+停顿、底角斜滑、横屏左上角、小窗启动/选择打开、QS 磁贴直点、
+  快捷方式（含本轮选择器修复）、点空白关闭/缩小小窗、统计与诊断/日志拉取。
+
+> ⚠️ **OS4 多数功能的实现都需要依赖 root**，建议为该应用授权 root 以获取更好的体验；未授权 root 时
+> 上述部分功能（尤其快捷方式相关）不可用。
 
 ## 基于
 
