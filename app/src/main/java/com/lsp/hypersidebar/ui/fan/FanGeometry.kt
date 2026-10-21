@@ -135,8 +135,10 @@ fun computeFanGeometry(
     // （PRD §9.5"与扇形应用图标大小一致，跟随"），拟合只会缩小 ⇒ 配置值=保守上界，
     // 预留偏大不偏小。旧值固定 36dp 在大图标设置下预留不足，快捷栏顶到扇形下缘
     val quickList = quickApps.take(6)
-    val estBarBlockPx = (if (isLandscape) config.landscapeIconSizeDp else config.iconSizeDp) *
-        density * 2.6f   // barGap(0.6) + 栏高(icon+上下各 0.5 padding)
+    // 空栏不渲染；非空栏与 QuickAppsBar/quickCapsuleMetrics 共用垂直内边距，避免过早倾斜。
+    val estBarBlockPx = if (quickList.isEmpty()) 0f else
+        (if (isLandscape) config.landscapeIconSizeDp else config.iconSizeDp) *
+            density * (0.6f + 1f + 2f * QUICK_BAR_VERTICAL_PAD_RATIO) // barGap + 图标 + 上下 padding
 
     // ===== 展开角 =====
     // 半径先取配置值（不收窄）
